@@ -1,0 +1,19 @@
+name: watchme_workspace
+description: Workspace root for watchme, an open-source smart-TV control apparatus.
+publish_to: none
+
+environment:
+  sdk: ^3.13.0
+
+workspace:
+  - packages/watchme_core
+  - packages/watchme_io
+  - packages/watchme_engine
+  - packages/watchme_testkit
+  - packages/drivers/watchme_driver_roku
+  - packages/drivers/watchme_driver_firetv
+  - packages/watchme_e2e
+  - apps/watchme
+
+dev_dependencies:
+  lints: ^6.1.0

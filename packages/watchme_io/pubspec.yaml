@@ -1,0 +1,23 @@
+name: watchme_io
+description: >-
+  dart:io implementations of the watchme transports: HTTP, WebSocket, TCP,
+  UDP, SSDP and mDNS discovery, Wake-on-LAN, TLS pinning and stores.
+version: 0.1.0
+repository: https://github.com/fingerskier/watchme
+publish_to: none
+
+environment:
+  sdk: ^3.13.0
+
+resolution: workspace
+
+dependencies:
+  crypto: ^3.0.6
+  multicast_dns: ^0.3.3
+  path: ^1.9.0
+  watchme_core: ^0.1.0
+  xml: ^7.1.0
+
+dev_dependencies:
+  test: ^1.25.0
+  watchme_testkit: ^0.1.0
