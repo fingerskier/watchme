@@ -987,29 +987,66 @@ final class Engine implements WatchmeEngine {
           when _powerKeys.contains(key)) {
         return await _pressPowerKey(entry, key, action);
       }
-      final before = _clock.now();
-      if (command is SetVolume && _knownVolume(entry) == null) {
-        await _connectRelativeVolume(entry);
+      if (command.capability case Capability.volume || Capability.mute) {
+        return await _serialVolume(deviceId, () => _route(entry, command));
       }
-      final known = _knownVolume(entry);
-      final routed = await _router.route(
-        command,
-        _candidates(entry, command.capability),
-        (route, c) => _executeOn(entry, route, c),
-        knownVolume: known,
-      );
-      final result = routed.result;
-      if (routed.via case final via? when result.delivered) {
-        _inferVolume(entry, command, via, known, before);
-      } else if (mayHaveActed(result) && routed.steps.isNotEmpty) {
-        _markUncertain(entry, command, routed.steps.last.driverId);
-      }
-      return result;
+      return await _route(entry, command);
     } on Object catch (error) {
       return Failed(
         WatchmeError.internal('The engine failed: $error', cause: error),
       );
     }
+  }
+
+  /// Per device, the last volume or mute command queued.
+  final Map<String, Future<void>> _volumeTail = {};
+
+  /// Runs volume and mute commands for [deviceId] one at a time, so each
+  /// routes and infers from the level the previous one left: two
+  /// overlapping `SetVolume(20)` from 10 on a relative-only route must not
+  /// both step by +10.
+  Future<CommandResult> _serialVolume(
+    String deviceId,
+    Future<CommandResult> Function() run,
+  ) {
+    final previous = _volumeTail[deviceId] ?? Future<void>.value();
+    final done = Completer<void>();
+    final tail = done.future;
+    _volumeTail[deviceId] = tail;
+    return previous
+        .then<CommandResult>((_) {
+          if (_closed) {
+            return const Failed(WatchmeError.cancelled('The engine is closed'));
+          }
+          return run();
+        })
+        .whenComplete(() {
+          done.complete();
+          if (identical(_volumeTail[deviceId], tail)) {
+            _volumeTail.remove(deviceId);
+          }
+        });
+  }
+
+  Future<CommandResult> _route(_DeviceEntry entry, Command command) async {
+    final before = _clock.now();
+    if (command is SetVolume && _knownVolume(entry) == null) {
+      await _connectRelativeVolume(entry);
+    }
+    final known = _knownVolume(entry);
+    final routed = await _router.route(
+      command,
+      _candidates(entry, command.capability),
+      (route, c) => _executeOn(entry, route, c),
+      knownVolume: known,
+    );
+    final result = routed.result;
+    if (routed.via case final via? when result.delivered) {
+      _inferVolume(entry, command, via, known, before);
+    } else if (mayHaveActed(result) && routed.steps.isNotEmpty) {
+      _markUncertain(entry, command, routed.steps.last.driverId);
+    }
+    return result;
   }
 
   static const Set<RemoteKey> _powerKeys = {

@@ -545,6 +545,10 @@ final class PowerOrchestrator {
     ];
     final failures = <CommandResult>[];
 
+    // A later request asked for something else while this one was queued:
+    // turning the device on now would undo it.
+    if (op.interrupted) return _replacedResult;
+
     // 1. Discrete, local.
     if (local.isNotEmpty) {
       final r = await router.route(command, local, target.execute);

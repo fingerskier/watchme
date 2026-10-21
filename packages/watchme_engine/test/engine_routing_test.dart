@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:test/test.dart';
 import 'package:watchme_core/watchme_core.dart';
 import 'package:watchme_testkit/watchme_testkit.dart';
@@ -81,6 +83,42 @@ void main() {
     await h.clock.advance(const Duration(seconds: 1));
     await h.engine.send(id, const SetVolume(20));
     expect(atv.executed.last, const StepVolume(-5));
+  });
+
+  test('overlapping SetVolume calls step from the level the previous one '
+      'left', () async {
+    // Codex PR review: two SetVolume(20) from 10 both snapshotted 10 and
+    // both stepped +10, leaving the TV at 30.
+    final gate = Completer<void>();
+    final atv = FakeDriver(
+      'androidtv.remote2',
+      ceiling: const [relativeVolume],
+      onProbe: (_) => matched(capabilities: const [relativeVolume]),
+      onExecute: (_) async {
+        await gate.future;
+        return const Confirmed();
+      },
+    );
+    final h = Harness(drivers: [atv]);
+    addTearDown(h.close);
+    atv.sessionState = DeviceState(
+      volume: Observed.reported(10, 'androidtv.remote2', h.clock.now()),
+    );
+    final id = await h.add('10.0.2.10');
+    await h.clock.advance(const Duration(minutes: 1));
+
+    final first = h.engine.send(id, const SetVolume(20));
+    final second = h.engine.send(id, const SetVolume(20));
+    await h.clock.flush();
+    gate.complete();
+    expect(await first, isConfirmed);
+    expect(await second, isConfirmed);
+    final stepped = atv.executed.whereType<StepVolume>().fold<int>(
+      0,
+      (sum, c) => sum + c.steps,
+    );
+    expect(stepped, 10, reason: '${atv.executed}');
+    expect(h.view(id).state.volume!.value, 20);
   });
 
   group('partial delivery', () {

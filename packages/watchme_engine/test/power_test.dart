@@ -428,6 +428,33 @@ void main() {
     }
 
     test('an on that an off interrupted while it was queued sends no '
+        'discrete power-on either', () async {
+      // Codex PR review: the interruption was checked only before
+      // Wake-on-LAN, after the local discrete attempt had gone out.
+      final gate = Completer<void>();
+      var calls = 0;
+      final roku = FakeDriver(
+        'roku.ecp',
+        ceiling: const [discreteOn, discreteOff],
+        onExecute: (_) async {
+          if (++calls == 1) await gate.future;
+          return const Confirmed();
+        },
+      );
+      final rig = await Rig([roku]).add();
+      addTearDown(rig.h.close);
+      final firstOff = rig.power(false);
+      await rig.h.clock.flush();
+      final on = rig.power(true);
+      final secondOff = rig.power(false);
+      gate.complete();
+      expect(await firstOff, isConfirmed);
+      expect(await on, isA<Failed>());
+      expect(await secondOff, isConfirmed);
+      expect(roku.executed, isNot(contains(const SetPower(true))));
+    });
+
+    test('an on that an off interrupted while it was queued sends no '
         'Wake-on-LAN before the off', () async {
       // Integration adversarial check of Codex re-review finding 2: a
       // queued on, interrupted before it started, still sent a full round
