@@ -146,4 +146,62 @@ void main() {
       expect(net.sentDatagrams.single.host, '255.255.255.255');
     },
   );
+
+  group('cancelled', () {
+    // Codex follow-up C: the engine closes while a round is in progress;
+    // nothing may go out after that.
+    test('stops before the next packet once it returns true', () async {
+      final net = FakeNetworkStack();
+      final report =
+          await WakeOnLan(
+            net,
+            subnetBroadcasts: () async => ['10.0.0.255'],
+            repeats: 2,
+          ).wake(
+            mac,
+            lastKnownIp: '10.0.0.7',
+            cancelled: () => net.sentDatagrams.isNotEmpty,
+          );
+      expect(net.sentDatagrams, hasLength(1));
+      expect(report.sent, hasLength(1));
+    });
+
+    test('sends nothing when cancelled while finding destinations', () async {
+      final net = FakeNetworkStack();
+      var closed = false;
+      final wol = WakeOnLan(
+        net,
+        subnetBroadcasts: () async {
+          closed = true;
+          return ['10.0.0.255'];
+        },
+        repeats: 1,
+      );
+      await expectLater(
+        wol.wake(mac, lastKnownIp: '10.0.0.7', cancelled: () => closed),
+        throwsA(
+          isA<WatchmeError>().having(
+            (e) => e.code,
+            'code',
+            WatchmeErrorCode.cancelled,
+          ),
+        ),
+      );
+      expect(
+        await wol.send(mac, lastKnownIp: '10.0.0.7', cancelled: () => closed),
+        isFalse,
+      );
+      expect(net.sentDatagrams, isEmpty);
+    });
+
+    test('a callback that stays false changes nothing', () async {
+      final net = FakeNetworkStack();
+      await WakeOnLan(
+        net,
+        subnetBroadcasts: () async => [],
+        repeats: 1,
+      ).wake(mac, lastKnownIp: '10.0.0.7', cancelled: () => false);
+      expect(net.sentDatagrams, hasLength(4));
+    });
+  });
 }

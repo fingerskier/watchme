@@ -219,7 +219,11 @@ void main() {
     test('Wake-on-LAN goes through the injected sender when there is one, '
         'once per round', () async {
       final calls = <(String, String?)>[];
-      Future<bool> sender(String m, {String? lastKnownIp}) async {
+      Future<bool> sender(
+        String m, {
+        String? lastKnownIp,
+        bool Function()? cancelled,
+      }) async {
         calls.add((m, lastKnownIp));
         return true;
       }
@@ -241,12 +245,47 @@ void main() {
       expect(calls, hasLength(3));
     });
 
+    test('the injected sender is told when the engine closes in the middle '
+        'of its round', () async {
+      // Codex follow-up C: the production sender finds destinations and
+      // sends several packets per call, so close() must reach inside it.
+      bool Function()? seen;
+      final inRound = Completer<void>();
+      final release = Completer<void>();
+      Future<bool> sender(
+        String m, {
+        String? lastKnownIp,
+        bool Function()? cancelled,
+      }) async {
+        seen = cancelled;
+        inRound.complete();
+        await release.future;
+        return true;
+      }
+
+      final rig = await Rig(
+        [FakeDriver('dial')],
+        mac: mac,
+        wakeOnLan: sender,
+      ).add();
+      rig.online = false;
+      final result = rig.power(true);
+      await inRound.future;
+      expect(seen, isNotNull);
+      expect(seen!(), isFalse);
+      final closing = rig.h.close();
+      expect(seen!(), isTrue);
+      release.complete();
+      await closing;
+      expect(await result, isA<Failed>());
+    });
+
     test('a sender that sends nothing means no Wake-on-LAN went out', () async {
       final dial = FakeDriver('dial');
       final rig = await Rig(
         [dial],
         mac: mac,
-        wakeOnLan: (_, {lastKnownIp}) async => false,
+        wakeOnLan: (_, {lastKnownIp, cancelled}) async => false,
       ).add();
       addTearDown(rig.h.close);
       final result = rig.power(true);
@@ -300,7 +339,11 @@ void main() {
         'says packets may have gone out', () async {
       var calls = 0;
       final sending = Completer<bool>();
-      Future<bool> sender(String m, {String? lastKnownIp}) {
+      Future<bool> sender(
+        String m, {
+        String? lastKnownIp,
+        bool Function()? cancelled,
+      }) {
         calls++;
         return sending.future;
       }

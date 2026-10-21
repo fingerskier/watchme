@@ -16,9 +16,16 @@ import 'util.dart';
 /// `WakeOnLan(network, repeats: 1).send` from watchme_io has the right
 /// shape, and also sends to every subnet-directed broadcast, which a
 /// multi-homed host needs.
+///
+/// [cancelled] turns `true` once the orchestrator is closed or the
+/// operation is interrupted. A sender checks it after finding its
+/// destinations and before every packet, and sends nothing more once it
+/// is `true`: a round can take a while (interface lookup, several
+/// destinations), and shutdown must not wait for it.
 typedef WakeOnLanSender = Future<bool> Function(
   String mac, {
   String? lastKnownIp,
+  bool Function()? cancelled,
 });
 
 /// Tunables for [PowerOrchestrator].
@@ -816,7 +823,11 @@ final class PowerOrchestrator {
     final sender = _wakeOnLan;
     if (sender != null) {
       final ip = target.host.isEmpty ? null : target.host;
-      round = [for (final mac in macs) () => sender(mac, lastKnownIp: ip)];
+      bool cancelled() => _closed || op.interrupted;
+      round = [
+        for (final mac in macs)
+          () => sender(mac, lastKnownIp: ip, cancelled: cancelled),
+      ];
     } else {
       final net = _transports.network;
       if (net == null) return false;

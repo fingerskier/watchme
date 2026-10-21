@@ -95,17 +95,31 @@ final class WakeOnLan {
   /// Wakes the device with [mac] (any format `normalizeMac` accepts), also
   /// unicasting to [lastKnownIp] when given.
   ///
+  /// [cancelled] is checked after the destinations are found and before
+  /// every packet: once it returns `true`, nothing more is sent.
+  ///
   /// Throws `FormatException` for an invalid MAC, and [WatchmeError]
-  /// ([WatchmeErrorCode.unreachable], or the stack's error) when not a
-  /// single packet could be sent; partial failures are in the report.
-  Future<WakeOnLanReport> wake(String mac, {String? lastKnownIp}) async {
+  /// ([WatchmeErrorCode.unreachable], [WatchmeErrorCode.cancelled], or the
+  /// stack's error) when not a single packet could be sent; partial
+  /// failures are in the report.
+  Future<WakeOnLanReport> wake(
+    String mac, {
+    String? lastKnownIp,
+    bool Function()? cancelled,
+  }) async {
     final packet = magicPacket(mac);
     final destinations = await targets(lastKnownIp: lastKnownIp);
     final sent = <WakeTarget>[];
     final failed = <WakeTarget, WatchmeError>{};
+    var stopped = false;
+    rounds:
     for (var round = 0; round < repeats; round++) {
       if (round > 0) await clock.delay(interval);
       for (final target in destinations) {
+        if (cancelled?.call() ?? false) {
+          stopped = true;
+          break rounds;
+        }
         try {
           await network.sendDatagram(
             target.host,
@@ -121,6 +135,7 @@ final class WakeOnLan {
       }
     }
     if (sent.isEmpty) {
+      if (stopped) throw const WatchmeError.cancelled('Wake-on-LAN cancelled');
       throw failed.values.firstOrNull ??
           const WatchmeError.unreachable('No Wake-on-LAN destination');
     }
@@ -133,10 +148,19 @@ final class WakeOnLan {
   /// once per round and repeats the rounds itself, stopping between them
   /// when it is closed, so hosts pass `WakeOnLan(network, repeats: 1).send`
   /// to `Engine(wakeOnLan: ...)`: with more [repeats], each call would
-  /// repeat every packet again, and those repeats could not be stopped.
-  Future<bool> send(String mac, {String? lastKnownIp}) async {
+  /// repeat every packet again. The engine passes [cancelled], which stops
+  /// the call between packets once the engine closes.
+  Future<bool> send(
+    String mac, {
+    String? lastKnownIp,
+    bool Function()? cancelled,
+  }) async {
     try {
-      return (await wake(mac, lastKnownIp: lastKnownIp)).anySent;
+      return (await wake(
+        mac,
+        lastKnownIp: lastKnownIp,
+        cancelled: cancelled,
+      )).anySent;
     } on FormatException {
       return false;
     } on WatchmeError {
