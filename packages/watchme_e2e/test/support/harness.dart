@@ -285,11 +285,13 @@ final class E2eSystem {
   /// [e2ePolicy] on the engine and the stack and the socket guard
   /// installed. [lookup] replaces the stack's name resolver; [passThrough]
   /// seeds [LoopbackTransports.passThrough]; [config] defaults to
-  /// [e2eConfig].
+  /// [e2eConfig]; [rokuRequestTimeout], when given, replaces the Roku
+  /// driver's per-request deadline.
   static Future<E2eSystem> start(
     Directory stateDir, {
     Iterable<DiscoveryProvider> Function(NetworkStack network)? discovery,
     Duration? rokuPollInterval,
+    Duration? rokuRequestTimeout,
     HostLookup? lookup,
     Set<String> passThrough = const {},
     EngineConfig config = e2eConfig,
@@ -302,7 +304,13 @@ final class E2eSystem {
     final devices = FileDeviceRepository(devicesPath(stateDir));
     final engine = Engine(
       drivers: [
-        RokuDriver(pollInterval: rokuPollInterval),
+        if (rokuRequestTimeout == null)
+          RokuDriver(pollInterval: rokuPollInterval)
+        else
+          RokuDriver(
+            pollInterval: rokuPollInterval,
+            requestTimeout: rokuRequestTimeout,
+          ),
         FireTvDriver(apiPollInterval: const Duration(milliseconds: 50)),
       ],
       transports: transports,

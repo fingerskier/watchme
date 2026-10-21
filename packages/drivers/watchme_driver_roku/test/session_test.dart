@@ -675,6 +675,123 @@ void main() {
       ]);
       expect(session.state.power!.confidence, Confidence.reported);
     });
+
+    test('a command that reaches nothing disconnects at once', () async {
+      session = await open();
+      final events = <DeviceEvent>[];
+      final sub = session.events.listen(events.add);
+      addTearDown(sub.cancel);
+
+      roku.net.setUnreachable(roku.host);
+      expect(
+        await session.execute(const PressKey(RemoteKey.home)),
+        isFailedWith(WatchmeErrorCode.unreachable),
+      );
+      await pumpEventQueue();
+      final lost = events.whereType<ConnectionChanged>().single;
+      expect(lost.state, ConnectionState.disconnected);
+      expect(lost.error, isWatchmeError(WatchmeErrorCode.unreachable));
+      expect(session.state.power!.confidence, Confidence.stale);
+    });
+
+    group('timeouts', () {
+      const slow = WatchmeError.timeout('No answer from the Roku in time');
+
+      /// Makes the next [times] requests to [path] time out after
+      /// connecting.
+      FakeHttpRoute timeOut(String method, String path, {int times = 1}) =>
+          roku.net.onHttp(method, path, (_) => throw slow, times: times);
+
+      test('one timeout keeps the session connected with its state', () async {
+        session = await open(pollInterval: const Duration(seconds: 5));
+        final events = <DeviceEvent>[];
+        final sub = session.events.listen(events.add);
+        addTearDown(sub.cancel);
+        final before = session.state.power!;
+
+        // A poll whose device-info answer is late...
+        final poll = timeOut('GET', '/query/device-info');
+        await clock.advance(const Duration(seconds: 5));
+        await pumpEventQueue();
+        expect(poll.hits, 1);
+        // ...and a command whose answer is late.
+        timeOut('POST', '/keypress/Home');
+        expect(
+          await session.execute(const PressKey(RemoteKey.home)),
+          isFailedWith(WatchmeErrorCode.timeout),
+        );
+        await pumpEventQueue();
+
+        expect(events.whereType<ConnectionChanged>(), isEmpty);
+        expect(
+          session.state.connections['roku.ecp'],
+          ConnectionState.connected,
+        );
+        expect(session.state.power, before, reason: 'not marked stale');
+        expect(
+          await session.execute(const PressKey(RemoteKey.home)),
+          isConfirmed,
+        );
+        expect(events.whereType<ConnectionChanged>(), isEmpty);
+      });
+
+      test('$rokuTimeoutsBeforeDisconnect timeouts in a row disconnect; an '
+          'answer in between starts the count again', () async {
+        expect(rokuTimeoutsBeforeDisconnect, 3);
+        session = await open();
+        final events = <DeviceEvent>[];
+        final sub = session.events.listen(events.add);
+        addTearDown(sub.cancel);
+        Iterable<ConnectionState> connections() =>
+            events.whereType<ConnectionChanged>().map((e) => e.state);
+
+        // Two timeouts, then an answer: the count starts again.
+        timeOut('GET', '/query/device-info', times: 2);
+        for (var i = 0; i < 2; i++) {
+          await expectLater(
+            session.refresh(),
+            throwsWatchmeError(WatchmeErrorCode.timeout),
+          );
+        }
+        await session.refresh();
+        await pumpEventQueue();
+        expect(connections(), isEmpty);
+
+        // Two more, and a command that times out too: three in a row.
+        timeOut('GET', '/query/device-info', times: 2);
+        timeOut('POST', '/keypress/Up');
+        for (var i = 0; i < 2; i++) {
+          await expectLater(
+            session.refresh(),
+            throwsWatchmeError(WatchmeErrorCode.timeout),
+          );
+        }
+        await pumpEventQueue();
+        expect(connections(), isEmpty);
+        expect(
+          await session.execute(const PressKey(RemoteKey.up)),
+          isFailedWith(WatchmeErrorCode.timeout),
+        );
+        await pumpEventQueue();
+        final lost = events.whereType<ConnectionChanged>().single;
+        expect(lost.state, ConnectionState.disconnected);
+        expect(lost.error, isWatchmeError(WatchmeErrorCode.timeout));
+        expect(session.state.power!.confidence, Confidence.stale);
+        expect(
+          session.state.connections['roku.ecp'],
+          ConnectionState.disconnected,
+        );
+
+        // Any answer brings it back.
+        await session.refresh();
+        await pumpEventQueue();
+        expect(connections(), [
+          ConnectionState.disconnected,
+          ConnectionState.connected,
+        ]);
+        expect(session.state.power!.confidence, Confidence.reported);
+      });
+    });
   });
 
   test('close ends events and later commands fail', () async {

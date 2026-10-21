@@ -388,11 +388,19 @@ sealed class Command {
 /// The engine treats `PressKey(RemoteKey.power)` as a power-toggle intent
 /// and hands it to the power orchestrator instead of routing it as a key:
 ///
-/// * When the evidence agrees on the current power state (two independent
-///   sources, overview section 2.8), it executes `SetPower(!current)`: a
-///   discrete route first, a toggle only under the two-source rule.
-/// * Otherwise it returns `Unsupported(Unsupported.needsConfirmation)`, and
-///   the UI asks the user (see [SetPower.userConfirmed]).
+/// * When the evidence settles the current power state (overview section
+///   2.8), it executes `SetPower(!current)`: a discrete route first, a
+///   toggle only under the two-source rule. The evidence settles it when
+///   two independent sources agree, or when the only source is the
+///   device's own report (`Confidence.reported`, never an inferred state)
+///   from a driver with full `powerState` support (not a player reporting
+///   its own power) and the action it implies has a discrete route (an off route that is
+///   not toggle-only; an on route that is not, or Wake-on-LAN). A discrete
+///   on or off is idempotent, so a single source is enough for it, never
+///   for a toggle.
+/// * Otherwise, and within the quiet period after the last power command,
+///   it returns `Unsupported(Unsupported.needsConfirmation)`, and the UI
+///   asks the user (see [SetPower.userConfirmed]).
 /// * [KeyAction.down] and [KeyAction.up] are refused with `Unsupported`:
 ///   holding a toggle makes no sense.
 ///
@@ -427,7 +435,10 @@ final class PressKey extends Command {
 /// Discrete power on or off. The engine's power orchestrator decides how
 /// (overview section 2.8): a discrete route first, then Wake-on-LAN for
 /// "on", and a power toggle only when two independent sources agree on the
-/// current state. When they do not, the result is
+/// current state. One source is never enough for a toggle, not even the
+/// device's own report (which is enough for the power key to pick a
+/// discrete command, see [PressKey]). When only a toggle is left and the
+/// sources do not agree, the result is
 /// `Unsupported(Unsupported.needsConfirmation)` and the UI asks the user.
 final class SetPower extends Command {
   /// Creates a power command.

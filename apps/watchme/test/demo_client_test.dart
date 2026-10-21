@@ -4,6 +4,7 @@ import 'package:watchme/src/app.dart';
 import 'package:watchme/src/demo/demo_client.dart';
 import 'package:watchme/src/remote/remote_screen.dart';
 import 'package:watchme_core/watchme_core.dart';
+import 'package:watchme_testkit/watchme_testkit.dart' show FakeClock;
 
 import 'support/fake_client.dart';
 
@@ -237,7 +238,12 @@ void main() {
     });
 
     test('the power key is a toggle intent', () async {
-      final client = _demo();
+      final clock = FakeClock(DateTime.utc(2026, 10, 21, 12));
+      final client = DemoWatchmeClient(
+        clock: clock,
+        latency: Duration.zero,
+        scanTime: Duration.zero,
+      );
       await client.scan();
       await _pairWith(
         client,
@@ -251,33 +257,44 @@ void main() {
               .state
               .power
               ?.value;
+      Future<CommandResult> powerKey(String id) =>
+          client.send(id, const PressKey(RemoteKey.power));
+      const ask = Unsupported(Unsupported.needsConfirmation);
 
-      // Each demo TV has one source for its power state (its own driver)
-      // and the engine needs two to toggle on its own, so it asks, even for
-      // the Roku that reports its state. This used to toggle the Roku
-      // directly, which the real engine never does (verifier follow-up to
-      // Codex finding #1).
-      expect(
-        await client.send('demo-roku', const PressKey(RemoteKey.power)),
-        const Unsupported(Unsupported.needsConfirmation),
-      );
-      expect(await power('demo-roku'), PowerMode.on);
+      // Each demo TV has one source for its power state: its own driver.
+      // The Roku reports its power mode and has discrete on and off, so,
+      // as in the engine, that one report is enough for the power key to
+      // send the discrete command.
+      expect(await powerKey('demo-roku'), const Confirmed());
+      expect(await power('demo-roku'), PowerMode.standby);
+
+      // Within the quiet period after a power command the evidence may lag,
+      // so the next press asks.
+      await clock.advance(const Duration(seconds: 5));
+      expect(await powerKey('demo-roku'), ask);
+      expect(await power('demo-roku'), PowerMode.standby);
       expect(
         await client.send(
           'demo-roku',
-          const SetPower(false, userConfirmed: true),
+          const SetPower(true, userConfirmed: true),
         ),
         const Confirmed(),
       );
-      expect(await power('demo-roku'), PowerMode.standby);
+      expect(await power('demo-roku'), PowerMode.on);
       expect(
-        await client.send('demo-roku', const SetPower(true)),
+        await client.send('demo-roku', const SetPower(false)),
         const Confirmed(),
         reason: 'a discrete power command needs no question',
       );
+      expect(await power('demo-roku'), PowerMode.standby);
+
+      // Once it is over, the power key turns it on with the discrete key.
+      await clock.advance(const Duration(seconds: 21));
+      expect(await powerKey('demo-roku'), const Confirmed());
       expect(await power('demo-roku'), PowerMode.on);
 
-      // The same on the Fire TV, which cannot report its state at all.
+      // The Fire TV cannot report its state, only infer it, so the power
+      // key always asks.
       expect(
         await client.send('demo-firetv', const PressKey(RemoteKey.power)),
         const Unsupported(Unsupported.needsConfirmation),
@@ -290,6 +307,11 @@ void main() {
         ),
         const Confirmed(),
       );
+      expect(await power('demo-firetv'), PowerMode.standby);
+      // Not even once the quiet period is over: an inferred state is a
+      // guess.
+      await clock.advance(const Duration(seconds: 21));
+      expect(await powerKey('demo-firetv'), ask);
       expect(await power('demo-firetv'), PowerMode.standby);
 
       // A toggle cannot be held.
@@ -411,8 +433,8 @@ void main() {
     expect(find.text('Standby?'), findsOneWidget);
   });
 
-  testWidgets('the power key asks about a demo Roku, which is one source '
-      'of its power state', (tester) async {
+  testWidgets('the power key switches a demo Roku, which reports its power '
+      'state, and asks within the quiet period', (tester) async {
     final client = _demo();
     addTearDown(client.close);
     useWindowSize(tester, const Size(1200, 1100));
@@ -425,6 +447,14 @@ void main() {
     expect(find.byType(RemoteScreen), findsOneWidget);
     expect(find.text('On'), findsOneWidget);
 
+    // The Roku's own report settles its state, and power off is discrete.
+    await tester.tap(find.byTooltip('Power'));
+    await tester.pumpAndSettle();
+    expect(find.text('Is the TV on?'), findsNothing);
+    expect(find.text('Standby'), findsOneWidget);
+    expect(find.byType(SnackBar), findsNothing);
+
+    // A second press within the quiet period asks.
     await tester.tap(find.byTooltip('Power'));
     await tester.pumpAndSettle();
     expect(find.text('Is the TV on?'), findsOneWidget);

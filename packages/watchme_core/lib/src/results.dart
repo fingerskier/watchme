@@ -104,9 +104,12 @@ final class Unsupported extends CommandResult {
   /// Creates an unsupported result with a human-readable [reason].
   const Unsupported(this.reason);
 
-  /// The reason the power orchestrator gives when it refuses to send a power
-  /// toggle without two agreeing state sources, for [SetPower] and for
-  /// `PressKey(RemoteKey.power)`.
+  /// The reason the power orchestrator gives when it refuses to guess: for
+  /// [SetPower], a power toggle without two agreeing state sources; for
+  /// `PressKey(RemoteKey.power)`, a current state that neither two agreeing
+  /// sources nor a single device-reported one with a discrete route settles
+  /// (see [PressKey]), or any press within the quiet period after the last
+  /// power command.
   ///
   /// The UI then asks the user "Is the TV on right now?" and sends
   /// `SetPower(!isOn, userConfirmed: true)` (see [SetPower.userConfirmed]).

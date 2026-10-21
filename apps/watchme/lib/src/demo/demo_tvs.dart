@@ -1,4 +1,5 @@
 import 'package:watchme_core/watchme_core.dart';
+import 'package:watchme_engine/watchme_engine.dart' show PowerConfig;
 
 /// The PIN the demo Fire TV accepts.
 const String demoFireTvPin = '1234';
@@ -295,6 +296,10 @@ class DemoTv {
   /// When the simulated state last changed.
   DateTime stateAt;
 
+  /// When the last power command was carried out, for the engine's quiet
+  /// period ([PowerConfig.toggleQuietPeriod]).
+  DateTime? powerAt;
+
   /// Whether the TV accepts commands now.
   bool get connected => !requiresPairing || paired;
 
@@ -358,25 +363,27 @@ class DemoTv {
       return Unsupported('$protocol cannot do ${command.capability.name}.');
     }
     lastSeen = now;
-    final result = _apply(command);
+    final result = _apply(command, now);
     if (result.delivered) stateAt = now;
     return result;
   }
 
-  CommandResult _apply(Command command) => switch (command) {
+  CommandResult _apply(Command command, DateTime now) => switch (command) {
     PressKey(key: final key) when unsupportedKeys.contains(key) => Unsupported(
       '$protocol has no ${key.name} key.',
     ),
     // As in the engine, the power key is a toggle intent, not a key press.
-    PressKey(key: RemoteKey.power, action: KeyAction.click) => _togglePower(),
+    PressKey(key: RemoteKey.power, action: KeyAction.click) => _togglePower(
+      now,
+    ),
     PressKey(key: RemoteKey.power) => const Unsupported(
       'The power key toggles; it cannot be held.',
     ),
-    PressKey(:final key, action: KeyAction.click) => _click(key),
+    PressKey(:final key, action: KeyAction.click) => _click(key, now),
     PressKey() => const Confirmed(),
     // A discrete route exists for both TVs, so a confirmed command needs
     // no toggle.
-    SetPower(:final on) => _setPower(on),
+    SetPower(:final on) => _setPower(on, now),
     SetMute(:final muted) => _setMute(muted ?? !this.muted),
     StepVolume() => const Confirmed(),
     SetVolume() => const Unsupported(
@@ -394,17 +401,18 @@ class DemoTv {
     _ => Unsupported('The demo does not simulate ${command.type}.'),
   };
 
-  CommandResult _click(RemoteKey key) {
+  CommandResult _click(RemoteKey key, DateTime now) {
     switch (key) {
       case RemoteKey.home:
         foreground = home;
         playback = PlaybackState.stopped;
       case RemoteKey.mute:
         muted = !muted;
+      // The engine sends these as SetPower.
       case RemoteKey.powerOn:
-        power = PowerMode.on;
+        return _setPower(true, now);
       case RemoteKey.powerOff:
-        power = PowerMode.standby;
+        return _setPower(false, now);
       case RemoteKey.play || RemoteKey.pause || RemoteKey.playPause:
         return _media(MediaAction.playPause);
       default:
@@ -413,16 +421,39 @@ class DemoTv {
     return const Confirmed();
   }
 
-  /// The engine's answer to the power key. It turns the TV the other way
-  /// only when at least two independent sources agree on the TV's state,
-  /// and each demo TV has one: its own driver (the Roku reports its power
-  /// state, the Fire TV cannot). So, as the engine would, it asks the user,
-  /// who answers with a confirmed [SetPower].
-  CommandResult _togglePower() =>
-      const Unsupported(Unsupported.needsConfirmation);
+  /// The engine's answer to the power key at time [now].
+  ///
+  /// Each demo TV has one source for its power state: its own driver. The
+  /// engine acts on a single source only when the TV reports the state
+  /// itself and the action it implies has a route that is not toggle-only
+  /// (both demo TVs have discrete on and off), and never within the quiet
+  /// period after the last power command. So, as the engine would, the
+  /// Roku, which reports its power mode, is switched with the discrete
+  /// command, and the Fire TV, whose state is only inferred, asks the user,
+  /// who answers with a confirmed [SetPower]. Both ask within the quiet
+  /// period.
+  CommandResult _togglePower(DateTime now) {
+    final last = powerAt;
+    final quiet =
+        last != null &&
+        now.difference(last) < const PowerConfig().toggleQuietPeriod;
+    final turnOn = switch (power) {
+      PowerMode.on => false,
+      PowerMode.off || PowerMode.standby => true,
+      _ => null,
+    };
+    const ask = Unsupported(Unsupported.needsConfirmation);
+    if (quiet || !reportsState || turnOn == null) return ask;
+    final route = capabilities.supportFor(
+      turnOn ? Capability.powerOn : Capability.powerOff,
+    );
+    if (!route.usable || route.has(CapFlag.toggleOnly)) return ask;
+    return _setPower(turnOn, now);
+  }
 
-  CommandResult _setPower(bool on) {
+  CommandResult _setPower(bool on, DateTime now) {
     power = on ? PowerMode.on : PowerMode.standby;
+    powerAt = now;
     return const Confirmed();
   }
 

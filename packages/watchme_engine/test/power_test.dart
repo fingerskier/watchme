@@ -313,8 +313,8 @@ void main() {
       },
     );
 
-    test('one source is not enough: needs confirmation, and gathering the '
-        'evidence connects nothing', () async {
+    test('one source is not enough for a toggle: needs confirmation, and '
+        'gathering the evidence connects nothing', () async {
       final ws = FakeDriver('samsung.ws', ceiling: const [toggleOn]);
       final rig = await Rig([ws]).add();
       addTearDown(rig.h.close);
@@ -556,20 +556,194 @@ void main() {
   group('the power key is a toggle intent', () {
     const powerKey = PressKey(RemoteKey.power);
 
-    test('with one source it needs confirmation and sends nothing', () async {
+    test('with one source and only toggles it needs confirmation and sends '
+        'nothing', () async {
       // Replaces the M0 test that let the key through as "the user's own
-      // toggle": finding #1 (the raw key bypassed the two-source gate).
+      // toggle": finding #1 (the raw key bypassed the two-source gate). The
+      // source is the device's own report, which settles the state for a
+      // discrete command, never for a toggle.
       final ws = FakeDriver('samsung.ws', ceiling: const [toggleOn, toggleOff]);
       final rig = await Rig([ws]).add();
       addTearDown(rig.h.close);
-      rig.probeSays(ws, PowerMode.on);
+      for (final mode in [PowerMode.on, PowerMode.standby]) {
+        rig.probeSays(ws, mode);
+        expect(
+          await rig.h.engine.send(rig.id, powerKey),
+          isUnsupported(Unsupported.needsConfirmation),
+          reason: '$mode',
+        );
+      }
+      expect(ws.executed, isEmpty);
+      expect(ws.connects, isEmpty, reason: 'connecting can wake a TV');
+      expect(rig.h.engine.power.lastCommand(rig.id), isNull);
+    });
+
+    test('one source the device reports settles it when a discrete route '
+        'can act: off, then on', () async {
+      // A Roku TV alone: its probe and its session are one source, and
+      // device-info power-mode is the device's own report.
+      final roku = FakeDriver(
+        'roku.ecp',
+        ceiling: const [discreteOn, discreteOff, powerState],
+      );
+      final rig = await Rig([roku]).add();
+      addTearDown(rig.h.close);
+      rig.probeSays(roku, PowerMode.on);
+      expect(await rig.h.engine.send(rig.id, powerKey), isConfirmed);
+      expect(roku.executed, [const SetPower(false)]);
+      expect(rig.h.engine.power.lastCommand(rig.id)?.on, isFalse);
+      expect(roku.connects.single.allowWake, isFalse);
+
+      await rig.h.clock.advance(const Duration(seconds: 21));
+      roku.lastSession.onRefresh = () =>
+          DeviceState(power: rig.says(PowerMode.standby, 'roku.ecp'));
+      expect(await rig.h.engine.send(rig.id, powerKey), isConfirmed);
+      expect(roku.executed, [const SetPower(false), const SetPower(true)]);
+      expect(rig.h.engine.power.lastCommand(rig.id)?.on, isTrue);
+      expect(roku.executed, isNot(contains(powerKey)));
+    });
+
+    test('one reported source with a MAC turns it on by Wake-on-LAN, '
+        'never by its toggle', () async {
+      final ws = FakeDriver(
+        'samsung.ws',
+        ceiling: const [toggleOn, powerState],
+      );
+      final rig = await Rig([ws], mac: mac).add();
+      addTearDown(rig.h.close);
+      rig.probeSays(ws, PowerMode.standby);
+      final result = rig.h.engine.send(rig.id, powerKey);
+      await rig.h.clock.advance(const Duration(seconds: 3));
+      expect(await result, isSentUnconfirmed);
+      expect(rig.h.transports.net.sentDatagrams, isNotEmpty);
+      expect(ws.executed.where(isPowerCommand), isEmpty);
+    });
+
+    test('one inferred source does not settle it, even with discrete '
+        'routes', () async {
+      // A Fire TV alone: its power state is inferred (a closed API port, a
+      // command it accepted), never reported.
+      final firetv = FakeDriver(
+        'firetv.lightning',
+        ceiling: const [discreteOn, discreteOff, powerState],
+      );
+      final rig = await Rig([firetv], mac: mac).add();
+      addTearDown(rig.h.close);
+      for (final mode in [PowerMode.on, PowerMode.standby]) {
+        rig.probePower['firetv.lightning'] = Observed.inferred(
+          mode,
+          'firetv.lightning',
+          rig.h.clock.now(),
+        );
+        expect(
+          await rig.h.engine.send(rig.id, powerKey),
+          isUnsupported(Unsupported.needsConfirmation),
+          reason: '$mode',
+        );
+      }
+      expect(firetv.executed, isEmpty);
+      expect(firetv.connects, isEmpty);
+      expect(rig.h.transports.net.sentDatagrams, isEmpty);
+    });
+
+    test('one reported source does not settle it within the quiet '
+        'period', () async {
+      final roku = FakeDriver(
+        'roku.ecp',
+        ceiling: const [discreteOn, discreteOff, powerState],
+      );
+      final rig = await Rig([roku]).add();
+      addTearDown(rig.h.close);
+      expect(await rig.power(false), isConfirmed);
+      await rig.h.clock.advance(const Duration(seconds: 5));
+      roku.lastSession.onRefresh = () =>
+          DeviceState(power: rig.says(PowerMode.standby, 'roku.ecp'));
       expect(
         await rig.h.engine.send(rig.id, powerKey),
         isUnsupported(Unsupported.needsConfirmation),
       );
-      expect(ws.executed, isEmpty);
-      expect(ws.connects, isEmpty, reason: 'connecting can wake a TV');
+      expect(roku.executed, [const SetPower(false)]);
+    });
+
+    test('one reported source with partial power-state support does not '
+        'settle it: a player reports its own power, not the TV\'s', () async {
+      final player = FakeDriver(
+        'roku.ecp',
+        ceiling: const [
+          discreteOn,
+          discreteOff,
+          CapabilitySupport.partial(Capability.powerState),
+        ],
+      );
+      final rig = await Rig([player]).add();
+      addTearDown(rig.h.close);
+      for (final mode in [PowerMode.on, PowerMode.standby]) {
+        rig.probeSays(player, mode);
+        expect(
+          await rig.h.engine.send(rig.id, powerKey),
+          isUnsupported(Unsupported.needsConfirmation),
+          reason: '$mode',
+        );
+      }
+      expect(player.executed, isEmpty);
+    });
+
+    test('one reported source whose discrete route fails sends no toggle: '
+        'it asks', () async {
+      // Limited mode refuses PowerOff/PowerOn; another driver has only the
+      // toggle, which one source never justifies.
+      const refused = Failed(
+        WatchmeError.rejected(
+          'Limited mode',
+          rawDeviceMessage: 'ECP command not allowed in Limited mode.',
+        ),
+      );
+      final roku = FakeDriver(
+        'roku.ecp',
+        ceiling: const [discreteOn, discreteOff, powerState],
+        onExecute: (_) => refused,
+      );
+      final ws = FakeDriver('samsung.ws', ceiling: const [toggleOn, toggleOff]);
+      final rig = await Rig([ws, roku]).add();
+      addTearDown(rig.h.close);
+
+      rig.probeSays(roku, PowerMode.on);
+      expect(
+        await rig.h.engine.send(rig.id, powerKey),
+        isUnsupported(Unsupported.needsConfirmation),
+      );
+      expect(roku.executed, [const SetPower(false)]);
+
+      rig.probeSays(roku, PowerMode.standby);
+      roku.lastSession.onRefresh = () =>
+          DeviceState(power: rig.says(PowerMode.standby, 'roku.ecp'));
+      expect(
+        await rig.h.engine.send(rig.id, powerKey),
+        isUnsupported(Unsupported.needsConfirmation),
+      );
+      expect(roku.executed, [const SetPower(false), const SetPower(true)]);
+      expect(ws.executed, isEmpty, reason: 'no toggle on one source');
       expect(rig.h.engine.power.lastCommand(rig.id), isNull);
+    });
+
+    test('two disagreeing sources: needs confirmation, even with discrete '
+        'routes', () async {
+      final roku = FakeDriver(
+        'roku.ecp',
+        ceiling: const [discreteOn, discreteOff],
+      );
+      final rest = FakeDriver('samsung.rest', ceiling: const [powerState]);
+      final rig = await Rig([roku, rest]).add();
+      addTearDown(rig.h.close);
+      rig
+        ..probeSays(roku, PowerMode.on)
+        ..probeSays(rest, PowerMode.standby);
+      expect(
+        await rig.h.engine.send(rig.id, powerKey),
+        isUnsupported(Unsupported.needsConfirmation),
+      );
+      expect(roku.executed, isEmpty);
+      expect(roku.connects, isEmpty);
     });
 
     test('two sources agreeing it is on turn it off', () async {

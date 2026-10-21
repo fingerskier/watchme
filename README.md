@@ -28,7 +28,7 @@ Licence: Apache-2.0. The project is early (milestone M0) and has not yet been us
 - **Engine:**
   - merges every way a device was found (SSDP, mDNS, manual add) into one device, keyed by MAC, stable id, then IP;
   - routes each command to the best driver and falls back to the next one, but never repeats a command that may already have reached the TV;
-  - power orchestration that never sends a power toggle on a guess: the Power key asks "Is the TV on right now?" unless two sources agree on the TV's state;
+  - power orchestration that never sends a power toggle on a guess: the Power key asks "Is the TV on right now?" unless two sources agree on the TV's state, or the TV itself reports it and a discrete on/off command can act on it (a Roku TV alone);
   - contacts local-network addresses only;
   - Wake-on-LAN;
   - file-backed credential and device stores.
@@ -126,7 +126,7 @@ The app keeps `credentials.json` and `devices.json` in its application-support d
   - On desktop they are stored in plain JSON in `credentials.json`, mode `0600` (a directory watchme creates itself is made `0700`). Writes are atomic.
   - A corrupt file is moved aside, not silently discarded.
   - Encryption at rest through the OS keystore is planned.
-- **Power.** watchme never sends a power toggle on a guess. It prefers discrete on/off commands and Wake-on-LAN. It sends a toggle only when two independent sources agree on the TV's current state, or when you have just told it what the TV shows; otherwise it asks you. The Power key follows the same rule, power commands to one TV run one at a time, and a hold of the Power key is refused.
+- **Power.** watchme never sends a power toggle on a guess. It prefers discrete on/off commands and Wake-on-LAN. It sends a toggle only when two independent sources agree on the TV's current state, or when you have just told it what the TV shows; otherwise it asks you. The Power key follows the same rule, with one relaxation: when the TV itself reports its state (a Roku TV's `power-mode`) and a discrete on or off command exists, that one report is enough to pick the discrete command, because a discrete command repeated changes nothing. An inferred state (a Fire TV's) never is, nor is a streaming player's report of its own power (a Roku stick's), and a single report never sends a toggle. Within 20 seconds of the last power command the Power key always asks. Power commands to one TV run one at a time, and a hold of the Power key is refused.
 - **Waking.** Only a command you send can wake a TV. Background reconnects, refreshes and polling never do: a TV that drops off the network shows as disconnected, with its last known state marked as such, until it answers again.
 - **Local network only.** The engine and the network stack contact private (RFC 1918), link-local and unique-local IPv6 addresses only. Public addresses, `100.64.0.0/10` (carrier-grade NAT and VPN overlays such as Tailscale) and reserved ranges are refused before anything is sent, for manual adds, discovery replies and every connection. A host name is resolved by watchme itself, every address it resolves to is checked, and the connection goes to the checked address. The desktop app also allows loopback (`127.0.0.1`), for the simulators; the planned hub will not.
 - **No repeats.** A command that may already have reached the TV (a timeout, or a volume run cut short after some steps) is never retried or sent through another driver. Forgetting a TV or quitting the app stops a command in progress before its next request.

@@ -141,7 +141,13 @@ final class _PowerOp {
 ///   would undo it.
 ///
 /// The power key is a toggle intent, not a key: [pressPowerKey] turns it
-/// into `SetPower(!current)` when the evidence agrees on the current state.
+/// into `SetPower(!current)` when the evidence settles the current state:
+/// two independent sources agree on it, or the only source is the device's
+/// own report, from a driver with full power-state support (a player's
+/// report of its own power does not count), and the action it implies has a
+/// discrete route. A discrete
+/// on or off is idempotent, so a wrong direction does nothing harmful; any
+/// toggle that `SetPower` falls back to still needs the two-source rule.
 ///
 /// Operations on one device run one at a time, from evidence collection to
 /// confirmation, so two callers can never both decide to toggle. A caller
@@ -236,12 +242,26 @@ final class PowerOrchestrator {
   /// The power key, `PressKey(RemoteKey.power)`: switch [target] to the
   /// other state. Never throws.
   ///
-  /// When at least two independent, fresh sources agree on the current
-  /// state (and no power command went out in the quiet period), this is
-  /// [setPower] with the other state, run in the same turn. Otherwise the
-  /// result is `Unsupported(Unsupported.needsConfirmation)`: the UI asks
-  /// "Is the TV on right now?" and sends `SetPower(!isOn, userConfirmed:
-  /// true)`.
+  /// When no power command went out in the quiet period and the evidence
+  /// settles the current state, this is [setPower] with the other state,
+  /// run in the same turn. The evidence settles it when:
+  ///
+  /// * at least two independent, fresh sources agree on it; or
+  /// * exactly one fresh source knows it, that source is the device's own
+  ///   report ([Confidence.reported]; an inferred state never counts), and
+  ///   the action it implies has a discrete route: a power-off route that
+  ///   is not [CapFlag.toggleOnly] to turn it off, or a discrete power-on
+  ///   route or a MAC for Wake-on-LAN to turn it on.
+  ///
+  /// A single source is enough for a discrete command because on and off
+  /// are idempotent: if the source is wrong, the command changes nothing.
+  /// It is never enough for a toggle: when the discrete route fails and
+  /// only a toggle is left, [setPower]'s two-source rule applies and the
+  /// result is `needsConfirmation`, with no toggle sent.
+  ///
+  /// Otherwise the result is `Unsupported(Unsupported.needsConfirmation)`:
+  /// the UI asks "Is the TV on right now?" and sends `SetPower(!isOn,
+  /// userConfirmed: true)`.
   Future<CommandResult> pressPowerKey(PowerTarget target) => _serialized(
     target,
     (on: null, userConfirmed: false),
@@ -253,7 +273,7 @@ final class PowerOrchestrator {
           'No driver for this device can switch it on or off',
         );
       }
-      final isOn = await _agreement(target);
+      final isOn = await _powerKeyState(target);
       if (_closed) return _closedResult;
       if (isOn == null) return const Unsupported(Unsupported.needsConfirmation);
       return isOn ? _powerOff(target) : _powerOn(target, op);
@@ -482,6 +502,54 @@ final class PowerOrchestrator {
   /// 17-20 s after off, so the evidence lags).
   Future<bool?> _agreement(PowerTarget target) async {
     if (_inQuietPeriod(target)) return null;
+    return _agreed(await _freshEvidence(target));
+  }
+
+  /// The current state the power key acts on (see [pressPowerKey]): the
+  /// two-source [_agreement] when there is one, otherwise the state a
+  /// single reported source gives when the action it implies has a
+  /// discrete route. `null` in the quiet period, and whenever neither
+  /// holds.
+  Future<bool?> _powerKeyState(PowerTarget target) async {
+    if (_inQuietPeriod(target)) return null;
+    final latest = await _freshEvidence(target);
+    final agreed = _agreed(latest);
+    if (agreed != null || latest.length != 1) return agreed;
+    final only = latest.values.single;
+    // An inferred state (a Fire TV's, say: from what watchme sent or how
+    // the device answered) is a guess, and a guess never decides.
+    if (only.confidence != Confidence.reported) return null;
+    // A player (a Roku stick, say) reports its own power, not the TV's: only
+    // a driver with full power-state support speaks for the screen.
+    if (!target
+        .routes(Capability.powerState)
+        .any(
+          (r) => r.driverId == only.source && r.support.level == Support.yes,
+        )) {
+      return null;
+    }
+    final isOn = _isOn(only.value);
+    if (isOn == null) return null;
+    return _hasDiscreteRoute(target, on: !isOn) ? isOn : null;
+  }
+
+  /// Whether [target] can be switched [on] without a toggle: a power route
+  /// that is not toggle-only, or, to turn it on, a MAC for Wake-on-LAN.
+  static bool _hasDiscreteRoute(PowerTarget target, {required bool on}) {
+    final capability = on ? Capability.powerOn : Capability.powerOff;
+    if (target
+        .routes(capability)
+        .any((r) => !r.support.has(CapFlag.toggleOnly))) {
+      return true;
+    }
+    return on && target.macs.isNotEmpty;
+  }
+
+  /// The latest usable observation of each source: not stale, not
+  /// [PowerMode.unknown], and no older than [PowerConfig.evidenceMaxAge].
+  Future<Map<String, Observed<PowerMode>>> _freshEvidence(
+    PowerTarget target,
+  ) async {
     final now = _clock.now();
     final latest = <String, Observed<PowerMode>>{};
     for (final o in await target.powerEvidence()) {
@@ -490,6 +558,12 @@ final class PowerOrchestrator {
       if (now.difference(o.at) > config.evidenceMaxAge) continue;
       if (o.supersedes(latest[o.source])) latest[o.source] = o;
     }
+    return latest;
+  }
+
+  /// The state every source in [latest] agrees on, when there are at least
+  /// two of them (see [_agreement]).
+  static bool? _agreed(Map<String, Observed<PowerMode>> latest) {
     if (latest.length < 2) return null;
     bool all(bool Function(PowerMode mode) test) =>
         latest.values.every((o) => test(o.value));
@@ -497,6 +571,14 @@ final class PowerOrchestrator {
     if (all((m) => m == PowerMode.off || m == PowerMode.standby)) return false;
     return null;
   }
+
+  /// `true` for on, `false` for off or standby, `null` for a state that
+  /// says neither (screen off, art mode, unknown).
+  static bool? _isOn(PowerMode mode) => switch (mode) {
+    PowerMode.on => true,
+    PowerMode.off || PowerMode.standby => false,
+    PowerMode.screenOff || PowerMode.artMode || PowerMode.unknown => null,
+  };
 
   bool _inQuietPeriod(PowerTarget target) {
     final last = _last[target.deviceId];

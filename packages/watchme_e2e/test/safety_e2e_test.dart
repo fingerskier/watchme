@@ -87,10 +87,13 @@ void main() {
       sim.clearLog();
     });
 
-    test('#1 the power key asks when only one source knows the state, and '
+    test('#1 the power key asks when the only source infers the state, and '
         "the user's answer turns the TV off without the toggle", () async {
       final engine = system.engine;
-      // The Fire TV session is the only power source: no guess is made.
+      // The Fire TV session is the only power source, and it infers the
+      // state (from what it sent and which port answers) rather than
+      // reading a report: no guess is made, though its routes are
+      // discrete.
       expect(
         await engine.send(id, const PressKey(RemoteKey.power)),
         isUnsupported(Unsupported.needsConfirmation),
@@ -237,6 +240,123 @@ void main() {
       );
       expect(sim.wakeCount, wakes + 1);
       expect(driver().connection, ConnectionState.connected);
+    });
+  });
+
+  group('Roku TV alone', () {
+    late RokuSimulator sim;
+
+    /// The e2e configuration with a short quiet period, so a test can wait
+    /// it out.
+    const quickQuiet = EngineConfig(
+      probeTimeout: Duration(seconds: 5),
+      connectTimeout: Duration(seconds: 10),
+      power: PowerConfig(
+        broadcastAddress: '127.255.255.255',
+        wakeTimeout: Duration(seconds: 3),
+        wakePollInterval: Duration(milliseconds: 200),
+        toggleQuietPeriod: Duration(milliseconds: 500),
+      ),
+    );
+
+    setUp(() async {
+      sim = RokuSimulator();
+      await sim.start();
+      addTearDown(sim.stop);
+    });
+
+    /// Adds the simulator (and refusals for the Fire TV probe).
+    Future<String> addRoku(E2eSystem system) async {
+      final view = await system.engine.addManual(
+        '127.0.0.1',
+        ports: {
+          rokuEcpPortName: sim.port,
+          FireTvPorts.dial: await closedPort(),
+          FireTvPorts.api: await closedPort(),
+        },
+      );
+      expect(view.drivers.map((d) => d.driverId), [rokuDriverId]);
+      return view.id;
+    }
+
+    Iterable<String> rokuKeys() => sim.keyLog.map((k) => k.key);
+
+    test('#1 its own power-mode report is enough for the power key to turn '
+        'it off and on with the discrete keys, never the raw toggle', () async {
+      final system = await E2eSystem.start(dir, config: quickQuiet);
+      final engine = system.engine;
+      final id = await addRoku(system);
+      sim.clearLogs();
+
+      // One source (device-info and the session are the same driver), but
+      // it is the TV's own report and PowerOff is discrete.
+      expect(
+        await engine.send(id, const PressKey(RemoteKey.power)),
+        isConfirmed,
+      );
+      expect(rokuKeys(), ['PowerOff']);
+      expect(sim.powerMode, RokuSimPowerMode.ready);
+
+      // Within the quiet period the report may lag: the next press asks.
+      expect(
+        await engine.send(id, const PressKey(RemoteKey.power)),
+        isUnsupported(Unsupported.needsConfirmation),
+      );
+      expect(rokuKeys(), ['PowerOff']);
+
+      // After it, the fresh report says standby, and PowerOn is discrete.
+      await Future<void>.delayed(quickQuiet.power.toggleQuietPeriod);
+      expect(
+        await engine.send(id, const PressKey(RemoteKey.power)),
+        isConfirmed,
+      );
+      expect(rokuKeys(), ['PowerOff', 'PowerOn']);
+      expect(sim.powerMode, RokuSimPowerMode.powerOn);
+      expect(rokuKeys(), isNot(contains('Power')), reason: 'no raw toggle');
+    });
+
+    test('one slow answer neither drops the session nor makes the device '
+        'stale', () async {
+      final system = await E2eSystem.start(
+        dir,
+        rokuRequestTimeout: const Duration(milliseconds: 400),
+      );
+      final engine = system.engine;
+      final id = await addRoku(system);
+      expect(
+        await engine.send(id, const PressKey(RemoteKey.home)),
+        isConfirmed,
+      );
+      DriverView driver() => engine.currentDevices.single.drivers.single;
+      Observed<PowerMode>? power() => engine.currentDevices.single.state.power;
+      expect(driver().connection, ConnectionState.connected);
+      expect(power()?.confidence, Confidence.reported);
+      final events = record(engine.events(id));
+
+      // The Roku acts on the key but answers after the deadline.
+      final gate = sim.holdNext('POST', '/keypress/Up');
+      expect(
+        await engine.send(id, const PressKey(RemoteKey.up)),
+        isFailedWith(WatchmeErrorCode.timeout),
+      );
+      expect(gate.isReached, isTrue);
+      gate.release();
+      // Give a dropped session's events time to show.
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+      expect(events.whereType<ConnectionChanged>(), isEmpty);
+      expect(driver().connection, ConnectionState.connected);
+      expect(driver().lastError?.code, WatchmeErrorCode.timeout);
+      expect(power()?.value, PowerMode.on);
+      expect(power()?.confidence, Confidence.reported);
+
+      // The same session carries on: no reconnect reads device-info again.
+      sim.clearLogs();
+      expect(
+        await engine.send(id, const PressKey(RemoteKey.home)),
+        isConfirmed,
+      );
+      expect(sim.requests.map((r) => r.path), ['/keypress/Home']);
+      expect(events.whereType<ConnectionChanged>(), isEmpty);
     });
   });
 

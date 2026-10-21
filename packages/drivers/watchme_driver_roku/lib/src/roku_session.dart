@@ -32,17 +32,32 @@ const int rokuMaxVolumeSteps = 100;
 /// hold up every other command (Back, power off) for minutes.
 const int rokuMaxTextRunes = 256;
 
+/// How many requests in a row must time out, with no answer in between,
+/// before a session reports its device lost. One slow answer is not a lost
+/// device; a Roku that accepts connections and never answers is.
+const int rokuTimeoutsBeforeDisconnect = 3;
+
 /// A session with one Roku over ECP.
 ///
-/// ECP is stateless HTTP, so "connected" means the device answered its last
-/// request. While anyone listens to [events], the session polls
-/// device-info, the foreground app and the media player every poll
-/// interval. It emits [StateChanged] for the fields whose value or
-/// confidence changed ([state] always carries the latest observation
-/// times), [ConnectionChanged] when the device stops or resumes answering,
-/// and [CapabilitiesChanged] when the "Control by mobile apps" level turns
-/// out to differ (for example a key press answered
-/// `ECP command not allowed in Limited mode.`).
+/// ECP is stateless HTTP, so "connected" means the device still answers.
+/// While anyone listens to [events], the session polls device-info, the
+/// foreground app and the media player every poll interval. It emits
+/// [StateChanged] for the fields whose value or confidence changed ([state]
+/// always carries the latest observation times), [ConnectionChanged] when
+/// the device stops or resumes answering, and [CapabilitiesChanged] when
+/// the "Control by mobile apps" level turns out to differ (for example a
+/// key press answered `ECP command not allowed in Limited mode.`).
+///
+/// The device stops answering when a request reaches nothing
+/// ([WatchmeErrorCode.unreachable]: refused, no route, host down), or when
+/// [rokuTimeoutsBeforeDisconnect] requests in a row time out with no answer
+/// in between. The session then marks its observations stale and emits
+/// [ConnectionChanged] with [ConnectionState.disconnected] and the error.
+/// A single [WatchmeErrorCode.timeout] (the Roku accepted the connection
+/// and answered late, or dropped it; the request may have been delivered)
+/// is only returned or thrown: the session stays connected and keeps its
+/// state, so one slow answer does not drop it. Any answer resumes it and
+/// starts the count again.
 ///
 /// Commands run one at a time in the order given, so key presses and text
 /// arrive in order. [close] stops a command in progress before its next
@@ -124,6 +139,9 @@ final class RokuSession implements DriverSession {
 
   /// ECP commands of the running command that the device accepted.
   int _delivered = 0;
+
+  /// Requests that timed out since the device last answered.
+  int _timeouts = 0;
 
   @override
   String get driverId => rokuDriverId;
@@ -479,7 +497,8 @@ final class RokuSession implements DriverSession {
 
   /// Sends one request unless the session was closed meanwhile. Every
   /// request goes through here, so a command stops before its next request
-  /// once [close] is called.
+  /// once [close] is called, and every answer or transport failure counts
+  /// towards the connection state (see [_noteTransportError]).
   Future<HttpResult> _request(Future<HttpResult> Function() send) async {
     if (_closed) throw _closedError;
     final HttpResult r;
@@ -721,11 +740,24 @@ final class RokuSession implements DriverSession {
     _emit(CapabilitiesChanged(List.unmodifiable(caps), driverId: rokuDriverId));
   }
 
+  /// Takes in a request that failed with [e]. Only a device that stopped
+  /// answering is reported lost: a request that reached nothing, or the
+  /// [rokuTimeoutsBeforeDisconnect]th timeout in a row. A single timeout
+  /// is left to the caller, which returns or throws it.
   void _noteTransportError(WatchmeError e) {
-    if (e.code != WatchmeErrorCode.unreachable &&
-        e.code != WatchmeErrorCode.timeout) {
-      return;
+    switch (e.code) {
+      case WatchmeErrorCode.unreachable:
+        _lost(e);
+      case WatchmeErrorCode.timeout:
+        if (++_timeouts >= rokuTimeoutsBeforeDisconnect) _lost(e);
+      default:
+        break;
     }
+  }
+
+  /// The device stopped answering: marks every observation stale and
+  /// reports the session disconnected with [e] (once).
+  void _lost(WatchmeError e) {
     if (_connection != ConnectionState.connected) return;
     _connection = ConnectionState.disconnected;
     _emitState(
@@ -745,7 +777,9 @@ final class RokuSession implements DriverSession {
     );
   }
 
+  /// The device answered a request (whatever its status).
   void _markReachable() {
+    _timeouts = 0;
     if (_connection == ConnectionState.connected || _closed) return;
     _connection = ConnectionState.connected;
     _emitState(
@@ -787,7 +821,9 @@ final class RokuSession implements DriverSession {
     try {
       await refresh();
     } on Object {
-      // Failures surface as ConnectionChanged / CapabilitiesChanged events.
+      // A lost device and a changed access level surface as
+      // ConnectionChanged and CapabilitiesChanged events; a single timeout
+      // leaves the session as it was until the next poll.
     } finally {
       _polling = false;
     }

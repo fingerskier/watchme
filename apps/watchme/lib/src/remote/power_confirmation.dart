@@ -6,11 +6,11 @@ import 'package:watchme_engine/watchme_engine.dart' show PowerOrchestrator;
 /// is on before it sends a power toggle for [command].
 ///
 /// The engine answers `Unsupported(Unsupported.needsConfirmation)` when the
-/// only way to carry out [SetPower] or the power key
-/// (`PressKey(RemoteKey.power)`, a toggle intent) is a toggle, and its
-/// evidence does not agree on the TV's current state. A [SetPower] the user
-/// already confirmed is never asked about again: if it is refused too, the
-/// refusal is reported instead.
+/// only way to carry out [SetPower] is a toggle and its evidence does not
+/// agree on the TV's current state, and when its evidence does not settle
+/// the current state for the power key (`PressKey(RemoteKey.power)`, a
+/// toggle intent). A [SetPower] the user already confirmed is never asked
+/// about again: if it is refused too, the refusal is reported instead.
 bool needsPowerConfirmation(Command command, CommandResult result) =>
     result is Unsupported &&
     result.reason == Unsupported.needsConfirmation &&

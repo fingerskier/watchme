@@ -16,10 +16,13 @@ export 'demo_tvs.dart' show demoFireTvHost, demoFireTvPin, demoRokuHost;
 ///
 /// Both appear after a [scan], or when added by address. Other addresses
 /// fail as unreachable, or as refused when they are off the local network.
-/// The power key asks whether the TV is on, on both TVs, as the engine
-/// does for a TV with fewer than two independent sources for its power
-/// state: each demo TV has only its own driver. Power on and Power off are
-/// discrete on both and need no question.
+/// Each demo TV has only its own driver, so one source for its power
+/// state, and the power key follows the engine's rule for that case: the
+/// Roku reports its power mode and has discrete on and off, so the power
+/// key switches it with the discrete command; the Fire TV can only infer
+/// its state, so the power key asks whether the TV is on. Both ask within
+/// the engine's quiet period after a power command. Power on and Power off
+/// are discrete on both and need no question.
 final class DemoWatchmeClient implements WatchmeClient {
   /// Creates the demo. [latency] delays every answer and [scanTime] caps a
   /// scan's duration; tests pass [Duration.zero] for both.
