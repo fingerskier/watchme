@@ -528,7 +528,12 @@ abstract interface class Driver {
   ///
   /// Throws [WatchmeError]: [WatchmeErrorCode.unauthorized] when pairing is
   /// required and [credential] is `null`; [WatchmeErrorCode.reauthRequired]
-  /// when the device rejects [credential]; transport codes otherwise.
+  /// when the device rejects [credential]; transport codes otherwise. A
+  /// driver that sent a wake that may have reached the device (Fire TV's
+  /// DIAL launch acknowledged, or failed without proving it did nothing)
+  /// before failing throws [WatchmeErrorCode.partiallyDelivered] instead,
+  /// whatever failed, with that failure (a rejected [credential] included)
+  /// as its [WatchmeError.cause]: the device may now be on.
   Future<DriverSession> connect(
     Endpoint endpoint,
     Transports transports,

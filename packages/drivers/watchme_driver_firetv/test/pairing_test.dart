@@ -132,7 +132,10 @@ void main() {
     expect(net.callsTo('POST', '/v1/FireTV/pin/verify'), hasLength(1));
   });
 
-  test('a refused verify fails with the raw device text', () async {
+  test('a refused verify says why in watchme\'s words, never the '
+      'device\'s', () async {
+    // Codex re-review of finding #8: this endpoint's text may be the
+    // token, whatever it looks like, so "PIN expired" is not shown either.
     net.respond(
       'POST',
       '/v1/FireTV/pin/verify',
@@ -143,8 +146,12 @@ void main() {
       steps.last,
       isPairingFailedWith(
         WatchmeErrorCode.rejected,
-        rawDeviceMessage: 'PIN expired',
+        rawDeviceMessage: '<redacted> (11 characters, not JSON)',
       ),
+    );
+    expect(
+      (steps.last as PairingFailed).error.message,
+      allOf(contains('HTTP 400'), endsWith(FireTvDriver.pinRefusedReason)),
     );
   });
 
@@ -294,7 +301,7 @@ void main() {
       expectNoToken(step);
     });
 
-    test('a refusal keeps its words but not a token field', () async {
+    test('a refusal keeps neither its words nor a token field', () async {
       final step = await verifyAnswers(
         HttpResult.json(400, {
           'description': 'PIN expired',
@@ -306,10 +313,92 @@ void main() {
         isPairingFailedWith(
           WatchmeErrorCode.rejected,
           rawDeviceMessage:
-              '{"description":"PIN expired","clientToken":"<redacted>"}',
+              '{"description":"<redacted>","clientToken":"<redacted>"}',
         ),
       );
       expectNoToken(step);
+    });
+
+    // Codex re-review of finding #8: `keepProse` kept a description shaped
+    // like words, and a token may contain spaces.
+    for (final status in [400, 401, 403, 500]) {
+      test('a word-shaped token in a refusal: HTTP $status', () async {
+        final step = await verifyAnswers(
+          HttpResult.json(status, {'description': 'secret bearer words'}),
+        );
+        expect(
+          step,
+          isPairingFailedWith(
+            status == 400
+                ? WatchmeErrorCode.rejected
+                : status == 500
+                ? WatchmeErrorCode.protocol
+                : WatchmeErrorCode.unauthorized,
+            rawDeviceMessage: '{"description":"<redacted>"}',
+          ),
+        );
+        final failed = step as PairingFailed;
+        for (final text in [
+          jsonEncode(failed.toJson()),
+          jsonEncode(failed.toJson(includeSecrets: true)),
+          '$failed',
+          '${failed.error.cause}',
+        ]) {
+          expect(text, isNot(contains('secret')), reason: text);
+          expect(text, isNot(contains('bearer')), reason: text);
+        }
+        expect(
+          failed.error.message,
+          status == 500
+              ? isNot(contains(FireTvDriver.pinRefusedReason))
+              : endsWith(FireTvDriver.pinRefusedReason),
+        );
+      });
+    }
+
+    group('a token holding the X-Api-Key value', () {
+      // Codex re-review of finding #8: the API key, a prefix of this
+      // token, was replaced first and left `<redacted>-SecretSuffix`.
+      const token = '0987654321-SecretSuffix';
+
+      void expectNoSuffix(PairingStep step) {
+        final failed = step as PairingFailed;
+        for (final text in [
+          jsonEncode(failed.toJson()),
+          jsonEncode(failed.toJson(includeSecrets: true)),
+          '$failed',
+          '${failed.error.cause}',
+        ]) {
+          expect(text, isNot(contains('SecretSuffix')), reason: text);
+          expect(text, isNot(contains(token)), reason: text);
+          expect(text, isNot(contains('-Sec')), reason: text);
+        }
+      }
+
+      test('in a 403 description', () async {
+        final step = await verifyAnswers(
+          HttpResult.json(403, {'description': token}),
+        );
+        expect(step, isPairingFailedWith(WatchmeErrorCode.unauthorized));
+        expectNoSuffix(step);
+      });
+
+      test('refused for its characters, then echoed in a key and in '
+          'escaped text', () async {
+        // The newline makes the token unusable, so the driver adds it to
+        // the values it removes; the key and the nested, escaped copy are
+        // only found that way.
+        const unusable = '$token\n';
+        final step = await verifyAnswers(
+          HttpResult.json(200, {
+            'description': unusable,
+            unusable: 1,
+            'detail': r'id 0987654321-SecretSuffix\n, key 0987654321',
+          }),
+        );
+        expect(step, isPairingFailedWith(WatchmeErrorCode.protocol));
+        expectNoSuffix(step);
+      });
     });
   });
 
@@ -335,6 +424,63 @@ void main() {
       (steps.single as PairingFailed).error.message,
       contains('DIAL wake failed too'),
     );
+  });
+
+  // Codex re-review of finding #4: an acknowledged wake that the API never
+  // followed was reported as unreachable, which says nothing reached the
+  // device, although the wake may have turned it (and the TV) on.
+  group('a failure after a wake that may have reached the device is a '
+      'partial delivery', () {
+    Future<PairingFailed> failure() async {
+      final stepsFuture = _drive(start(), []);
+      await clock.advance(const Duration(seconds: 7));
+      return (await stepsFuture).single as PairingFailed;
+    }
+
+    test('acknowledged, then the API stays closed', () async {
+      tv.wakeOnDial = false;
+      final failed = await failure();
+      expect(failed.error.code, WatchmeErrorCode.partiallyDelivered);
+      expect(failed.error.message, contains('acknowledged the DIAL wake'));
+      expect(failed.error.cause, isWatchmeError(WatchmeErrorCode.unreachable));
+      expect(tv.wakes, 1);
+    });
+
+    test('timed out, then the API stays closed', () async {
+      net.onHttp('POST', '/apps/FireTVRemote', (_) {
+        tv.wakes++;
+        throw const WatchmeError.timeout('No answer from DIAL');
+      });
+      final failed = await failure();
+      expect(failed.error.code, WatchmeErrorCode.partiallyDelivered);
+      expect(
+        failed.error.message,
+        contains('DIAL wake may have reached the Fire TV'),
+      );
+      expect(failed.error.cause, isWatchmeError(WatchmeErrorCode.unreachable));
+    });
+
+    test('acknowledged, then showing the PIN is refused', () async {
+      net.respond(
+        'POST',
+        '/v1/FireTV/pin/display',
+        HttpResult.json(403, {'description': 'not now'}),
+      );
+      final failed = await failure();
+      expect(failed.error.code, WatchmeErrorCode.partiallyDelivered);
+      expect(failed.error.cause, isWatchmeError(WatchmeErrorCode.unauthorized));
+      expect(failed.rawDeviceMessage, '{"description":"not now"}');
+    });
+
+    test('refused by DIAL (403), then showing the PIN is refused: not '
+        'partial', () async {
+      tv.wakeUp();
+      net.respond('POST', '/apps/FireTVRemote', HttpResult(403));
+      net.respond('POST', '/v1/FireTV/pin/display', HttpResult(403));
+      final failed = await failure();
+      expect(failed.error.code, WatchmeErrorCode.unauthorized);
+      expect(failed.error.message, contains('DIAL wake failed too'));
+    });
   });
 
   test('cancel ends the flow with PairingFailed(cancelled)', () async {

@@ -67,6 +67,18 @@ class Rig {
   Future<CommandResult> power(bool on) => h.engine.send(id, SetPower(on));
 }
 
+/// The result of a power operation that [PowerOrchestrator.close] cut short
+/// after something it sent may have reached the device: not a bare
+/// "cancelled", which would say nothing happened.
+final Matcher isInterruptedAfterSending = allOf(
+  isFailedWith(WatchmeErrorCode.partiallyDelivered),
+  isA<Failed>().having(
+    (f) => f.error.cause,
+    'cause',
+    isWatchmeError(WatchmeErrorCode.cancelled),
+  ),
+);
+
 const powerOnUnavailable = CapabilitySupport(
   Capability.powerOn,
   Support.no,
@@ -204,27 +216,30 @@ void main() {
       expect(await stale, isConfirmed);
     });
 
-    test(
-      'Wake-on-LAN goes through the injected sender when there is one',
-      () async {
-        final calls = <(String, String?)>[];
-        Future<bool> sender(String m, {String? lastKnownIp}) async {
-          calls.add((m, lastKnownIp));
-          return true;
-        }
+    test('Wake-on-LAN goes through the injected sender when there is one, '
+        'once per round', () async {
+      final calls = <(String, String?)>[];
+      Future<bool> sender(String m, {String? lastKnownIp}) async {
+        calls.add((m, lastKnownIp));
+        return true;
+      }
 
-        final dial = FakeDriver('dial');
-        final rig = await Rig([dial], mac: mac, wakeOnLan: sender).add();
-        addTearDown(rig.h.close);
-        rig.online = false;
-        final result = rig.power(true);
-        await rig.h.clock.flush();
-        expect(calls, [(mac, '10.0.2.40')]);
-        expect(rig.h.transports.net.sentDatagrams, isEmpty);
-        await rig.h.clock.advance(const Duration(seconds: 31));
-        expect(await result, isSentUnconfirmed);
-      },
-    );
+      final dial = FakeDriver('dial');
+      final rig = await Rig([dial], mac: mac, wakeOnLan: sender).add();
+      addTearDown(rig.h.close);
+      rig.online = false;
+      final result = rig.power(true);
+      await rig.h.clock.flush();
+      expect(calls, [(mac, '10.0.2.40')]);
+      expect(rig.h.transports.net.sentDatagrams, isEmpty);
+      // The orchestrator repeats the round itself, so it can stop between
+      // rounds when it is closed.
+      await rig.h.clock.advance(const Duration(milliseconds: 200));
+      expect(calls, List.filled(3, (mac, '10.0.2.40')));
+      await rig.h.clock.advance(const Duration(seconds: 31));
+      expect(await result, isSentUnconfirmed);
+      expect(calls, hasLength(3));
+    });
 
     test('a sender that sends nothing means no Wake-on-LAN went out', () async {
       final dial = FakeDriver('dial');
@@ -234,7 +249,10 @@ void main() {
         wakeOnLan: (_, {lastKnownIp}) async => false,
       ).add();
       addTearDown(rig.h.close);
-      expect(await rig.power(true), isUnsupported(contains('Wake-on-LAN')));
+      final result = rig.power(true);
+      // Every round is tried, 100 ms apart.
+      await rig.h.clock.advance(const Duration(milliseconds: 200));
+      expect(await result, isUnsupported(contains('Wake-on-LAN')));
     });
 
     test('closing the engine stops a wait for the device to wake', () async {
@@ -244,11 +262,66 @@ void main() {
       final result = rig.power(true);
       await rig.h.clock.advance(const Duration(seconds: 3));
       final probesBefore = dial.probes.length;
+      final packets = rig.h.transports.net.sentDatagrams.length;
       await rig.h.close();
       await rig.h.clock.advance(const Duration(seconds: 40));
-      expect(await result, isFailedWith(WatchmeErrorCode.cancelled));
+      // The packets went out before the close: the device may still wake.
+      expect(await result, isInterruptedAfterSending);
       expect(dial.probes, hasLength(probesBefore));
       expect(dial.connects, isEmpty);
+      expect(rig.h.transports.net.sentDatagrams, hasLength(packets));
+    });
+
+    test('closing the engine between Wake-on-LAN rounds sends no more '
+        'packets, and the caller learns that some went out', () async {
+      // Codex re-review, new finding 1 (Reqall 9365): close() answered
+      // "cancelled" while the wake loop went on, and the 4 packets of the
+      // first round became 12 a second later.
+      final dial = FakeDriver('dial');
+      final rig = await Rig([dial], mac: mac).add();
+      rig.online = false;
+      CommandResult? result;
+      unawaited(rig.power(true).then((r) => result = r));
+      await rig.h.clock.flush();
+      final net = rig.h.transports.net;
+      expect(net.sentDatagrams, hasLength(4), reason: 'the first round');
+
+      await rig.h.close();
+      await rig.h.clock.advance(const Duration(seconds: 1));
+      expect(net.sentDatagrams, hasLength(4));
+      expect(result, isInterruptedAfterSending);
+      await rig.h.clock.advance(const Duration(seconds: 40));
+      expect(net.sentDatagrams, hasLength(4));
+      expect(dial.connects, isEmpty);
+    });
+
+    test('closing the engine while the injected sender is sending: no '
+        'further round, and the caller gets a result within a second that '
+        'says packets may have gone out', () async {
+      var calls = 0;
+      final sending = Completer<bool>();
+      Future<bool> sender(String m, {String? lastKnownIp}) {
+        calls++;
+        return sending.future;
+      }
+
+      final dial = FakeDriver('dial');
+      final rig = await Rig([dial], mac: mac, wakeOnLan: sender).add();
+      rig.online = false;
+      CommandResult? result;
+      unawaited(rig.power(true).then((r) => result = r));
+      await rig.h.clock.flush();
+      expect(calls, 1);
+
+      await rig.h.close();
+      expect(result, isNull, reason: 'a packet may be on its way');
+      await rig.h.clock.advance(const Duration(seconds: 1));
+      expect(result, isInterruptedAfterSending);
+
+      sending.complete(true);
+      await rig.h.clock.advance(const Duration(seconds: 40));
+      expect(calls, 1);
+      expect(dial.probes, hasLength(1), reason: 'only the add probed');
     });
 
     test('a later request for something else ends the wait after '
@@ -278,6 +351,67 @@ void main() {
         isUnsupported('No driver for this device can turn it off'),
       );
       expect(dial.probes.length, lessThanOrEqualTo(probes + 1));
+    });
+
+    for (final (name, interrupt) in [
+      ('an off', const SetPower(false)),
+      ('the power key', const PressKey(RemoteKey.power)),
+    ]) {
+      test('$name queued behind the wait ends it at the next poll, even with '
+          'an on queued after it', () async {
+        // Codex re-review, new finding 2 (Reqall 9366): only the last queued
+        // request was checked, so an on queued after the off hid it, and
+        // the off waited out the whole 30 s wake timeout.
+        final roku = FakeDriver('roku.ecp', ceiling: const [discreteOff]);
+        final rig = await Rig([roku], mac: mac).add();
+        addTearDown(rig.h.close);
+        rig.online = false;
+        CommandResult? first;
+        unawaited(rig.power(true).then((r) => first = r));
+        await rig.h.clock.advance(const Duration(seconds: 3));
+        expect(first, isNull, reason: 'still waiting for the device');
+
+        CommandResult? second;
+        unawaited(rig.h.engine.send(rig.id, interrupt).then((r) => second = r));
+        unawaited(rig.power(true));
+        await rig.h.clock.advance(const Duration(seconds: 2));
+        expect(first, isSentUnconfirmed);
+        expect(second, isNotNull, reason: 'it ran at the next poll');
+        if (interrupt is SetPower) {
+          expect(second, isConfirmed);
+          expect(roku.executed, [const SetPower(false)]);
+        }
+      });
+    }
+
+    test('an on that an off interrupted while it was queued sends no '
+        'Wake-on-LAN before the off', () async {
+      // Integration adversarial check of Codex re-review finding 2: a
+      // queued on, interrupted before it started, still sent a full round
+      // of magic packets just before the off ran, so the TV could wake
+      // after the off.
+      final roku = FakeDriver('roku.ecp', ceiling: const [discreteOff]);
+      final rig = await Rig([roku], mac: mac).add();
+      addTearDown(rig.h.close);
+      rig.online = false;
+      CommandResult? first;
+      unawaited(rig.power(true).then((r) => first = r));
+      await rig.h.clock.advance(const Duration(seconds: 3));
+      expect(first, isNull, reason: 'still waiting for the device');
+      final packets = rig.h.transports.net.sentDatagrams.length;
+
+      // Not joined: it asks more firmly than the running on.
+      final second = rig.h.engine.send(
+        rig.id,
+        const SetPower(true, userConfirmed: true),
+      );
+      final off = rig.power(false);
+      await rig.h.clock.advance(const Duration(seconds: 3));
+      expect(first, isSentUnconfirmed);
+      expect(await second, isFailedWith(WatchmeErrorCode.cancelled));
+      expect(await off, isConfirmed);
+      expect(roku.executed, [const SetPower(false)]);
+      expect(rig.h.transports.net.sentDatagrams, hasLength(packets));
     });
 
     test('no toggle after Wake-on-LAN, even with agreeing sources', () async {
@@ -958,6 +1092,102 @@ void main() {
     expect(ws.executed, isEmpty);
   });
 
+  group('a connect whose wake may have reached the device', () {
+    // Codex re-review of finding #4 (Reqall 9345): a Fire TV's acknowledged
+    // DIAL wake switched the TV on, its API never opened, the connect
+    // failure counted as "nothing sent", and a confirmed toggle on another
+    // driver switched the TV straight back off. The driver now reports
+    // such a connect as partiallyDelivered.
+    WatchmeError wokeThen(WatchmeError cause) =>
+        WatchmeError.partiallyDelivered(
+          'The DIAL wake reached the TV, then: ${cause.message}',
+          cause: cause,
+        );
+
+    test('is not followed by a toggle, even a confirmed one', () async {
+      final fire = FakeDriver('firetv.lightning', ceiling: const [discreteOn]);
+      final ws = FakeDriver('samsung.ws', ceiling: const [toggleOn]);
+      final rig = await Rig([fire, ws]).add();
+      addTearDown(rig.h.close);
+      fire.connectError = wokeThen(
+        const WatchmeError.unreachable('The API port never opened'),
+      );
+
+      expect(
+        await rig.h.engine.send(
+          rig.id,
+          const SetPower(true, userConfirmed: true),
+        ),
+        isFailedWith(WatchmeErrorCode.partiallyDelivered),
+      );
+      expect(fire.connects.single.allowWake, isTrue);
+      expect(ws.executed, isEmpty, reason: 'the toggle would undo the wake');
+      expect(
+        rig.h.engine.power.lastCommand(rig.id)?.on,
+        isTrue,
+        reason: 'the wake may have acted, so the quiet period starts',
+      );
+    });
+
+    test('rejecting the credential is still not followed by a toggle, and '
+        'the pairing shows as revoked', () async {
+      final fire = FakeDriver(
+        'firetv.lightning',
+        ceiling: const [discreteOn],
+        requiresPairing: true,
+      );
+      final ws = FakeDriver('samsung.ws', ceiling: const [toggleOn]);
+      final rig = await Rig([fire, ws]).add();
+      addTearDown(rig.h.close);
+      await rig.h.credentials.write(token(rig.id, 'firetv.lightning'));
+      final events = <DeviceEvent>[];
+      rig.h.engine.events(rig.id).listen(events.add);
+      fire.connectError = wokeThen(
+        const WatchmeError.unauthorized(
+          'The TV rejected the token',
+          rawDeviceMessage: '401 Unauthorized',
+        ),
+      );
+
+      expect(
+        await rig.h.engine.send(
+          rig.id,
+          const SetPower(true, userConfirmed: true),
+        ),
+        isFailedWith(WatchmeErrorCode.partiallyDelivered),
+      );
+      expect(ws.executed, isEmpty);
+      await pump();
+      expect(events.whereType<ReauthRequired>(), hasLength(1));
+      final view = rig.h.driverView(rig.id, 'firetv.lightning');
+      expect(view.needsPairing, isTrue);
+      expect(
+        view.lastError,
+        isWatchmeError(
+          WatchmeErrorCode.reauthRequired,
+          rawDeviceMessage: '401 Unauthorized',
+        ),
+      );
+    });
+
+    test('a command routed through it is not replayed on another '
+        'driver', () async {
+      const keys = [CapabilitySupport.yes(Capability.systemKeys)];
+      final fire = FakeDriver('firetv.lightning', ceiling: keys);
+      final roku = FakeDriver('roku.ecp', ceiling: keys);
+      final rig = await Rig([fire, roku]).add();
+      addTearDown(rig.h.close);
+      fire.connectError = wokeThen(
+        const WatchmeError.timeout('The status read timed out'),
+      );
+      expect(
+        await rig.h.engine.send(rig.id, const PressKey(RemoteKey.home)),
+        isFailedWith(WatchmeErrorCode.partiallyDelivered),
+      );
+      expect(roku.connects, isEmpty);
+    });
+  });
+
   group('one power operation per device at a time', () {
     test('two concurrent offs send one toggle', () async {
       final ws = FakeDriver('samsung.ws', ceiling: const [toggleOff]);
@@ -1018,8 +1248,12 @@ void main() {
       expect(second, isNull, reason: 'queued behind the hung one');
 
       await rig.h.close();
-      expect(first, isFailedWith(WatchmeErrorCode.cancelled));
       expect(second, isFailedWith(WatchmeErrorCode.cancelled));
+      // The toggle may have reached the TV: its caller is not told that
+      // nothing happened, and waits no longer than a second for the session.
+      expect(first, isNull);
+      await rig.h.clock.advance(const Duration(seconds: 1));
+      expect(first, isInterruptedAfterSending);
       expect(ws.executed, [const SetPower(false)]);
     });
 
@@ -1127,6 +1361,39 @@ void main() {
       expect(await second, isFailedWith(WatchmeErrorCode.cancelled));
       expect(target.executed, isEmpty);
     });
+
+    test('a running request sends nothing after close: a command in flight '
+        'that turns out not to have been sent ends it as cancelled, with no '
+        'Wake-on-LAN after it', () async {
+      final transports = FakeTransports();
+      orchestrator = PowerOrchestrator(transports: transports, clock: clock);
+      final attempt = Completer<RouteAttempt>();
+      final target = _ScriptedTarget(
+        routes: const [discreteOn],
+        macs: const {mac},
+        onExecute: (_) => attempt.future,
+      );
+      CommandResult? result;
+      unawaited(orchestrator.setPower(target, true).then((r) => result = r));
+      await pump();
+      expect(target.executed, [const SetPower(true)]);
+
+      orchestrator.close();
+      await pump();
+      expect(result, isNull, reason: 'the power-on may be on its way');
+      attempt.complete(
+        const RouteAttempt(
+          Failed(WatchmeError.unreachable('refused')),
+          commandSent: false,
+        ),
+      );
+      await pump();
+      expect(result, isFailedWith(WatchmeErrorCode.cancelled));
+      await clock.advance(const Duration(seconds: 40));
+      expect(transports.net.sentDatagrams, isEmpty);
+      expect(target.executed, hasLength(1));
+      expect(target.evidenceReads, 0);
+    });
   });
 
   group('waking while connecting', () {
@@ -1230,6 +1497,52 @@ class _GatedTarget implements PowerTarget {
       for (final (i, mode) in evidence.indexed)
         Observed.reported(mode, 'source$i', clock.now()),
     ];
+  }
+
+  @override
+  Future<bool> answers() async => false;
+}
+
+/// A device whose power routes are [routes] and whose commands are answered
+/// by [onExecute]; it never answers a probe.
+class _ScriptedTarget implements PowerTarget {
+  _ScriptedTarget({
+    required this._routes,
+    required this.onExecute,
+    this.macs = const {},
+  });
+
+  final List<CapabilitySupport> _routes;
+  final Future<RouteAttempt> Function(Command command) onExecute;
+  final List<Command> executed = [];
+  int evidenceReads = 0;
+
+  @override
+  final Set<String> macs;
+
+  @override
+  String get deviceId => 'tv';
+
+  @override
+  String get host => '10.0.2.60';
+
+  @override
+  List<RouteCandidate> routes(Capability capability) => [
+    for (final s in _routes)
+      if (s.capability == capability)
+        RouteCandidate(driverId: 'driver', support: s),
+  ];
+
+  @override
+  Future<RouteAttempt> execute(RouteCandidate route, Command command) {
+    executed.add(command);
+    return onExecute(command);
+  }
+
+  @override
+  Future<List<Observed<PowerMode>>> powerEvidence() async {
+    evidenceReads++;
+    return const [];
   }
 
   @override

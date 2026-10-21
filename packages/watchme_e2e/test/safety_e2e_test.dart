@@ -358,6 +358,85 @@ void main() {
       expect(sim.requests.map((r) => r.path), ['/keypress/Home']);
       expect(events.whereType<ConnectionChanged>(), isEmpty);
     });
+
+    /// The e2e configuration with the Wake-on-LAN rounds far enough apart
+    /// for a test to act between them.
+    const slowRounds = EngineConfig(
+      probeTimeout: Duration(seconds: 5),
+      connectTimeout: Duration(seconds: 10),
+      power: PowerConfig(
+        broadcastAddress: '127.255.255.255',
+        wakeTimeout: Duration(seconds: 3),
+        wakePollInterval: Duration(milliseconds: 200),
+        wakeOnLanInterval: Duration(milliseconds: 300),
+      ),
+    );
+
+    /// The magic packets of one Wake-on-LAN round for device [id]: each
+    /// cached MAC to the loopback broadcast and as unicast, on ports 9
+    /// and 7.
+    Future<int> roundOf(E2eSystem system, String id) async =>
+        (await system.devices.get(id))!.allMacs.length * 2 * 2;
+
+    test('closing the engine between Wake-on-LAN rounds sends no more '
+        'packets, and the caller learns some went out', () async {
+      final system = await E2eSystem.start(dir, config: slowRounds);
+      final id = await addRoku(system);
+      final round = await roundOf(system, id);
+      expect(round, greaterThan(0));
+      // Off the network: the discrete PowerOn fails, so magic packets go
+      // to the cached MACs.
+      await sim.stop();
+      final datagrams = system.transports.datagramLog;
+      final result = system.engine.send(id, const SetPower(true));
+      await eventually(() => datagrams.length >= round, reason: 'one round');
+      final sent = datagrams.length;
+      expect(sent, round, reason: 'one round, then a 300 ms gap');
+
+      await system.engine.close();
+      // Two more rounds were due within 600 ms.
+      await Future<void>.delayed(const Duration(seconds: 1));
+      expect(datagrams, hasLength(sent));
+      expect(
+        await result,
+        failedWithCause(
+          WatchmeErrorCode.partiallyDelivered,
+          WatchmeErrorCode.cancelled,
+        ),
+      );
+    });
+
+    test('closing the engine while it waits for the woken device ends the '
+        'wait without another probe, and the caller learns packets went '
+        'out', () async {
+      final system = await E2eSystem.start(dir, config: slowRounds);
+      final id = await addRoku(system);
+      final all = slowRounds.power.wakeOnLanRepeats * await roundOf(system, id);
+      await sim.stop();
+      final transports = system.transports;
+      final result = system.engine.send(id, const SetPower(true));
+      // Every round went out, and the wait polls the device every 200 ms.
+      await eventually(() => transports.datagramLog.length >= all);
+      final probed = transports.httpLog.length;
+      await eventually(
+        () => transports.httpLog.length > probed,
+        reason: 'the first poll',
+      );
+
+      final polls = transports.httpLog.length;
+      await system.engine.close();
+      // The wait had more than two seconds left: about ten polls.
+      await Future<void>.delayed(const Duration(seconds: 1));
+      expect(transports.httpLog, hasLength(polls));
+      expect(transports.datagramLog, hasLength(all));
+      expect(
+        await result,
+        failedWithCause(
+          WatchmeErrorCode.partiallyDelivered,
+          WatchmeErrorCode.cancelled,
+        ),
+      );
+    });
   });
 
   group('one host both drivers recognise', () {
@@ -473,6 +552,104 @@ void main() {
         isEmpty,
         reason: 'the Fire TV route would press three more times',
       );
+    });
+  });
+
+  group('#4 a wake sent while connecting', () {
+    late FireTvSimulator sim;
+    late ToggleOnlyPowerDriver toggle;
+    late E2eSystem system;
+    late String id;
+
+    /// How long the Fire TV driver waits for its API after a wake.
+    const apiStartup = Duration(milliseconds: 500);
+
+    /// A device with two power-on routes: the Fire TV's DIAL wake
+    /// (discrete), and a toggle. It is paired, then the engine restarts
+    /// with the stick asleep, so the next command connects (and wakes).
+    setUp(() async {
+      sim = await FireTvSimulator.start();
+      addTearDown(sim.close);
+      toggle = ToggleOnlyPowerDriver();
+      final first = await E2eSystem.start(
+        dir,
+        extraDrivers: [toggle],
+        fireTvApiStartupTimeout: apiStartup,
+      );
+      id = await addAndPairFireTv(first, sim);
+      expect(
+        first.engine.currentDevices.single.drivers.map((d) => d.driverId),
+        unorderedEquals([fireTvDriverId, ToggleOnlyPowerDriver.id]),
+      );
+      await first.close();
+      await sim.sleep();
+      system = await E2eSystem.start(
+        dir,
+        extraDrivers: [toggle],
+        fireTvApiStartupTimeout: apiStartup,
+      );
+      sim.clearLog();
+    });
+
+    Iterable<FireTvSimRequest> wakes() =>
+        sim.dialRequests.where((r) => r.method == 'POST');
+
+    test('an acknowledged DIAL wake whose API never opens is a partial '
+        'delivery: no toggle follows to undo it', () async {
+      // The DIAL server takes the wake, but the API port stays closed (a
+      // stick slow to boot, or one whose remote app failed to start).
+      sim.respondOnce('POST', '/apps/FireTVRemote', 201);
+      final result = await system.engine.send(
+        id,
+        const SetPower(true, userConfirmed: true),
+      );
+      expect(
+        result,
+        failedWithCause(
+          WatchmeErrorCode.partiallyDelivered,
+          WatchmeErrorCode.unreachable,
+        ),
+      );
+      expect(wakes(), hasLength(1));
+      expect(
+        toggle.toggles,
+        isEmpty,
+        reason: 'the woken TV would be switched straight back off',
+      );
+      final fireTv = system.engine.currentDevices.single.drivers.firstWhere(
+        (d) => d.driverId == fireTvDriverId,
+      );
+      expect(fireTv.lastError?.code, WatchmeErrorCode.partiallyDelivered);
+      expect(fireTv.needsPairing, isFalse);
+      // The wake may still take effect: it starts the quiet period, as a
+      // delivered power-on would, so no toggle follows it for a while.
+      expect(system.engine.power.lastCommand(id)?.on, isTrue);
+    });
+
+    test('a token refused after the wake still asks for pairing, and no '
+        'toggle follows', () async {
+      sim.revokeTokens();
+      final events = record(system.engine.events(id));
+      final result = await system.engine.send(
+        id,
+        const SetPower(true, userConfirmed: true),
+      );
+      expect(
+        result,
+        failedWithCause(
+          WatchmeErrorCode.partiallyDelivered,
+          WatchmeErrorCode.reauthRequired,
+        ),
+      );
+      expect(wakes(), hasLength(1));
+      expect(sim.awake, isTrue, reason: 'the wake worked');
+      expect(toggle.toggles, isEmpty, reason: 'it would turn the TV off');
+      await eventually(() => events.whereType<ReauthRequired>().isNotEmpty);
+      final fireTv = system.engine.currentDevices.single.drivers.firstWhere(
+        (d) => d.driverId == fireTvDriverId,
+      );
+      expect(fireTv.needsPairing, isTrue);
+      expect(fireTv.lastError?.code, WatchmeErrorCode.reauthRequired);
     });
   });
 

@@ -129,8 +129,11 @@ final class WakeOnLan {
 
   /// Like [wake], but never throws: `true` when at least one packet went
   /// out, `false` for an invalid MAC or when nothing could be sent. Its
-  /// shape is the engine's Wake-on-LAN sender, so hosts pass
-  /// `WakeOnLan(network).send` to `Engine(wakeOnLan: ...)`.
+  /// shape is the engine's Wake-on-LAN sender. The engine calls its sender
+  /// once per round and repeats the rounds itself, stopping between them
+  /// when it is closed, so hosts pass `WakeOnLan(network, repeats: 1).send`
+  /// to `Engine(wakeOnLan: ...)`: with more [repeats], each call would
+  /// repeat every packet again, and those repeats could not be stopped.
   Future<bool> send(String mac, {String? lastKnownIp}) async {
     try {
       return (await wake(mac, lastKnownIp: lastKnownIp)).anySent;

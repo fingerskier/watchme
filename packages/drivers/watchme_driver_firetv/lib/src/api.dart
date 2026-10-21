@@ -250,7 +250,8 @@ bool wakeMayHaveActed(WatchmeError wake) =>
 /// wake itself may have taken effect ([wakeMayHaveActed]), that is no
 /// longer true of the whole operation, since `unreachable` means nothing
 /// reached the device: the result takes the wake's code (a timeout,
-/// say) instead.
+/// say) instead. Connecting and pairing use [afterWake] instead, which
+/// reports such a wake as a partial delivery.
 WatchmeError withWakeContext(WatchmeError error, WatchmeError? wake) {
   if (wake == null) return error;
   final uncertain =
@@ -263,6 +264,33 @@ WatchmeError withWakeContext(WatchmeError error, WatchmeError? wake) {
         : '${error.message} (the DIAL wake failed too: ${wake.message})',
     rawDeviceMessage: error.rawDeviceMessage ?? wake.rawDeviceMessage,
     cause: error.cause ?? error,
+  );
+}
+
+/// The error of [what] (connecting, or pairing up to showing the PIN),
+/// which failed with [error] after sending a DIAL wake that ended with
+/// [wake]: `null` when the DIAL server acknowledged it.
+///
+/// A wake that may have reached the device (acknowledged, or failed
+/// without proving it did nothing: [wakeMayHaveActed]) may have woken it,
+/// and the TV with it over HDMI-CEC, whatever failed next: the API port
+/// staying closed, a status read, a refused token. The result is then
+/// [WatchmeErrorCode.partiallyDelivered] with [error] as its cause, so the
+/// engine neither falls back to another route nor toggles the power, which
+/// could turn the TV off again. A wake that did nothing only adds its
+/// explanation ([withWakeContext]).
+WatchmeError afterWake(String what, WatchmeError error, WatchmeError? wake) {
+  if (error.code == WatchmeErrorCode.partiallyDelivered) return error;
+  if (wake != null && !wakeMayHaveActed(wake)) {
+    return withWakeContext(error, wake);
+  }
+  final sent = wake == null
+      ? 'the Fire TV acknowledged the DIAL wake'
+      : 'the DIAL wake may have reached the Fire TV (${wake.message})';
+  return WatchmeError.partiallyDelivered(
+    '$what failed after $sent, so it may be on: ${error.message}',
+    rawDeviceMessage: error.rawDeviceMessage ?? wake?.rawDeviceMessage,
+    cause: error,
   );
 }
 
@@ -301,23 +329,24 @@ bool isTokenField(String name) {
 ///
 /// * In a JSON body, every string or number value of a token-bearing field
 ///   ([isTokenField]) is removed. With [allValues], every non-empty string
-///   value except `"OK"`, and every number, is: a PIN-verify answer carries
-///   the new token in `description`, and an unexpected answer may carry it
-///   anywhere. [keepProse] then keeps strings that are plainly words
-///   ([isProse], e.g. "PIN expired"). A JSON body that needed no change is
+///   value except `"OK"`, and every number, is, whatever it looks like: a
+///   PIN-verify answer carries the new token in `description`, a token may
+///   be any printable text (words and spaces included), and an unexpected
+///   answer may carry it anywhere. A JSON body that needed no change is
 ///   kept verbatim.
-/// * With [allValues], a non-empty body that is not JSON is removed whole,
-///   unless [keepProse] is set and it is plainly words.
+/// * With [allValues], a non-empty body that is not JSON is removed whole.
 /// * Every occurrence of a [secrets] value is removed: verbatim, trimmed,
 ///   JSON-escaped, and inside JSON strings, whatever escapes the device
-///   used (`\/`, `\uXXXX`). Text that is not JSON is also searched after
-///   decoding JSON string escapes and percent-encoding, and is shown
-///   decoded where a secret was found that way.
+///   used (`\/`, `\uXXXX`). The text is also searched after decoding JSON
+///   string escapes and percent-encoding, and the escaped text such an
+///   occurrence came from is removed. Occurrences are all found in the
+///   same text before any is removed, and each run of overlapping ones is
+///   removed whole, so a secret inside another (the `X-Api-Key` value at
+///   the start of a token, say) leaves nothing of either behind.
 String redactSecrets(
   String text, {
   Iterable<String> secrets = const [],
   bool allValues = false,
-  bool keepProse = false,
 }) {
   final known = _secretForms(secrets);
   if (text.trim().isEmpty) return _scrub(text, known);
@@ -329,7 +358,7 @@ String redactSecrets(
     isJson = false;
   }
   if (!isJson) {
-    if (allValues && !(keepProse && isProse(text.trim()))) {
+    if (allValues) {
       return '$redactedText (${text.length} characters, not JSON)';
     }
     return _scrub(text, known);
@@ -338,9 +367,7 @@ String redactSecrets(
   Object? walk(Object? node, {required bool secret}) {
     switch (node) {
       case final String s
-          when s.isNotEmpty &&
-              (secret ||
-                  (allValues && s != 'OK' && !(keepProse && isProse(s)))):
+          when s.isNotEmpty && (secret || (allValues && s != 'OK')):
         changed = true;
         return redactedText;
       case final String s:
@@ -367,16 +394,8 @@ String redactSecrets(
 
   final redacted = walk(json, secret: false);
   // Whatever the walk missed (a secret spanning JSON syntax) still goes.
-  return _replaceForms(changed ? jsonEncode(redacted) : text, known);
+  return _scrub(changed ? jsonEncode(redacted) : text, known);
 }
-
-/// Whether [text] is plainly words: two or more runs of letters, each
-/// optionally ending in punctuation, separated by single spaces ("PIN
-/// expired", "Bad arguments supplied."). Tokens have digits, symbols or no
-/// spaces, so a token is never prose.
-bool isProse(String text) => _prose.hasMatch(text);
-
-final RegExp _prose = RegExp(r"^[A-Za-z]+[.,:;!?']?(?: [A-Za-z]+[.,:;!?']?)+$");
 
 /// The forms of [secrets] searched for verbatim: each value, trimmed, and
 /// JSON-escaped.
@@ -399,50 +418,128 @@ String _scrubKey(String key, Set<String> secrets, void Function() changed) {
   return clean;
 }
 
-/// [text] with every form of [secrets] replaced. When the text, decoded
-/// once or more ([_decodeEscapes]), holds a secret its raw form hides, the
-/// decoded text is returned with the secret replaced.
-String _scrub(String text, Set<String> secrets) {
-  if (secrets.isEmpty) return text;
-  var current = _replaceForms(text, secrets);
-  var view = current;
-  for (var depth = 0; depth < 3; depth++) {
-    final decoded = _decodeEscapes(view);
-    if (decoded == view) break;
-    view = decoded;
-    if (secrets.any(view.contains)) {
-      view = current = _replaceForms(view, secrets);
-    }
+/// How many levels of escapes [_scrub] decodes.
+const int _decodeDepth = 3;
+
+/// [text] with every occurrence of every one of [forms] replaced by
+/// [redactedText], atomically.
+///
+/// Occurrences are searched for in [text] as it is and decoded once or
+/// more ([_decodeDepth] levels of JSON string escapes and percent-encoding),
+/// overlapping ones included, and each is mapped back to the range of
+/// [text] it came from. Only then is anything replaced: each run of
+/// overlapping or touching ranges becomes one [redactedText]. Replacing one
+/// form after another would instead let the first replacement cut a longer
+/// secret that contains it, leaving the rest of that secret behind.
+String _scrub(String text, Set<String> forms) {
+  if (forms.isEmpty || text.isEmpty) return text;
+  final ranges = <(int, int)>[];
+  _View? view = _View(text);
+  for (var depth = 0; view != null && depth <= _decodeDepth; depth++) {
+    ranges.addAll(view.find(forms));
+    view = view.decoded();
   }
-  return current;
+  return _replaceRanges(text, ranges);
 }
 
-String _replaceForms(String text, Set<String> secrets) {
-  var out = text;
-  for (final form in secrets) {
-    out = out.replaceAll(form, redactedText);
+/// [text] with each run of overlapping or touching [ranges] (start
+/// inclusive, end exclusive) replaced by one [redactedText].
+String _replaceRanges(String text, List<(int, int)> ranges) {
+  if (ranges.isEmpty) return text;
+  ranges.sort((a, b) => a.$1.compareTo(b.$1));
+  final out = StringBuffer();
+  var kept = 0;
+  var (start, end) = ranges.first;
+  for (final (s, e) in ranges.skip(1)) {
+    if (s <= end) {
+      if (e > end) end = e;
+      continue;
+    }
+    out
+      ..write(text.substring(kept, start))
+      ..write(redactedText);
+    kept = end;
+    (start, end) = (s, e);
   }
-  return out;
+  return (out
+        ..write(text.substring(kept, start))
+        ..write(redactedText)
+        ..write(text.substring(end)))
+      .toString();
+}
+
+/// A text decoded from an original one, with the range of the original
+/// each of its UTF-16 code units came from.
+final class _View {
+  /// The original text itself.
+  _View(this.text)
+    : _starts = List.generate(text.length, (i) => i),
+      _ends = List.generate(text.length, (i) => i + 1);
+
+  _View._(this.text, this._starts, this._ends);
+
+  final String text;
+  final List<int> _starts;
+  final List<int> _ends;
+
+  /// The range of the original text behind each occurrence of each of
+  /// [forms] in [text], overlapping occurrences included.
+  Iterable<(int, int)> find(Set<String> forms) sync* {
+    for (final form in forms) {
+      if (form.isEmpty) continue;
+      for (
+        var at = text.indexOf(form);
+        at >= 0;
+        at = text.indexOf(form, at + 1)
+      ) {
+        yield (_starts[at], _ends[at + form.length - 1]);
+      }
+    }
+  }
+
+  /// This text with one level of JSON string escapes (`\/`, `\uXXXX`,
+  /// `\n`, ...) and percent-encoding (`%2F`) decoded, or `null` when it has
+  /// none. Each escape decodes to one code unit, which comes from the
+  /// original range of the whole escape.
+  _View? decoded() {
+    final matches = _escape.allMatches(text).toList();
+    if (matches.isEmpty) return null;
+    final out = StringBuffer();
+    final starts = <int>[];
+    final ends = <int>[];
+    var kept = 0;
+    void copy(int from, int to) {
+      out.write(text.substring(from, to));
+      starts.addAll(_starts.getRange(from, to));
+      ends.addAll(_ends.getRange(from, to));
+    }
+
+    for (final m in matches) {
+      copy(kept, m.start);
+      out.write(_unescape(m));
+      starts.add(_starts[m.start]);
+      ends.add(_ends[m.end - 1]);
+      kept = m.end;
+    }
+    copy(kept, text.length);
+    return _View._(out.toString(), starts, ends);
+  }
 }
 
 final RegExp _escape = RegExp(
   r'\\(?:u([0-9a-fA-F]{4})|(["\\/bfnrt]))|%([0-9a-fA-F]{2})',
 );
 
-/// [text] with JSON string escapes (`\/`, `\uXXXX`, `\n`, ...) and
-/// percent-encoding (`%2F`) decoded, one level.
-String _decodeEscapes(String text) => text.replaceAllMapped(
-  _escape,
-  (m) => switch ((m[1] ?? m[3], m[2])) {
-    (final String hex, _) => String.fromCharCode(int.parse(hex, radix: 16)),
-    (_, 'b') => '\b',
-    (_, 'f') => '\f',
-    (_, 'n') => '\n',
-    (_, 'r') => '\r',
-    (_, 't') => '\t',
-    (_, final c) => c!,
-  },
-);
+/// The one code unit an [_escape] match stands for.
+String _unescape(Match m) => switch ((m[1] ?? m[3], m[2])) {
+  (final String hex, _) => String.fromCharCode(int.parse(hex, radix: 16)),
+  (_, 'b') => '\b',
+  (_, 'f') => '\f',
+  (_, 'n') => '\n',
+  (_, 'r') => '\r',
+  (_, 't') => '\t',
+  (_, final c) => c!,
+};
 
 /// [error] with [redactSecrets] applied to its message and raw device
 /// message, and to its cause: a [WatchmeError] cause is redacted the same

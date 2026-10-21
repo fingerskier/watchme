@@ -735,6 +735,64 @@ void main() {
       await expectInvalidated(events);
     });
 
+    // A connect whose wake may have reached the device reports
+    // partiallyDelivered, whatever failed after it, the credential's
+    // rejection included (Codex re-review of finding #4, Reqall 9345). The
+    // revocation is in its cause, and must still be noticed.
+    for (final cause in const [
+      WatchmeError.reauthRequired(
+        'Token revoked',
+        rawDeviceMessage: '401 token revoked',
+      ),
+      WatchmeError.unauthorized(
+        'Token rejected',
+        rawDeviceMessage: '401 token revoked',
+      ),
+    ]) {
+      test('a connect that woke the device, then had the credential rejected '
+          '(${cause.code.name}), does the same', () async {
+        final events = <DeviceEvent>[];
+        h.engine.events(id).listen(events.add);
+        fire.lastSession.emit(
+          const ConnectionChanged(
+            ConnectionState.disconnected,
+            driverId: 'firetv.lightning',
+          ),
+        );
+        await pump();
+        fire.connectError = WatchmeError.partiallyDelivered(
+          'The DIAL wake reached the TV, then: ${cause.message}',
+          cause: cause,
+        );
+        expect(
+          await h.engine.send(id, home),
+          isFailedWith(WatchmeErrorCode.partiallyDelivered),
+        );
+        expect(fire.connects.last.allowWake, isTrue);
+        await expectInvalidated(events);
+      });
+    }
+
+    test('a command partly delivered before the credential was revoked does '
+        'the same', () async {
+      final events = <DeviceEvent>[];
+      h.engine.events(id).listen(events.add);
+      fire.lastSession.onExecute = (_) => const Failed(
+        WatchmeError.partiallyDelivered(
+          'Typed 3 of 8 characters, then the token was revoked',
+          cause: WatchmeError.reauthRequired(
+            'Token revoked',
+            rawDeviceMessage: '401 token revoked',
+          ),
+        ),
+      );
+      expect(
+        await h.engine.send(id, home),
+        isFailedWith(WatchmeErrorCode.partiallyDelivered),
+      );
+      await expectInvalidated(events);
+    });
+
     test('pairing again restores the driver', () async {
       fire.lastSession.emit(
         const ReauthRequired(

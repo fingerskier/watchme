@@ -38,8 +38,10 @@ Future<WatchmeClient> createClient() async {
 ///   loopback included.
 /// * Drivers: Roku ECP and Fire TV.
 /// * Wake-on-LAN: [WakeOnLan], which also sends to each subnet-directed
-///   broadcast and on ports 9 and 7, repeated, so a multi-homed host and a
-///   lossy Wi-Fi link still reach the TV.
+///   broadcast and on ports 9 and 7, so a multi-homed host still reaches
+///   the TV. It sends one round per call (`repeats: 1`): the engine repeats
+///   the rounds itself, for a lossy Wi-Fi link, and stops between them once
+///   it is closed.
 /// * Stores: `credentials.json` and `devices.json` in [stateDirectory],
 ///   written atomically with mode 0600 in a 0700 directory; a store that
 ///   cannot be made private refuses to write.
@@ -62,7 +64,9 @@ Future<WatchmeClient> createEngineClient({
     // Discovery keeps the strict LAN-only default: a reply from the network
     // must never point the app at its own loopback services.
     discoveryProviders: [SsdpDiscovery(network), MdnsDiscovery()],
-    wakeOnLan: WakeOnLan(network).send,
+    // One round per call: the power orchestrator repeats the rounds and
+    // checks for shutdown between them (see WakeOnLanSender).
+    wakeOnLan: WakeOnLan(network, repeats: 1).send,
     credentials: FileCredentialStore(
       _join(stateDirectory, 'credentials.json'),
       onWarning: warn,

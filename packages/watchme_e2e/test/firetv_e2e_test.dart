@@ -323,18 +323,30 @@ void main() {
         id,
         const PressKey(RemoteKey.home),
       );
+      // Connecting woke the stick through DIAL first (acknowledged), so the
+      // pin mismatch after it is a partial delivery caused by it: the stick,
+      // and the TV with it, may be on.
+      final pinMismatch = isA<WatchmeError>()
+          .having((e) => e.code, 'code', WatchmeErrorCode.partiallyDelivered)
+          .having((e) => e.message, 'message', contains('does not match'))
+          .having(
+            (e) => e.cause,
+            'cause',
+            isWatchmeError(
+              WatchmeErrorCode.protocol,
+              message: contains('does not match the pin'),
+            ),
+          );
       expect(
         result,
-        isFailedWith(
-          WatchmeErrorCode.protocol,
-          message: contains('does not match the pin'),
-        ),
+        isA<Failed>().having((r) => r.error, 'error', pinMismatch),
       );
+      expect(sim.dialRequests.where((r) => r.method == 'POST'), hasLength(1));
       // The TLS check fails before any request: the token never reached
       // the impostor.
       expect(sim.apiRequests, isEmpty);
       final driver = restarted.engine.currentDevices.single.drivers.single;
-      expect(driver.lastError?.code, WatchmeErrorCode.protocol);
+      expect(driver.lastError, pinMismatch);
       expect(driver.connection, ConnectionState.failed);
     });
 

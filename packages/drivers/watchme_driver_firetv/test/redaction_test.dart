@@ -54,26 +54,29 @@ void main() {
       );
     });
 
-    test('keepProse keeps plain words and nothing token-shaped', () {
+    // Codex re-review of finding #8: `keepProse` kept strings shaped like
+    // words, but a token may be any printable text, spaces included, so
+    // HTTP 403 {"description":"secret bearer words"} kept its token.
+    test('allValues removes words too: a token may look like prose', () {
       expect(
         redactSecrets(
-          '{"description":"PIN expired","other":"S3cr3tTok",'
-          '"two":"abc def1","msg":"Bad arguments supplied. Please check."}',
+          '{"description":"secret bearer words","other":"S3cr3tTok",'
+          '"msg":"Bad arguments supplied. Please check."}',
           allValues: true,
-          keepProse: true,
         ),
-        '{"description":"PIN expired","other":"<redacted>",'
-        '"two":"<redacted>","msg":"Bad arguments supplied. Please check."}',
+        '{"description":"<redacted>","other":"<redacted>",'
+        '"msg":"<redacted>"}',
       );
-      expect(
-        redactSecrets('PIN expired', allValues: true, keepProse: true),
+      for (final text in [
         'PIN expired',
-      );
-      for (final token in ['S3cr3tTok', 'tok en\nx', 'abc\ndef', 'a  b']) {
+        'secret bearer words',
+        'S3cr3tTok',
+        'a  b',
+      ]) {
         expect(
-          redactSecrets(token, allValues: true, keepProse: true),
-          startsWith('<redacted>'),
-          reason: token,
+          redactSecrets(text, allValues: true),
+          '<redacted> (${text.length} characters, not JSON)',
+          reason: text,
         );
       }
     });
@@ -161,6 +164,82 @@ void main() {
           reason: 'text without a secret keeps its escapes',
         );
       });
+
+      test('text around a secret keeps its escapes', () {
+        expect(
+          redactSecrets(
+            r'a\/b abc\/tok\/123 %2F tok%2D1',
+            secrets: ['abc/tok/123', 'tok-1'],
+          ),
+          r'a\/b <redacted> %2F <redacted>',
+        );
+      });
+    });
+
+    // Codex re-review of finding #8: secrets were replaced one after the
+    // other, so the `X-Api-Key` value, a prefix of this token, was
+    // replaced first and left `<redacted>-SecretSuffix`, from which the
+    // public key rebuilds the token.
+    group('removes overlapping secrets whole', () {
+      const apiKey = '0987654321';
+      const token = '$apiKey-SecretSuffix';
+
+      for (final (name, text) in [
+        ('the token alone', 'bad token $token'),
+        ('the token as a suffix', 'bad token x$token'),
+        ('the token as an infix', 'x${token}y and z${token}0987'),
+        ('the API key alone elsewhere', 'key $apiKey, token $token'),
+        ('the key right after the token', '$token$apiKey'),
+        ('JSON-escaped', jsonEncode({'e': 'bad token $token'})),
+        ('JSON \\u escapes', r'{"e":"bad 0987654321-SecretSuffix"}'),
+        ('percent-encoded', 'token=0987654321%2DSecretSuffix'),
+        ('percent-encoded twice', 'token=0987654321%252DSecretSuffix'),
+        (
+          'escaped JSON inside JSON',
+          jsonEncode({
+            'e': jsonEncode({'t': token}).replaceAll('-', r'-'),
+          }),
+        ),
+        ('escaped, not JSON', r'<p>0987654321-SecretSuffix</p>'),
+      ]) {
+        test(name, () {
+          final out = redactSecrets(text, secrets: [apiKey, token]);
+          expectNoTokenFragment(out, token, public: apiKey);
+          expect(out, contains(redactedText));
+        });
+      }
+
+      test('either order of the secrets', () {
+        for (final secrets in [
+          [apiKey, token],
+          [token, apiKey],
+        ]) {
+          expect(
+            redactSecrets('a $token b $apiKey c', secrets: secrets),
+            'a <redacted> b <redacted> c',
+          );
+        }
+      });
+
+      test('a secret inside the other, or overlapping its end', () {
+        // A token inside the API key.
+        expect(
+          redactSecrets('k=$apiKey t=87654', secrets: [apiKey, '87654']),
+          'k=<redacted> t=<redacted>',
+        );
+        // A token whose end overlaps the start of the API key.
+        const before = 'SecretSuffix0987';
+        final out = redactSecrets(
+          'x ${before}654321 y',
+          secrets: [apiKey, before],
+        );
+        expect(out, 'x <redacted> y');
+        expectNoTokenFragment(out, before, public: apiKey);
+      });
+
+      test('overlapping occurrences of one secret', () {
+        expect(redactSecrets('xababay', secrets: ['aba']), 'x<redacted>y');
+      });
     });
   });
 
@@ -227,6 +306,17 @@ void main() {
       ),
     );
   });
+}
+
+/// Expects [text] to hold no run of more than 3 characters of [secret],
+/// except runs of the [public] value (the `X-Api-Key`, which every
+/// client sends).
+void expectNoTokenFragment(String text, String secret, {String public = ''}) {
+  for (var i = 0; i + 4 <= secret.length; i++) {
+    final fragment = secret.substring(i, i + 4);
+    if (public.contains(fragment)) continue;
+    expect(text, isNot(contains(fragment)), reason: '"$fragment" in $text');
+  }
 }
 
 class _NoNetwork implements NetworkStack {

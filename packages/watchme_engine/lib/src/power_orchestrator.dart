@@ -5,13 +5,17 @@ import 'package:watchme_core/watchme_core.dart';
 import 'capability_router.dart';
 import 'util.dart';
 
-/// Sends Wake-on-LAN for the device with [mac] (also unicast to
-/// [lastKnownIp] when given) and reports whether any packet went out. Never
-/// throws.
+/// Sends one round of Wake-on-LAN for the device with [mac]: the magic
+/// packet once to each destination, also unicast to [lastKnownIp] when
+/// given. Reports whether any packet went out. Never throws.
 ///
-/// `WakeOnLan(network).send` from watchme_io has this shape: it also sends
-/// to every subnet-directed broadcast and repeats each packet, which a
-/// multi-homed host and a lossy Wi-Fi link need.
+/// The [PowerOrchestrator] repeats the round itself, calling the sender
+/// once per MAC per round, [PowerConfig.wakeOnLanRepeats] rounds
+/// [PowerConfig.wakeOnLanInterval] apart, and stops between calls once it is
+/// closed. A sender should therefore not repeat packets on its own:
+/// `WakeOnLan(network, repeats: 1).send` from watchme_io has the right
+/// shape, and also sends to every subnet-directed broadcast, which a
+/// multi-homed host needs.
 typedef WakeOnLanSender = Future<bool> Function(
   String mac, {
   String? lastKnownIp,
@@ -29,6 +33,7 @@ final class PowerConfig {
     this.wakeOnLanRepeats = 3,
     this.wakeOnLanInterval = const Duration(milliseconds: 100),
     this.broadcastAddress = '255.255.255.255',
+    this.closeGrace = const Duration(seconds: 1),
   });
 
   /// How long to wait for a device to reappear after Wake-on-LAN.
@@ -47,16 +52,22 @@ final class PowerConfig {
   /// UDP ports magic packets go to when no [WakeOnLanSender] is given.
   final List<int> wakeOnLanPorts;
 
-  /// How many times each magic packet is sent (UDP over Wi-Fi is lossy)
-  /// when no [WakeOnLanSender] is given.
+  /// How many rounds of magic packets one wake sends (UDP over Wi-Fi is
+  /// lossy). A round is one call of the [WakeOnLanSender] per MAC, or,
+  /// without one, each packet once to each destination.
   final int wakeOnLanRepeats;
 
-  /// The gap between those repeats.
+  /// The gap between those rounds.
   final Duration wakeOnLanInterval;
 
   /// The broadcast address for magic packets when no [WakeOnLanSender] is
   /// given.
   final String broadcastAddress;
+
+  /// How long [PowerOrchestrator.close] waits for a running operation that
+  /// may have reached the device to stop on its own before telling its
+  /// caller so anyway (a session whose command never returns).
+  final Duration closeGrace;
 }
 
 /// What the [PowerOrchestrator] needs from one device. The engine
@@ -99,12 +110,94 @@ final class _PowerOp {
   _PowerOp(this.intent);
 
   final _Intent intent;
-  late final Future<CommandResult> result;
+  final Completer<CommandResult> _done = Completer();
+
+  /// What its callers get.
+  Future<CommandResult> get result => _done.future;
+
+  /// Whether it has started: every operation queued in front of it ended.
+  bool started = false;
+
+  /// Set once a later request asks for something other than "on" (off, or
+  /// the power key): the user changed their mind, so a wait for this
+  /// operation's Wake-on-LAN to take effect ends, and an "on" sends no
+  /// magic packet, remote command or toggle it has not sent yet. A request
+  /// after that one never clears it, whatever it asks for.
+  bool interrupted = false;
+
+  /// Whether something this operation sent may have reached the device: a
+  /// magic packet went out, or a command was delivered or may have been.
+  bool sent = false;
+
+  /// Sends and commands started and not finished.
+  int inFlight = 0;
+
+  /// Tells the callers what happened, [PowerConfig.closeGrace] after
+  /// [PowerOrchestrator.close], if the operation has not stopped by then.
+  Timer? grace;
+
+  /// Whether the device may have received something from this operation,
+  /// counting what is still on its way.
+  bool get mayHaveSent => sent || inFlight > 0;
 
   /// Whether a caller asking for [other] gets what it wants from this
   /// operation: the same state, asked for at least as firmly.
   bool covers(_Intent other) =>
       intent.on == other.on && (intent.userConfirmed || !other.userConfirmed);
+
+  /// Gives the callers [result], unless they already have one.
+  void complete(CommandResult result) {
+    grace?.cancel();
+    grace = null;
+    if (!_done.isCompleted) _done.complete(result);
+  }
+}
+
+/// [_target] as one operation sees it: once the orchestrator is closed it
+/// sends and reads nothing (a command comes back cancelled and not sent,
+/// evidence is empty, the device does not answer), and every command it
+/// sends is counted in [_op], so [PowerOrchestrator.close] knows whether
+/// the operation may have reached the device.
+final class _OpTarget implements PowerTarget {
+  _OpTarget(this._power, this._target, this._op);
+
+  final PowerOrchestrator _power;
+  final PowerTarget _target;
+  final _PowerOp _op;
+
+  @override
+  String get deviceId => _target.deviceId;
+
+  @override
+  String get host => _target.host;
+
+  @override
+  Set<String> get macs => _target.macs;
+
+  @override
+  List<RouteCandidate> routes(Capability capability) =>
+      _target.routes(capability);
+
+  @override
+  Future<RouteAttempt> execute(RouteCandidate route, Command command) {
+    if (_power._closed) {
+      return Future.value(
+        const RouteAttempt(PowerOrchestrator._closedResult, commandSent: false),
+      );
+    }
+    return _power._effect(
+      _op,
+      () => _target.execute(route, command),
+      (attempt) => attempt.result.delivered || mayHaveActed(attempt.result),
+    );
+  }
+
+  @override
+  Future<List<Observed<PowerMode>>> powerEvidence() async =>
+      _power._closed ? const [] : await _target.powerEvidence();
+
+  @override
+  Future<bool> answers() async => !_power._closed && await _target.answers();
 }
 
 /// Turns devices on and off without guessing (overview section 2.8).
@@ -154,16 +247,23 @@ final class _PowerOp {
 /// asking for what the operation in front of it already asks for joins it
 /// and gets its result; any other caller waits, then decides on fresh
 /// evidence (and meets the quiet period if a toggle just went out). A wait
-/// for a device to answer after Wake-on-LAN ends early when a later caller
-/// asks for something other than "on", and [close] releases every caller
-/// at once.
+/// for a device to answer after Wake-on-LAN ends at its next poll once a
+/// later caller asks for something other than "on" (off, or the power
+/// key), even when another "on" is queued after that caller. An "on" such a
+/// caller interrupted before its Wake-on-LAN went out (it was queued, say)
+/// sends none, and nothing after it: magic packets sent just before the
+/// "off" could wake the device after it.
+///
+/// [close] stops every operation before its next effect (a magic packet, a
+/// command, an evidence read or probe) and releases its callers; see there.
 final class PowerOrchestrator {
   /// Creates an orchestrator.
   ///
-  /// Magic packets go through [wakeOnLan] when given; otherwise the
-  /// orchestrator sends them itself through the transports' network stack,
-  /// to [PowerConfig.broadcastAddress] and the last known IP on
-  /// [PowerConfig.wakeOnLanPorts], [PowerConfig.wakeOnLanRepeats] times.
+  /// Magic packets go through [wakeOnLan] when given, one call per MAC per
+  /// round; otherwise the orchestrator sends them itself through the
+  /// transports' network stack, to [PowerConfig.broadcastAddress] and the
+  /// last known IP on [PowerConfig.wakeOnLanPorts]. Either way there are
+  /// [PowerConfig.wakeOnLanRepeats] rounds.
   PowerOrchestrator({
     required this._transports,
     required this._clock,
@@ -177,9 +277,11 @@ final class PowerOrchestrator {
   final WakeOnLanSender? _wakeOnLan;
   bool _closed = false;
 
-  /// The results of the operations not finished yet, completed by [close]
-  /// if they are still pending then.
-  final Set<Completer<CommandResult>> _pending = {};
+  /// The operations not finished yet, queued or running.
+  final Set<_PowerOp> _ops = {};
+
+  /// Waits in progress ([_sleep]), each with its timer; [close] ends them.
+  final Map<Completer<void>, Timer> _sleeps = {};
 
   /// Tunables.
   final PowerConfig config;
@@ -189,8 +291,8 @@ final class PowerOrchestrator {
 
   final Map<String, PowerCommandRecord> _last = {};
 
-  /// Per device, the last operation queued (running or waiting).
-  final Map<String, _PowerOp> _tail = {};
+  /// Per device, the operations queued, oldest (the running one) first.
+  final Map<String, List<_PowerOp>> _queues = {};
 
   /// The reason a confirmed toggle is refused within the quiet period. It
   /// is not [Unsupported.needsConfirmation]: asking the user again would
@@ -205,21 +307,66 @@ final class PowerOrchestrator {
   /// Forgets what was recorded for [deviceId].
   void forget(String deviceId) => _last.remove(deviceId);
 
-  /// Stops work in flight: a wait for a device to wake ends at its next
-  /// poll, no toggle goes out after it, and running, queued and later calls
-  /// complete at once with [WatchmeErrorCode.cancelled], even when the
-  /// operation in front of them never finishes (a session that hangs).
+  /// Stops work in flight. Nothing more is sent: every operation checks
+  /// before each magic packet, command, evidence read and probe, and a wait
+  /// (for the device to wake, or between Wake-on-LAN rounds) ends at once.
+  ///
+  /// Callers learn what may have happened:
+  ///
+  /// * Later calls, queued calls, and a running operation that has sent
+  ///   nothing complete at once with [WatchmeErrorCode.cancelled].
+  /// * A running operation that may have reached the device (a magic
+  ///   packet went out, a command was or may have been delivered) keeps its
+  ///   result when it was delivered or may have acted; otherwise its caller
+  ///   gets [WatchmeErrorCode.partiallyDelivered], caused by
+  ///   [WatchmeErrorCode.cancelled], never a bare "cancelled", which would
+  ///   say nothing happened. It completes when the operation stops, or
+  ///   after [PowerConfig.closeGrace] if a command it sent never returns (a
+  ///   session that hangs).
   void close() {
+    if (_closed) return;
     _closed = true;
-    for (final done in [..._pending]) {
-      if (!done.isCompleted) done.complete(_closedResult);
+    for (final MapEntry(key: woken, value: timer) in [..._sleeps.entries]) {
+      timer.cancel();
+      woken.complete();
     }
-    _pending.clear();
+    _sleeps.clear();
+    for (final op in [..._ops]) {
+      if (op.started && op.mayHaveSent) {
+        op.grace ??= _clock.timer(
+          config.closeGrace,
+          () => op.complete(_interrupted(op)),
+        );
+      } else {
+        op.complete(_closedResult);
+      }
+    }
   }
 
-  static const Failed _closedResult = Failed(
-    WatchmeError.cancelled('Power control was shut down'),
+  static const WatchmeError _shutDown = WatchmeError.cancelled(
+    'Power control was shut down',
   );
+
+  static const Failed _closedResult = Failed(_shutDown);
+
+  /// What an "on" ends with when a later request interrupted it before it
+  /// sent anything (see [_PowerOp.interrupted]).
+  static const Failed _replacedResult = Failed(
+    WatchmeError.cancelled(
+      'A later power request (off, or the power key) replaced this one',
+    ),
+  );
+
+  /// What the callers of [op] learn when [close] cut it short.
+  static CommandResult _interrupted(_PowerOp op) => op.mayHaveSent
+      ? const Failed(
+          WatchmeError.partiallyDelivered(
+            'Power control was shut down after a power command or '
+            'Wake-on-LAN went out; the device may still act on it',
+            cause: _shutDown,
+          ),
+        )
+      : _closedResult;
 
   /// Turns [target] on or off. Never throws.
   ///
@@ -234,7 +381,7 @@ final class PowerOrchestrator {
   }) => _serialized(
     target,
     (on: on, userConfirmed: userConfirmed),
-    (op) => on
+    (target, op) => on
         ? _powerOn(target, op, userConfirmed: userConfirmed)
         : _powerOff(target, userConfirmed: userConfirmed),
   );
@@ -265,7 +412,7 @@ final class PowerOrchestrator {
   Future<CommandResult> pressPowerKey(PowerTarget target) => _serialized(
     target,
     (on: null, userConfirmed: false),
-    (op) async {
+    (target, op) async {
       if (target.routes(Capability.powerOff).isEmpty &&
           target.routes(Capability.powerOn).isEmpty &&
           target.macs.isEmpty) {
@@ -283,48 +430,91 @@ final class PowerOrchestrator {
   /// Runs [run] once every earlier operation on [target] has finished, or
   /// joins the last queued operation when it covers [intent].
   ///
+  /// [run] gets [target] wrapped for its operation (see [_OpTarget]): it
+  /// must reach the device only through that.
+  ///
+  /// A request for anything but "on" interrupts every operation queued in
+  /// front of it (see [_PowerOp.interrupted]).
+  ///
   /// [close] ends the wait and the run: an operation that never finishes
   /// (a hung session) holds the queue until then, and no longer.
   Future<CommandResult> _serialized(
     PowerTarget target,
     _Intent intent,
-    Future<CommandResult> Function(_PowerOp op) run,
+    Future<CommandResult> Function(PowerTarget target, _PowerOp op) run,
   ) {
     if (_closed) return Future.value(_closedResult);
     final id = target.deviceId;
-    final previous = _tail[id];
+    final queue = _queues.putIfAbsent(id, () => []);
+    final previous = queue.lastOrNull;
     if (previous != null && previous.covers(intent)) return previous.result;
+    if (intent.on != true) {
+      for (final earlier in queue) {
+        earlier.interrupted = true;
+      }
+    }
     final op = _PowerOp(intent);
-    final done = Completer<CommandResult>();
-    op.result = done.future;
-    _tail[id] = op;
-    _pending.add(done);
+    queue.add(op);
+    _ops.add(op);
     unawaited(() async {
       CommandResult result;
       try {
         // The previous operation's result never throws: every operation
         // ends in a result, and close() completes it if it hangs.
         if (previous != null) await previous.result;
-        result = _closed ? _closedResult : await run(op);
+        if (_closed) {
+          result = _closedResult;
+        } else {
+          op.started = true;
+          result = await run(_OpTarget(this, target, op), op);
+        }
       } on Object catch (error) {
         result = Failed(
           WatchmeError.internal('Power control failed: $error', cause: error),
         );
       } finally {
-        if (identical(_tail[id], op)) _tail.remove(id);
+        queue.remove(op);
+        if (queue.isEmpty && identical(_queues[id], queue)) _queues.remove(id);
+        _ops.remove(op);
       }
-      _pending.remove(done);
-      if (!done.isCompleted) done.complete(result);
+      // Cut short by close(): a result saying nothing happened must not
+      // hide what the operation may already have sent.
+      final cutShort = _closed && !result.delivered && !mayHaveActed(result);
+      op.complete(cutShort ? _interrupted(op) : result);
     }());
     return op.result;
   }
 
-  /// Whether a request queued behind [op] asks for something other than
-  /// turning the device on (off, or the power key): the user changed their
-  /// mind, so a wait for [op]'s Wake-on-LAN to take effect should end.
-  bool _overtaken(PowerTarget target, _PowerOp op) {
-    final last = _tail[target.deviceId];
-    return last != null && !identical(last, op) && last.intent.on != true;
+  /// Runs [send], one effect of [op] (a magic packet, a command), counting
+  /// it while it runs and noting in [_PowerOp.sent] when [reached] says the
+  /// device may have got it. A send that throws may have.
+  Future<T> _effect<T>(
+    _PowerOp op,
+    Future<T> Function() send,
+    bool Function(T value) reached,
+  ) async {
+    op.inFlight++;
+    var finished = false;
+    try {
+      final value = await send();
+      finished = true;
+      if (reached(value)) op.sent = true;
+      return value;
+    } finally {
+      if (!finished) op.sent = true;
+      op.inFlight--;
+    }
+  }
+
+  /// Waits [duration], or until [close].
+  Future<void> _sleep(Duration duration) {
+    if (_closed) return Future.value();
+    final woken = Completer<void>();
+    _sleeps[woken] = _clock.timer(duration, () {
+      _sleeps.remove(woken);
+      woken.complete();
+    });
+    return woken.future;
   }
 
   Future<CommandResult> _powerOn(
@@ -356,10 +546,15 @@ final class PowerOrchestrator {
     }
 
     // 2. Wake-on-LAN, then wait and retry the discrete command.
+    if (_closed) return _bestFailure(failures) ?? _closedResult;
+    // A later request asked for something else: magic packets now could
+    // wake the device after that request turned it off.
+    if (op.interrupted) return _bestFailure(failures) ?? _replacedResult;
     final wokeAt = _clock.now();
-    if (await _sendWakeOnLan(target)) {
+    if (await _sendWakeOnLan(target, op)) {
       _record(target, true);
-      if (await _waitForDevice(target, () => _overtaken(target, op))) {
+      if (await _waitForDevice(target, op)) {
+        if (_closed) return _closedResult;
         if (local.isNotEmpty) {
           final retry = await router.route(command, local, target.execute);
           if (retry.result.delivered) {
@@ -376,7 +571,7 @@ final class PowerOrchestrator {
       if (_closed) return _closedResult;
       // A later request wants something else: the packets went out, and
       // nothing more is sent to turn the device on.
-      if (_overtaken(target, op)) return const SentUnconfirmed();
+      if (op.interrupted) return const SentUnconfirmed();
       if (remote.isNotEmpty) {
         final r = await router.route(command, remote, target.execute);
         if (r.result.delivered) return _delivered(target, true, r.result);
@@ -384,6 +579,8 @@ final class PowerOrchestrator {
       // No toggle after Wake-on-LAN: the packet may still be waking it.
       return const SentUnconfirmed();
     }
+    if (_closed) return _bestFailure(failures) ?? _closedResult;
+    if (op.interrupted) return _bestFailure(failures) ?? _replacedResult;
 
     // 3. Discrete, write-only or cloud.
     if (remote.isNotEmpty) {
@@ -605,57 +802,60 @@ final class PowerOrchestrator {
     return on;
   }
 
-  /// Sends magic packets for every cached MAC; `true` if any went out.
-  Future<bool> _sendWakeOnLan(PowerTarget target) async {
+  /// Sends magic packets for every cached MAC, [PowerConfig.wakeOnLanRepeats]
+  /// rounds [PowerConfig.wakeOnLanInterval] apart; `true` if any went out.
+  ///
+  /// One round is a call of the [WakeOnLanSender] per MAC, or, without
+  /// one, each packet once to each destination. [close] is checked before
+  /// every send, and ends the gap between rounds: nothing goes out after
+  /// it. Nor does anything once [op] is interrupted ([_PowerOp.interrupted]).
+  Future<bool> _sendWakeOnLan(PowerTarget target, _PowerOp op) async {
     if (target.macs.isEmpty) return false;
     final macs = target.macs.toList()..sort();
+    final List<Future<bool> Function()> round;
     final sender = _wakeOnLan;
     if (sender != null) {
-      var sent = false;
+      final ip = target.host.isEmpty ? null : target.host;
+      round = [for (final mac in macs) () => sender(mac, lastKnownIp: ip)];
+    } else {
+      final net = _transports.network;
+      if (net == null) return false;
+      final features = _transports.features;
+      final canBroadcast = features.contains(TransportFeature.udpBroadcast);
+      final canUnicast =
+          features.contains(TransportFeature.udpUnicast) &&
+          target.host.isNotEmpty;
+      final packets = <List<int>>[];
       for (final mac in macs) {
-        sent |= await sender(
-          mac,
-          lastKnownIp: target.host.isEmpty ? null : target.host,
-        );
+        try {
+          packets.add(magicPacket(mac));
+        } on FormatException {
+          continue;
+        }
       }
-      return sent;
-    }
-    final net = _transports.network;
-    if (net == null) return false;
-    final features = _transports.features;
-    final canBroadcast = features.contains(TransportFeature.udpBroadcast);
-    final canUnicast =
-        features.contains(TransportFeature.udpUnicast) &&
-        target.host.isNotEmpty;
-    final packets = <List<int>>[];
-    for (final mac in macs) {
-      try {
-        packets.add(magicPacket(mac));
-      } on FormatException {
-        continue;
-      }
+      round = [
+        for (final packet in packets)
+          for (final port in config.wakeOnLanPorts) ...[
+            if (canBroadcast)
+              () => _trySend(
+                () => net.sendDatagram(
+                  config.broadcastAddress,
+                  port,
+                  packet,
+                  broadcast: true,
+                ),
+              ),
+            if (canUnicast)
+              () => _trySend(() => net.sendDatagram(target.host, port, packet)),
+          ],
+      ];
     }
     var sent = false;
-    for (var round = 0; round < config.wakeOnLanRepeats; round++) {
-      if (round > 0) await _clock.delay(config.wakeOnLanInterval);
-      for (final packet in packets) {
-        for (final port in config.wakeOnLanPorts) {
-          if (canBroadcast) {
-            sent |= await _trySend(
-              () => net.sendDatagram(
-                config.broadcastAddress,
-                port,
-                packet,
-                broadcast: true,
-              ),
-            );
-          }
-          if (canUnicast) {
-            sent |= await _trySend(
-              () => net.sendDatagram(target.host, port, packet),
-            );
-          }
-        }
+    for (var i = 0; i < config.wakeOnLanRepeats; i++) {
+      if (i > 0) await _sleep(config.wakeOnLanInterval);
+      for (final send in round) {
+        if (_closed || op.interrupted) return sent;
+        sent |= await _effect(op, send, (bool went) => went);
       }
     }
     return sent;
@@ -671,12 +871,13 @@ final class PowerOrchestrator {
   }
 
   /// Waits for [target] to answer after Wake-on-LAN, polling until
-  /// [PowerConfig.wakeTimeout], [close], or [stop] returns true.
-  Future<bool> _waitForDevice(PowerTarget target, bool Function() stop) async {
+  /// [PowerConfig.wakeTimeout], until [close] (at once), or until [op] is
+  /// interrupted (at the next poll).
+  Future<bool> _waitForDevice(PowerTarget target, _PowerOp op) async {
     final deadline = _clock.now().add(config.wakeTimeout);
-    while (!_closed && !stop() && _clock.now().isBefore(deadline)) {
-      await _clock.delay(config.wakePollInterval);
-      if (_closed || stop()) return false;
+    while (!_closed && !op.interrupted && _clock.now().isBefore(deadline)) {
+      await _sleep(config.wakePollInterval);
+      if (_closed || op.interrupted) return false;
       if (await target.answers()) return true;
     }
     return false;

@@ -360,10 +360,22 @@ void main() {
   test('a changed certificate fails the pin until paired again', () async {
     final credential = await pair();
     await sim.restartWithCertificate(FireTvSimulatorCertificate.alternate);
+    final wakes = sim.wakeCount;
+    // The DIAL wake reached the device before the pin failed: a partial
+    // delivery with the pin failure as its cause (Codex re-review of #4).
     await expectLater(
       driver.connect(sim.endpoint, transports, credential),
-      throwsWatchmeError(WatchmeErrorCode.protocol),
+      throwsA(
+        isA<WatchmeError>()
+            .having((e) => e.code, 'code', WatchmeErrorCode.partiallyDelivered)
+            .having(
+              (e) => e.cause,
+              'cause',
+              isWatchmeError(WatchmeErrorCode.protocol),
+            ),
+      ),
     );
+    expect(sim.wakeCount, wakes + 1);
     final again = await pair();
     expect(
       again.peerCertSha256,

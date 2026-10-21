@@ -81,6 +81,9 @@ final class RouteAttempt {
   /// `false` when the attempt failed before the command left watchme
   /// (connecting failed, pairing missing). Falling back is then always
   /// safe, whatever the error.
+  ///
+  /// A connect that fails [WatchmeErrorCode.partiallyDelivered] is `true`:
+  /// a wake it sent may have reached the device, which may have acted.
   final bool commandSent;
 }
 

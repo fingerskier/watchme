@@ -69,8 +69,16 @@ void main() {
     test('a changed certificate fails the pin as a protocol error', () async {
       final credential = tv.credential();
       tv.changeCertificate();
-      await expectLater(
+      // After the wake that reached the device the failure is partial
+      // (Codex re-review of finding #4); the pin failure is its cause.
+      final error = await _connectError(
         driver.connect(tv.endpoint, transports, credential),
+      );
+      expect(error.code, WatchmeErrorCode.partiallyDelivered);
+      expect(error.cause, isWatchmeError(WatchmeErrorCode.protocol));
+      // Without a wake it is the pin failure itself.
+      await expectLater(
+        driver.connect(tv.endpoint, transports, credential, allowWake: false),
         throwsWatchmeError(WatchmeErrorCode.protocol),
       );
     });
@@ -108,8 +116,28 @@ void main() {
 
     test('a revoked token is reported as reauthRequired', () async {
       tv.tokenValid = false;
-      await expectLater(
+      // The DIAL wake reached the device first: partial, with the refused
+      // token as its cause (Codex re-review of finding #4).
+      final error = await _connectError(
         driver.connect(tv.endpoint, transports, tv.credential()),
+      );
+      expect(error.code, WatchmeErrorCode.partiallyDelivered);
+      expect(error.rawDeviceMessage, '{"description":"authn error"}');
+      expect(
+        error.cause,
+        isWatchmeError(
+          WatchmeErrorCode.reauthRequired,
+          rawDeviceMessage: '{"description":"authn error"}',
+        ),
+      );
+      // Connecting without a wake reports it directly.
+      await expectLater(
+        driver.connect(
+          tv.endpoint,
+          transports,
+          tv.credential(),
+          allowWake: false,
+        ),
         throwsWatchmeError(
           WatchmeErrorCode.reauthRequired,
           rawDeviceMessage: '{"description":"authn error"}',
@@ -260,19 +288,16 @@ void main() {
           'clientToken': tv.token,
         }),
       );
-      Object? error;
-      try {
-        await driver.connect(tv.endpoint, transports, tv.credential());
-      } on WatchmeError catch (e) {
-        error = e;
-      }
-      expect(error, isWatchmeError(WatchmeErrorCode.reauthRequired));
-      final e = error! as WatchmeError;
+      final e = await _connectError(
+        driver.connect(tv.endpoint, transports, tv.credential()),
+      );
+      expect(e.code, WatchmeErrorCode.partiallyDelivered);
+      expect(e.cause, isWatchmeError(WatchmeErrorCode.reauthRequired));
       expect(
         e.rawDeviceMessage,
         '{"description":"bad token <redacted>","clientToken":"<redacted>"}',
       );
-      for (final text in ['$e', jsonEncode(e.toJson())]) {
+      for (final text in ['$e', jsonEncode(e.toJson()), '${e.cause}']) {
         expect(text, isNot(contains(tv.token)));
       }
     });
@@ -286,11 +311,12 @@ void main() {
         throw const WatchmeError.timeout('No answer from DIAL');
       });
       final result = driver.connect(tv.endpoint, transports, tv.credential());
+      // Since the Codex re-review of finding #4 it is a partial delivery.
       final expectation = expectLater(
         result,
         throwsWatchmeError(
-          WatchmeErrorCode.timeout,
-          message: contains('DIAL wake may have reached the device'),
+          WatchmeErrorCode.partiallyDelivered,
+          message: contains('DIAL wake may have reached the Fire TV'),
         ),
       );
       await clock.advance(const Duration(seconds: 7));
@@ -309,19 +335,22 @@ void main() {
         '/v1/FireTV/status',
         HttpResult.text(403, r'{"msg":"token abc\/tok\/9 revoked"}'),
       );
-      Object? error;
-      try {
-        await driver.connect(
+      final e = await _connectError(
+        driver.connect(
           slashed.endpoint,
           FakeTransports(network: slashed.net),
           slashed.credential(),
-        );
-      } on WatchmeError catch (e) {
-        error = e;
-      }
-      final e = error! as WatchmeError;
-      expect(e.code, WatchmeErrorCode.reauthRequired);
+        ),
+      );
+      expect(e.code, WatchmeErrorCode.partiallyDelivered);
       expect(e.rawDeviceMessage, '{"msg":"token <redacted> revoked"}');
+      expect(
+        e.cause,
+        isWatchmeError(
+          WatchmeErrorCode.reauthRequired,
+          rawDeviceMessage: '{"msg":"token <redacted> revoked"}',
+        ),
+      );
     });
 
     test('reports both failures when the device stays unreachable', () async {
@@ -337,6 +366,206 @@ void main() {
       await clock.advance(const Duration(seconds: 7));
       await expectation;
     });
+
+    // Codex re-review of finding #4: a wake the DIAL server acknowledged,
+    // followed by an API that stayed closed, was reported as unreachable,
+    // so the engine fell back to a power toggle that turned the TV off.
+    group('a failure after a wake that may have reached the device is a '
+        'partial delivery', () {
+      Future<WatchmeError> connectError() async {
+        final error = _connectError(
+          driver.connect(tv.endpoint, transports, tv.credential()),
+        );
+        await clock.advance(const Duration(seconds: 7));
+        return error;
+      }
+
+      void wakeFailsWith(WatchmeError error) =>
+          net.onHttp('POST', '/apps/FireTVRemote', (_) {
+            tv.wakes++;
+            throw error;
+          });
+
+      test('acknowledged, then the API stays closed', () async {
+        tv.wakeOnDial = false;
+        final error = await connectError();
+        expect(error.code, WatchmeErrorCode.partiallyDelivered);
+        expect(error.message, contains('acknowledged the DIAL wake'));
+        expect(error.cause, isWatchmeError(WatchmeErrorCode.unreachable));
+        expect(tv.wakes, 1);
+      });
+
+      for (final status in [401, 403]) {
+        test(
+          'acknowledged, then the token is refused (HTTP $status)',
+          () async {
+            net.respond(
+              'GET',
+              '/v1/FireTV/status',
+              HttpResult.json(status, {'description': 'authn error'}),
+            );
+            final error = await connectError();
+            expect(error.code, WatchmeErrorCode.partiallyDelivered);
+            expect(
+              error.cause,
+              isWatchmeError(
+                WatchmeErrorCode.reauthRequired,
+                message: contains('HTTP $status'),
+              ),
+            );
+            expect(tv.wakes, 1);
+          },
+        );
+      }
+
+      test('acknowledged, then the status read fails', () async {
+        net.respond('GET', '/v1/FireTV/status', HttpResult(500));
+        final error = await connectError();
+        expect(error.code, WatchmeErrorCode.partiallyDelivered);
+        expect(error.cause, isWatchmeError(WatchmeErrorCode.protocol));
+      });
+
+      test('timed out, then the API stays closed', () async {
+        wakeFailsWith(const WatchmeError.timeout('No answer from DIAL'));
+        final error = await connectError();
+        expect(error.code, WatchmeErrorCode.partiallyDelivered);
+        expect(error.message, contains('No answer from DIAL'));
+        expect(error.cause, isWatchmeError(WatchmeErrorCode.unreachable));
+        expect(tv.wakes, 1);
+      });
+
+      test('garbled, then the token is refused', () async {
+        tv
+          ..wakeUp()
+          ..tokenValid = false;
+        wakeFailsWith(const WatchmeError.protocol('Garbled DIAL answer'));
+        final error = await connectError();
+        expect(error.code, WatchmeErrorCode.partiallyDelivered);
+        expect(error.cause, isWatchmeError(WatchmeErrorCode.reauthRequired));
+      });
+
+      test('refused before delivery, then the API stays closed: '
+          'unreachable', () async {
+        for (final refusal in [
+          const WatchmeError.unreachable('DIAL refused the connection'),
+          const WatchmeError.destinationRefused('Not on the LAN'),
+        ]) {
+          wakeFailsWith(refusal);
+          final error = await connectError();
+          expect(error.code, WatchmeErrorCode.unreachable, reason: '$refusal');
+          expect(error.message, contains('DIAL wake failed too'));
+        }
+      });
+
+      test('refused before delivery, then the token is refused: '
+          'reauthRequired', () async {
+        tv
+          ..wakeUp()
+          ..tokenValid = false;
+        net.setUnreachable(tv.host, port: tv.dialPort);
+        final error = await connectError();
+        expect(error.code, WatchmeErrorCode.reauthRequired);
+      });
+
+      test('allowWake: false sends no wake and stays unreachable', () async {
+        tv.wakeOnDial = false;
+        final error = await _connectError(
+          driver.connect(
+            tv.endpoint,
+            transports,
+            tv.credential(),
+            allowWake: false,
+          ),
+        );
+        expect(error.code, WatchmeErrorCode.unreachable);
+        expect(net.callsTo('POST', '/apps/FireTVRemote'), isEmpty);
+        expect(tv.wakes, 0);
+      });
+
+      test('a token holding the X-Api-Key value is not shown', () async {
+        final keyed = FakeFireTv(
+          FakeNetworkStack(),
+          token: '0987654321-SecretSuffix',
+        );
+        keyed.net.respond(
+          'GET',
+          '/v1/FireTV/status',
+          HttpResult.text(401, 'bad token ${keyed.token}'),
+        );
+        final error = await _connectError(
+          driver.connect(
+            keyed.endpoint,
+            FakeTransports(network: keyed.net),
+            keyed.credential(),
+          ),
+        );
+        expect(error.code, WatchmeErrorCode.partiallyDelivered);
+        for (final text in [
+          jsonEncode(error.toJson()),
+          '$error',
+          '${error.cause}',
+        ]) {
+          expect(text, isNot(contains('SecretSuffix')), reason: text);
+          expect(text, isNot(contains('-Sec')), reason: text);
+        }
+      });
+    });
+  });
+
+  // Codex re-review of finding #8: secrets were replaced one after the
+  // other, so the `X-Api-Key` value at the start of this token was replaced
+  // first and `<redacted>-SecretSuffix` was left in the error.
+  group('a token holding the X-Api-Key value never shows', () {
+    const token = '0987654321-SecretSuffix';
+    late FakeFireTv keyed;
+    late DriverSession session;
+
+    setUp(() async {
+      keyed = FakeFireTv(net, host: '10.0.0.8', token: token);
+      session = await driver.connect(
+        keyed.endpoint,
+        transports,
+        keyed.credential(),
+      );
+    });
+
+    tearDown(() => session.close());
+
+    for (final (name, status, body) in [
+      ('as Codex sent it', 500, 'bad token $token'),
+      ('as a suffix', 500, 'bad token x$token'),
+      ('as an infix', 500, 'id=x${token}y'),
+      ('next to the API key alone', 500, 'key 0987654321 token $token'),
+      ('percent-encoded', 500, 'token=0987654321%2DSecretSuffix'),
+      ('JSON', 500, jsonEncode({'e': 'bad token $token'})),
+      ('JSON-escaped', 500, r'{"e":"0987654321-SecretSuffix"}'),
+      ('in a 401', 401, jsonEncode({'description': 'bad token $token'})),
+    ]) {
+      test(name, () async {
+        net.respond(
+          'POST',
+          '/v1/FireTV',
+          HttpResult.text(status, body),
+          host: keyed.host,
+        );
+        final result = await session.execute(const PressKey(RemoteKey.home));
+        expect(result, isA<Failed>());
+        final error = (result as Failed).error;
+        for (final text in [
+          jsonEncode(result.toJson()),
+          '$result',
+          '${error.cause}',
+        ]) {
+          expect(text, isNot(contains(token)), reason: text);
+          expect(text, isNot(contains('SecretSuffix')), reason: text);
+          for (var i = 0; i + 4 <= token.length; i++) {
+            final fragment = token.substring(i, i + 4);
+            if ('0987654321'.contains(fragment)) continue;
+            expect(text, isNot(contains(fragment)), reason: text);
+          }
+        }
+      });
+    }
   });
 
   group('session', () {
@@ -1373,4 +1602,14 @@ void main() {
       await session.close();
     });
   });
+}
+
+/// The [WatchmeError] [connecting] fails with.
+Future<WatchmeError> _connectError(Future<DriverSession> connecting) async {
+  try {
+    await connecting;
+  } on WatchmeError catch (e) {
+    return e;
+  }
+  fail('connect succeeded');
 }

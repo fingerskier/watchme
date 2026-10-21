@@ -69,14 +69,19 @@ final class EngineConfig {
 ///   tried after watchme turned the device off or while it is known to be
 ///   off. A revoked credential ([ReauthRequired]) marks the pairing
 ///   invalid: the driver shows as needing pairing and is not used until
-///   paired again.
+///   paired again. That includes a revocation that is only the cause of a
+///   partial delivery (a connect whose wake went out before the token was
+///   refused).
 /// * **Routing.** [send] ranks the device's sessions with a
 ///   [CapabilityRouter] and falls back down the list while nothing reached
 ///   the device. After a failure that may have acted (a timeout, a partial
 ///   delivery) it neither falls back nor retries, and marks the state the
 ///   command changes (e.g. volume) stale until a source reports an
 ///   observation made after the failure; a refresh that returns what a
-///   session cached before the command does not revive it.
+///   session cached before the command does not revive it. A connect that
+///   fails [WatchmeErrorCode.partiallyDelivered] (a wake it sent may have
+///   reached the device) counts as such a failure, not as "nothing sent":
+///   the woken device must not get a toggle that switches it back off.
 /// * **Power.** `SetPower` and the power keys go through the
 ///   [PowerOrchestrator] instead: `PressKey(RemoteKey.power)` is a toggle
 ///   intent, never a raw key press, and holding a power key is refused.
@@ -93,9 +98,11 @@ final class Engine implements WatchmeEngine {
   /// A driver is enabled when it has no backends or one whose required
   /// transport features [transports] offers; likewise discovery providers.
   /// Without [credentials] or [repository], in-memory stores are used.
-  /// [wakeOnLan] sends Wake-on-LAN for the power orchestrator; hosts pass
-  /// `WakeOnLan(network).send` from watchme_io, which also covers subnet
-  /// broadcasts. Without it the orchestrator sends the packets itself.
+  /// [wakeOnLan] sends one round of Wake-on-LAN for the power orchestrator,
+  /// which repeats it (see [WakeOnLanSender]); hosts pass
+  /// `WakeOnLan(network, repeats: 1).send` from watchme_io, which also
+  /// covers subnet broadcasts. Without it the orchestrator sends the
+  /// packets itself.
   ///
   /// [destinationPolicy] is LAN-only by default. Give the native network
   /// stack the same policy: it is what enforces it on every connection.
@@ -1113,7 +1120,15 @@ final class Engine implements WatchmeEngine {
         allowWake: _mayWakeFor(route, command),
       );
     } on WatchmeError catch (error) {
-      return RouteAttempt(Failed(error), commandSent: false);
+      // A connect fails partiallyDelivered when a wake it sent may have
+      // reached the device (a Fire TV's DIAL wake, then an API that never
+      // opened or a refused token): the device may have acted, so this
+      // counts as sent. Nothing falls back, and the power orchestrator
+      // sends no toggle that would undo the wake.
+      return RouteAttempt(
+        Failed(error),
+        commandSent: error.code == WatchmeErrorCode.partiallyDelivered,
+      );
     }
     final started = _clock.now();
     CommandResult result;
@@ -1432,17 +1447,19 @@ final class Engine implements WatchmeEngine {
     unawaited(_persistQuietly(e));
   }
 
+  /// Records a failed connect. The credential counts as revoked when the
+  /// device refused it, even when the refusal is only the cause of the
+  /// failure (a wake went out first: see [credentialFailure]).
   void _connectFailed(
     _DeviceEntry e,
     _DriverSlot slot,
     WatchmeError error, {
     required bool hadCredential,
   }) {
-    final revoked =
-        error.code == WatchmeErrorCode.reauthRequired ||
-        (error.code == WatchmeErrorCode.unauthorized && hadCredential);
-    if (revoked) {
-      _markReauth(e, slot, error);
+    final refusal = credentialFailure(error);
+    if (refusal != null &&
+        (refusal.code == WatchmeErrorCode.reauthRequired || hadCredential)) {
+      _markReauth(e, slot, refusal);
       return;
     }
     _noteFailure(e, slot, error);
@@ -1513,8 +1530,7 @@ final class Engine implements WatchmeEngine {
           final retry =
               error is WatchmeError &&
               error.code != WatchmeErrorCode.cancelled &&
-              error.code != WatchmeErrorCode.unauthorized &&
-              error.code != WatchmeErrorCode.reauthRequired &&
+              credentialFailure(error) == null &&
               error.code != WatchmeErrorCode.unsupported &&
               error.code != WatchmeErrorCode.destinationRefused;
           if (retry) _scheduleReconnect(e, slot);
@@ -1556,9 +1572,12 @@ final class Engine implements WatchmeEngine {
     _emitDevices();
   }
 
+  /// Records a failure. A revoked credential, even as the cause of a
+  /// partial delivery (see [credentialFailure]), marks the pairing invalid.
   void _noteFailure(_DeviceEntry e, _DriverSlot slot, WatchmeError error) {
-    if (error.code == WatchmeErrorCode.reauthRequired) {
-      _markReauth(e, slot, error);
+    if (credentialFailure(error) case final refusal?
+        when refusal.code == WatchmeErrorCode.reauthRequired) {
+      _markReauth(e, slot, refusal);
       return;
     }
     slot

@@ -22,9 +22,17 @@ import 'session.dart';
 ///   first use.
 /// * [connect] wakes the device through DIAL every time (the API port does
 ///   not listen while the device sleeps), then verifies the token with the
-///   recorded certificate pinned. With `allowWake: false` (connections the
-///   user did not ask for) it sends no DIAL launch and fails at once as
-///   unreachable while the API port is closed.
+///   recorded certificate pinned. Once it sent a wake that may have reached
+///   the device (the DIAL server acknowledged it, or it failed without
+///   proving it did nothing, e.g. a timeout), any later failure (the API
+///   port staying closed, the status read, a refused token or certificate)
+///   is [WatchmeErrorCode.partiallyDelivered] with that failure as its
+///   cause, never `unreachable`: the device, and the TV with it over
+///   HDMI-CEC, may now be on, so nothing may fall back or toggle the power.
+///   A wake refused before delivery (nothing listened, or the destination
+///   was refused) leaves the failure's own code. With `allowWake: false`
+///   (connections the user did not ask for) it sends no DIAL launch and
+///   fails at once as unreachable while the API port is closed.
 /// * No error carries a bearer value: the client token, a token a PIN
 ///   verification returned, and the `X-Api-Key` value are redacted from
 ///   every error text, along with token-bearing JSON fields.
@@ -245,10 +253,17 @@ final class FireTvDriver implements Driver {
   // ---------------------------------------------------------------- pairing
 
   /// Errors never carry a token: a PIN-verify answer that fails, whatever
-  /// its status, is shown with every value redacted except plain words in
-  /// a refusal (see [redactSecrets]), and every known bearer value (the
-  /// `X-Api-Key` value, a token the device sent) is removed from every
-  /// error text, in any escaped form.
+  /// its status and shape, is shown with every value redacted (see
+  /// [redactSecrets]; a refusal's reason is watchme's own
+  /// [pinRefusedReason]), and every known bearer value (the `X-Api-Key`
+  /// value, a token the device sent) is removed from every error text, in
+  /// any escaped form.
+  ///
+  /// Pairing wakes the device through DIAL first. Until the PIN is on
+  /// screen, a failure after a wake that may have reached the device
+  /// (acknowledged, or failed without proving it did nothing) is
+  /// [WatchmeErrorCode.partiallyDelivered] with the failure as its cause:
+  /// the device, and the TV with it, may be on.
   @override
   PairingFlow? startPairing(
     Endpoint endpoint,
@@ -289,9 +304,11 @@ final class FireTvDriver implements Driver {
       tls: const TlsPolicy.firstUse(),
     );
     final wakeFailure = await tryWake(firstUse);
-    final HttpResult shown;
+    // Until the PIN is on screen, a failure after a wake that may have
+    // reached the device is a partial delivery (see [afterWake]).
+    final String fingerprint;
     try {
-      shown = await _untilListening(
+      final shown = await _untilListening(
         (timeout) => firstUse.post(
           FireTvPaths.pinDisplay,
           json: {'friendlyName': context.clientName},
@@ -299,16 +316,15 @@ final class FireTvDriver implements Driver {
         ),
         cancelled: () => flow.isCancelled,
       );
+      if (!shown.ok) throw _pairingError(shown, 'Showing the PIN');
+      fingerprint =
+          shown.peerCertificateSha256 ??
+          (throw const WatchmeError.protocol(
+            'The network stack did not report the Fire TV certificate, so '
+            'it cannot be pinned',
+          ));
     } on WatchmeError catch (e) {
-      throw withWakeContext(e, wakeFailure);
-    }
-    if (!shown.ok) throw _pairingError(shown, 'Showing the PIN');
-    final fingerprint = shown.peerCertificateSha256;
-    if (fingerprint == null) {
-      throw const WatchmeError.protocol(
-        'The network stack did not report the Fire TV certificate, so it '
-        'cannot be pinned',
-      );
+      throw afterWake('Pairing', e, wakeFailure);
     }
 
     final pinned = FireTvApi(
@@ -325,14 +341,10 @@ final class FireTvDriver implements Driver {
       );
       // This answer carries the new token in `description`, whatever its
       // status, and an unexpected one may carry it anywhere: an error shows
-      // it with every value redacted, keeping only plain words ("PIN
-      // expired") in a refusal.
-      String shown() => redactSecrets(
-        verified.text,
-        secrets: secrets,
-        allValues: true,
-        keepProse: !verified.ok,
-      );
+      // it with every value redacted, whatever it looks like, since a
+      // token may be any printable text, words and spaces included.
+      String shown() =>
+          redactSecrets(verified.text, secrets: secrets, allValues: true);
       if (!verified.ok) throw _pinVerifyError(verified, shown());
       final token = description(verified);
       if (token == null) {
@@ -389,15 +401,22 @@ final class FireTvDriver implements Driver {
     }
   }
 
-  /// [_pairingError] for a refused PIN check, showing [shown] (the answer,
-  /// redacted) instead of the body: the status is in the message.
+  /// What a refused PIN check (HTTP 400, 401 or 403) says, in watchme's
+  /// own words: none of the device's text from that endpoint is shown.
+  static const String pinRefusedReason = 'The PIN was wrong or expired';
+
+  /// [_pairingError] for a refused PIN check, showing [shown] (the answer
+  /// with every value redacted) instead of the body: the status is in the
+  /// message, with [pinRefusedReason] for a refusal that usually means the
+  /// PIN (400 once too many wrong PINs were tried or the PIN is gone from
+  /// the screen, 401 or 403).
   static WatchmeError _pinVerifyError(HttpResult result, String shown) {
     final error = _pairingError(result, 'Checking the PIN');
+    final pinRefused = const {400, 401, 403}.contains(result.status);
     return WatchmeError(
       error.code,
-      error.message,
+      pinRefused ? '${error.message}. $pinRefusedReason' : error.message,
       rawDeviceMessage: result.body.isEmpty ? error.rawDeviceMessage : shown,
-      cause: error.cause,
     );
   }
 
@@ -441,38 +460,49 @@ final class FireTvDriver implements Driver {
     final network = transports.requireNetwork();
     final api = FireTvApi(endpoint, network, tls: tls, token: token.token);
     try {
-      final result = allowWake
-          ? await _wakeAndReadStatus(api)
-          : await _readStatusWithoutWaking(api, endpoint);
-      if (isAuthFailure(result)) throw api.errorFor(result, 'Connecting');
-      // A firmware without the status endpoint still takes commands; the
-      // token is then checked by the first one.
-      if (!result.ok && result.status != 404) {
-        throw api.errorFor(result, 'Connecting');
+      if (!allowWake) {
+        return _open(api, await _readStatusWithoutWaking(api, endpoint));
       }
-      return FireTvSession(
-        api,
-        _clock,
-        status: result.ok ? parseStatus(result) : null,
-        apiStartupTimeout: apiStartupTimeout,
-        apiPollInterval: apiPollInterval,
-      );
+      return await _wakeAndOpen(api);
     } on WatchmeError catch (e) {
       throw api.redact(e);
     }
   }
 
   /// Port 8080 does not listen while the device sleeps: wakes it through
-  /// DIAL first, every time, then waits for the API to answer.
-  Future<HttpResult> _wakeAndReadStatus(FireTvApi api) async {
+  /// DIAL first, every time, then waits for the API to answer and checks
+  /// the token. Once a wake that may have reached the device was sent, any
+  /// failure is [WatchmeErrorCode.partiallyDelivered] ([afterWake]).
+  Future<FireTvSession> _wakeAndOpen(FireTvApi api) async {
     final wakeFailure = await tryWake(api);
     try {
-      return await _untilListening(
-        (timeout) => api.get(FireTvPaths.status, timeout: timeout),
+      return _open(
+        api,
+        await _untilListening(
+          (timeout) => api.get(FireTvPaths.status, timeout: timeout),
+        ),
       );
     } on WatchmeError catch (e) {
-      throw withWakeContext(e, wakeFailure);
+      throw afterWake('Connecting', e, wakeFailure);
     }
+  }
+
+  /// A session from the status answer [result], or the error it shows: a
+  /// refused token, or another failure.
+  FireTvSession _open(FireTvApi api, HttpResult result) {
+    if (isAuthFailure(result)) throw api.errorFor(result, 'Connecting');
+    // A firmware without the status endpoint still takes commands; the
+    // token is then checked by the first one.
+    if (!result.ok && result.status != 404) {
+      throw api.errorFor(result, 'Connecting');
+    }
+    return FireTvSession(
+      api,
+      _clock,
+      status: result.ok ? parseStatus(result) : null,
+      apiStartupTimeout: apiStartupTimeout,
+      apiPollInterval: apiPollInterval,
+    );
   }
 
   /// Reads the status once and sends nothing that could wake the device. A

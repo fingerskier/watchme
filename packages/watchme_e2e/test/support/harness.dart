@@ -33,7 +33,13 @@ final class LoopbackTransports implements Transports {
           lookup: lookup,
         ),
       ) {
-    network = _LoopbackOnlyStack(io.network, blocked, passThrough, httpLog);
+    network = _LoopbackOnlyStack(
+      io.network,
+      blocked,
+      passThrough,
+      httpLog,
+      datagramLog,
+    );
   }
 
   /// The wrapped transports.
@@ -50,6 +56,10 @@ final class LoopbackTransports implements Transports {
   /// Every HTTP request the engine asked for, as `METHOD uri`, whether it
   /// connected or not (a refused port leaves no trace in a simulator).
   final List<String> httpLog = [];
+
+  /// Every datagram the engine asked to send (magic packets), as
+  /// `host:port`, whether it went out or not.
+  final List<String> datagramLog = [];
 
   @override
   late final NetworkStack network;
@@ -87,12 +97,14 @@ final class _LoopbackOnlyStack implements NetworkStack {
     this._blocked,
     this._passThrough,
     this._httpLog,
+    this._datagramLog,
   );
 
   final NetworkStack _inner;
   final List<String> _blocked;
   final Set<String> _passThrough;
   final List<String> _httpLog;
+  final List<String> _datagramLog;
 
   void _check(String host, int port) {
     if (_isLoopback(host) || _passThrough.contains(host)) return;
@@ -158,6 +170,7 @@ final class _LoopbackOnlyStack implements NetworkStack {
     List<int> bytes, {
     bool broadcast = false,
   }) async {
+    _datagramLog.add('$host:$port');
     _check(host, port);
     return _inner.sendDatagram(host, port, bytes, broadcast: broadcast);
   }
@@ -286,15 +299,20 @@ final class E2eSystem {
   /// installed. [lookup] replaces the stack's name resolver; [passThrough]
   /// seeds [LoopbackTransports.passThrough]; [config] defaults to
   /// [e2eConfig]; [rokuRequestTimeout], when given, replaces the Roku
-  /// driver's per-request deadline.
+  /// driver's per-request deadline; [fireTvApiStartupTimeout], when given,
+  /// replaces how long the Fire TV driver waits for its API after a wake.
+  /// [extraDrivers] are registered after those two (see
+  /// [ToggleOnlyPowerDriver]).
   static Future<E2eSystem> start(
     Directory stateDir, {
     Iterable<DiscoveryProvider> Function(NetworkStack network)? discovery,
     Duration? rokuPollInterval,
     Duration? rokuRequestTimeout,
+    Duration? fireTvApiStartupTimeout,
     HostLookup? lookup,
     Set<String> passThrough = const {},
     EngineConfig config = e2eConfig,
+    List<Driver> extraDrivers = const [],
   }) async {
     _LoopbackSockets.install();
     addTearDown(nativeBlocked.clear);
@@ -311,7 +329,14 @@ final class E2eSystem {
             pollInterval: rokuPollInterval,
             requestTimeout: rokuRequestTimeout,
           ),
-        FireTvDriver(apiPollInterval: const Duration(milliseconds: 50)),
+        if (fireTvApiStartupTimeout == null)
+          FireTvDriver(apiPollInterval: const Duration(milliseconds: 50))
+        else
+          FireTvDriver(
+            apiPollInterval: const Duration(milliseconds: 50),
+            apiStartupTimeout: fireTvApiStartupTimeout,
+          ),
+        ...extraDrivers,
       ],
       transports: transports,
       discoveryProviders: discovery?.call(transports.network) ?? const [],
@@ -401,4 +426,98 @@ Future<List<PairingStep>> runPairing(
     if (step.isTerminal) break;
   }
   return seen;
+}
+
+/// A second power route that can only toggle (an IR blaster's power key,
+/// say), for the power rules: it recognises every device it is asked
+/// about and never touches the network. [toggles] counts what reached it.
+final class ToggleOnlyPowerDriver implements Driver {
+  /// Creates the driver; give the same instance to each [E2eSystem] that
+  /// shares the state directory, so [toggles] counts across restarts.
+  ToggleOnlyPowerDriver();
+
+  /// The driver id.
+  static const String id = 'e2e-toggle';
+
+  /// Power on and off, both through the one toggle.
+  static const List<CapabilitySupport> ceiling = [
+    CapabilitySupport.yes(
+      Capability.powerOn,
+      flags: {CapFlag.toggleOnly, CapFlag.writeOnly},
+    ),
+    CapabilitySupport.yes(
+      Capability.powerOff,
+      flags: {CapFlag.toggleOnly, CapFlag.writeOnly},
+    ),
+  ];
+
+  @override
+  final DriverDescriptor descriptor = const DriverDescriptor(
+    id: id,
+    vendor: 'Test',
+    protocol: 'e2e power toggle',
+    ceiling: ceiling,
+    backends: [],
+    stability: Stability.documented,
+    provenance: 'e2e fake',
+  );
+
+  /// Every command that reached the "device" through this driver: each one
+  /// is a press of the power toggle.
+  final List<Command> toggles = [];
+
+  @override
+  Future<ProbeResult> probe(Endpoint endpoint, Transports transports) async =>
+      const ProbeResult.matched(info: DeviceInfo(), capabilities: ceiling);
+
+  @override
+  PairingFlow? startPairing(
+    Endpoint endpoint,
+    Transports transports,
+    PairingContext context,
+  ) => null;
+
+  @override
+  Future<DriverSession> connect(
+    Endpoint endpoint,
+    Transports transports,
+    Credential? credential, {
+    bool allowWake = true,
+  }) async => _ToggleSession(toggles);
+}
+
+final class _ToggleSession implements DriverSession {
+  _ToggleSession(this._toggles);
+
+  final List<Command> _toggles;
+  final StreamController<DeviceEvent> _events = StreamController.broadcast();
+
+  @override
+  String get driverId => ToggleOnlyPowerDriver.id;
+
+  @override
+  List<CapabilitySupport> get capabilities => ToggleOnlyPowerDriver.ceiling;
+
+  @override
+  DeviceState get state => DeviceState.empty;
+
+  @override
+  Stream<DeviceEvent> get events => _events.stream;
+
+  @override
+  Future<CommandResult> execute(Command command) async {
+    switch (command) {
+      case SetPower() || PressKey(key: RemoteKey.power):
+        _toggles.add(command);
+        return const Confirmed();
+      default:
+        return Unsupported('${command.capability.name} is not a toggle');
+    }
+  }
+
+  @override
+  Future<DeviceState> refresh() async => state;
+
+  @override
+  Future<void> close() => _events.close();
 }

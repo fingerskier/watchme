@@ -57,6 +57,29 @@ bool mayHaveActed(CommandResult result) => switch (result) {
   _ => false,
 };
 
+/// The credential failure behind [error]: [error] itself when its code is
+/// [WatchmeErrorCode.unauthorized] or [WatchmeErrorCode.reauthRequired],
+/// else the first such error in its [WatchmeError.cause] chain, else
+/// `null`.
+///
+/// A failure that may have reached the device keeps its own code and
+/// carries the rejection as its cause: a Fire TV connect whose DIAL wake
+/// went out before the token was refused is
+/// [WatchmeErrorCode.partiallyDelivered], caused by the refusal. The
+/// device still revoked the credential.
+WatchmeError? credentialFailure(WatchmeError error) {
+  Object? current = error;
+  // A cause is final, so the chain cannot loop; the bound only caps depth.
+  for (var depth = 0; depth < 8 && current is WatchmeError; depth++) {
+    if (current.code == WatchmeErrorCode.unauthorized ||
+        current.code == WatchmeErrorCode.reauthRequired) {
+      return current;
+    }
+    current = current.cause;
+  }
+  return null;
+}
+
 /// 32-bit FNV-1a of [text]'s UTF-16 code units, as 8 hex digits.
 ///
 /// The multiply is split so the result is the same when compiled to
