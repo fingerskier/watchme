@@ -271,6 +271,95 @@ void main() {
       expect(s.calls.single, ('upnp', const SetVolume(30)));
     });
 
+    test('a press failing after one was delivered is a partial delivery, '
+        'and no other route replays it', () async {
+      // Codex finding #4: SetVolume(13) from 10, one press delivered, then
+      // the route fails as unreachable; the next route stepped +3 more.
+      var presses = 0;
+      final s = Script({
+        'keys': (c) => switch (c) {
+          StepVolume() => const RouteAttempt(Unsupported('no steps')),
+          _ =>
+            ++presses == 1
+                ? const RouteAttempt(Confirmed())
+                : const RouteAttempt(
+                    Failed(
+                      WatchmeError.unreachable(
+                        'refused',
+                        rawDeviceMessage: 'ECONNREFUSED',
+                      ),
+                    ),
+                  ),
+        },
+      });
+      final r = await router.route(
+        const SetVolume(13),
+        [
+          route('keys', Support.yes, flags: {CapFlag.relativeOnly}),
+          route('stepper', Support.partial, flags: {CapFlag.relativeOnly}),
+        ],
+        s.call,
+        knownVolume: 10,
+      );
+      expect(r.result.partiallyDelivered, isTrue);
+      expect(
+        r.result,
+        isFailedWith(
+          WatchmeErrorCode.partiallyDelivered,
+          message: contains('1 of 3'),
+          rawDeviceMessage: 'ECONNREFUSED',
+        ),
+      );
+      final error = (r.result as Failed).error;
+      expect((error.cause! as WatchmeError).code, WatchmeErrorCode.unreachable);
+      expect(r.via, isNull);
+      expect(s.calls, [
+        ('keys', const StepVolume(3)),
+        ('keys', const PressKey(RemoteKey.volumeUp)),
+        ('keys', const PressKey(RemoteKey.volumeUp)),
+      ]);
+    });
+
+    test('an unmapped press after a delivered one is a partial delivery '
+        'too', () async {
+      var presses = 0;
+      final s = Script({
+        'roku': (c) => switch (c) {
+          StepVolume() => const RouteAttempt(Unsupported('no steps')),
+          _ =>
+            ++presses == 1
+                ? const RouteAttempt(SentUnconfirmed())
+                : const RouteAttempt(Unsupported('gone')),
+        },
+      });
+      final r = await router.route(
+        const SetVolume(8),
+        [relative, route('other', Support.partial)],
+        s.call,
+        knownVolume: 10,
+      );
+      expect(r.result, isFailedWith(WatchmeErrorCode.partiallyDelivered));
+      expect(s.calls.where((c) => c.$1 == 'other'), isEmpty);
+    });
+
+    test('a first press that fails delivered nothing: fallback as '
+        'before', () async {
+      final s = Script({
+        'roku': (c) => switch (c) {
+          StepVolume() => const RouteAttempt(Unsupported('no steps')),
+          _ => const RouteAttempt(Failed(WatchmeError.unreachable('down'))),
+        },
+      });
+      final r = await router.route(
+        const SetVolume(12),
+        [relative, route('upnp', Support.partial)],
+        s.call,
+        knownVolume: 10,
+      );
+      expect(r.result, isConfirmed);
+      expect(r.via?.driverId, 'upnp');
+    });
+
     test('a zero step is confirmed without sending anything', () async {
       final s = Script({});
       final r = await router.route(
@@ -281,6 +370,66 @@ void main() {
       );
       expect(r.result, isConfirmed);
       expect(s.calls, isEmpty);
+    });
+  });
+
+  group('partial delivery', () {
+    test('is never in the default fallback codes', () {
+      expect(
+        CapabilityRouter.defaultFallbackCodes,
+        isNot(contains(WatchmeErrorCode.partiallyDelivered)),
+      );
+    });
+
+    test('ends the search even when the fallback codes list it', () async {
+      final s = Script({
+        'a': (_) => const RouteAttempt(
+          Failed(WatchmeError.partiallyDelivered('2 of 5 characters')),
+        ),
+      });
+      final permissive = CapabilityRouter(
+        fallbackCodes: {
+          ...CapabilityRouter.defaultFallbackCodes,
+          WatchmeErrorCode.partiallyDelivered,
+        },
+      );
+      final r = await permissive.route(const StepVolume(5), [
+        route('a', Support.yes),
+        route('b', Support.partial),
+      ], s.call);
+      expect(r.result, isFailedWith(WatchmeErrorCode.partiallyDelivered));
+      expect(s.calls, hasLength(1));
+    });
+
+    test(
+      'ends the search even if the attempt claims nothing was sent',
+      () async {
+        final s = Script({
+          'a': (_) => const RouteAttempt(
+            Failed(WatchmeError.partiallyDelivered('1 of 3')),
+            commandSent: false,
+          ),
+        });
+        final r = await router.route(const StepVolume(3), [
+          route('a', Support.yes),
+          route('b', Support.partial),
+        ], s.call);
+        expect(r.result, isFailedWith(WatchmeErrorCode.partiallyDelivered));
+        expect(s.calls, hasLength(1));
+      },
+    );
+
+    test('a refused destination falls back: nothing was sent', () async {
+      final s = Script({
+        'a': (_) => const RouteAttempt(
+          Failed(WatchmeError.destinationRefused('public address')),
+        ),
+      });
+      final r = await router.route(const StepVolume(1), [
+        route('a', Support.yes),
+        route('b', Support.partial),
+      ], s.call);
+      expect(r.via?.driverId, 'b');
     });
   });
 }

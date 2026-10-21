@@ -10,6 +10,7 @@ import '../widgets/command_feedback.dart';
 import '../widgets/labels.dart';
 import 'apps_sheet.dart';
 import 'capability_gate.dart';
+import 'power_confirmation.dart';
 import 'remote_button.dart';
 import 'remote_shortcuts.dart';
 
@@ -18,7 +19,15 @@ import 'remote_shortcuts.dart';
 /// Controls are shown, greyed out or hidden from the device's merged
 /// capabilities (see [gateFor]). Results that the user should hear about
 /// ([Unsupported], [Failed]) appear in a snackbar; [SentUnconfirmed] is
-/// silent. On desktop the keyboard drives the TV (see [remoteShortcuts]).
+/// silent. A power command the engine will not send on a guess asks "Is
+/// the TV on?" (see [needsPowerConfirmation]). On desktop the keyboard
+/// drives the TV (see [remoteShortcuts]).
+///
+/// A key held on the keyboard or on screen is released on the TV as soon
+/// as the remote stops getting its key-up: when the remote loses the
+/// keyboard (a dialog, the apps sheet, pairing or the app bar takes it),
+/// when the app becomes inactive, hidden or paused, when the device leaves
+/// the device list, or when the screen closes.
 class RemoteScreen extends StatefulWidget {
   /// Creates the remote for [deviceId].
   const RemoteScreen({super.key, required this.deviceId});
@@ -30,7 +39,8 @@ class RemoteScreen extends StatefulWidget {
   State<RemoteScreen> createState() => _RemoteScreenState();
 }
 
-class _RemoteScreenState extends State<RemoteScreen> {
+class _RemoteScreenState extends State<RemoteScreen>
+    with WidgetsBindingObserver {
   final FocusNode _remoteFocus = FocusNode(debugLabel: 'TV keyboard control');
   final TextEditingController _text = TextEditingController();
 
@@ -40,18 +50,82 @@ class _RemoteScreenState extends State<RemoteScreen> {
   /// Keyboard keys being held, with the remote key sent as key-down.
   final Map<LogicalKeyboardKey, RemoteKey> _held = {};
 
+  /// On-screen keys being held, with their labels for result messages.
+  final Map<RemoteKey, String> _buttonHeld = {};
+
   late WatchmeClient _client;
   DeviceView? _device;
 
   @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // An inactive, hidden or paused app gets no key-up either (the window
+    // lost focus, or the app went to the background).
+    if (state != AppLifecycleState.resumed) _releaseHeld();
+  }
+
+  @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     // Release anything still held so the TV stops repeating.
-    for (final key in _held.values) {
+    for (final key in [..._held.values, ..._buttonHeld.keys]) {
       unawaited(_deliver(PressKey(key, KeyAction.up)));
     }
+    _held.clear();
+    _buttonHeld.clear();
     _remoteFocus.dispose();
     _text.dispose();
     super.dispose();
+  }
+
+  /// Ends every hold on the TV and forgets the keys this screen saw go
+  /// down, because their key-up will not reach it: the remote lost the
+  /// keyboard, a route covers it, or the app is no longer in front.
+  ///
+  /// A key-up that does arrive later finds nothing held and sends nothing,
+  /// and a press whose key-up went elsewhere does not turn into a click.
+  /// With [quiet], results are not reported (the device is gone).
+  void _releaseHeld({bool quiet = false}) {
+    final keyboard = Map.of(_held);
+    final buttons = Map.of(_buttonHeld);
+    _held.clear();
+    _pressed.clear();
+    _buttonHeld.clear();
+    void release(RemoteKey remote, String label) => unawaited(
+      quiet
+          ? _deliver(PressKey(remote, KeyAction.up))
+          : _send(PressKey(remote, KeyAction.up), label),
+    );
+    for (final MapEntry(key: key, value: remote) in keyboard.entries) {
+      release(remote, remoteShortcutFor(key)?.label ?? remote.name);
+    }
+    for (final MapEntry(key: remote, value: label) in buttons.entries) {
+      release(remote, label);
+    }
+  }
+
+  void _onRemoteFocusChange(bool hasFocus) {
+    // Focus inside the remote (a button, the text field) still delivers
+    // key-ups to [_onKey]; focus anywhere else does not. That includes
+    // every route pushed on top (a dialog, the apps sheet, pairing), which
+    // takes the keyboard when it opens.
+    if (!hasFocus) _releaseHeld();
+  }
+
+  void _startButtonHold(RemoteKey key, String label) {
+    _buttonHeld[key] = label;
+    unawaited(_send(PressKey(key, KeyAction.down), label));
+  }
+
+  void _endButtonHold(RemoteKey key, String label) {
+    // Already released when the remote lost focus or the app went inactive.
+    if (_buttonHeld.remove(key) == null) return;
+    unawaited(_send(PressKey(key, KeyAction.up), label));
   }
 
   Future<CommandResult> _deliver(Command command) async {
@@ -65,10 +139,58 @@ class _RemoteScreenState extends State<RemoteScreen> {
   }
 
   /// Sends [command] and reports the result under [label].
+  ///
+  /// When the engine will not send a power toggle without knowing the TV's
+  /// state, asks the user what they see and sends the confirmed command
+  /// instead (see [needsPowerConfirmation]).
   Future<CommandResult> _send(Command command, String label) async {
     final result = await _deliver(command);
-    if (mounted) showCommandFeedback(context, result, label: label);
+    if (!mounted) return result;
+    if (needsPowerConfirmation(command, result)) {
+      return _confirmPower(command, result, label);
+    }
+    showCommandFeedback(context, result, label: label, command: command);
     return result;
+  }
+
+  /// Whether the "Is the TV on?" dialog is open.
+  bool _askingPower = false;
+
+  /// Asks whether the TV is on and sends what follows as a confirmed
+  /// [SetPower] (see [confirmedPowerCommand]): the other state for the
+  /// power key, and the state asked for, unless the TV is already in it,
+  /// for Power on and Power off. Returns [unconfirmed] when the user
+  /// cancels, the TV is already in that state, or a dialog is already open.
+  ///
+  /// Asks only while the remote is the page in front: a slow answer must
+  /// not put the question over another page (pairing, the apps sheet, a
+  /// dialog), where answering it would send a power command to this TV.
+  /// The refusal is reported instead.
+  Future<CommandResult> _confirmPower(
+    Command command,
+    CommandResult unconfirmed,
+    String label,
+  ) async {
+    if (_askingPower) return unconfirmed;
+    if (!(ModalRoute.isCurrentOf(context) ?? true)) {
+      showCommandFeedback(context, unconfirmed, label: label, command: command);
+      return unconfirmed;
+    }
+    _askingPower = true;
+    final wanted = wantedPower(command);
+    final bool? observedOn;
+    try {
+      observedOn = await askWhetherTvIsOn(context, wanted: wanted);
+    } finally {
+      _askingPower = false;
+    }
+    if (observedOn == null || !mounted) return unconfirmed;
+    final confirmed = confirmedPowerCommand(
+      observedOn: observedOn,
+      wanted: wanted,
+    );
+    if (confirmed == null) return unconfirmed;
+    return _send(confirmed, confirmed.on ? 'Power on' : 'Power off');
   }
 
   Future<void> _sendText() async {
@@ -182,6 +304,14 @@ class _RemoteScreenState extends State<RemoteScreen> {
     _client = controller.client;
     final device = _device = controller.byId(widget.deviceId);
     if (device == null) {
+      // The device left the list (forgotten, perhaps by another client).
+      // The keyboard handler goes with the remote's body, before it could
+      // hear of the focus loss, so no key-up will come: end the holds now.
+      if (_held.isNotEmpty || _buttonHeld.isNotEmpty || _pressed.isNotEmpty) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) _releaseHeld(quiet: true);
+        });
+      }
       return Scaffold(
         appBar: AppBar(title: const Text('Remote')),
         body: const Center(
@@ -214,6 +344,7 @@ class _RemoteScreenState extends State<RemoteScreen> {
           autofocus: true,
           skipTraversal: true,
           onKeyEvent: _onKey,
+          onFocusChange: _onRemoteFocusChange,
           child: LayoutBuilder(
             builder: (context, constraints) {
               final wide = constraints.maxWidth >= 760;
@@ -321,10 +452,8 @@ class _RemoteScreenState extends State<RemoteScreen> {
       onPressed: enabled ? () => _send(command, label) : null,
       onHoldStart: holdKey == null
           ? null
-          : () => _send(PressKey(holdKey, KeyAction.down), label),
-      onHoldEnd: holdKey == null
-          ? null
-          : () => _send(PressKey(holdKey, KeyAction.up), label),
+          : () => _startButtonHold(holdKey, label),
+      onHoldEnd: holdKey == null ? null : () => _endButtonHold(holdKey, label),
     );
   }
 
@@ -341,6 +470,16 @@ class _RemoteScreenState extends State<RemoteScreen> {
 
   List<Widget> _primaryControls(DeviceView device) => [
     ?_row([
+      // The power key is a toggle intent: the engine turns the TV off or on
+      // when its evidence agrees on the current state, and otherwise asks
+      // through [_confirmPower].
+      _key(
+        device,
+        command: const PressKey(RemoteKey.power),
+        icon: Icons.power_settings_new,
+        label: 'Power',
+        circular: true,
+      ),
       _key(
         device,
         command: const SetPower(true),
@@ -582,8 +721,11 @@ class _Banner extends StatelessWidget {
   }
 }
 
-/// What watchme knows about the TV right now, with each value's source in a
-/// tooltip.
+/// What watchme knows about the TV right now: whether a session is
+/// connected, then each value, with its source in a tooltip.
+///
+/// A value from a session that has since stopped answering is stale; it
+/// shows as "(last known)", never as the TV's current state.
 class _StatusLine extends StatelessWidget {
   const _StatusLine({required this.device});
 
@@ -593,7 +735,9 @@ class _StatusLine extends StatelessWidget {
   Widget build(BuildContext context) {
     final state = device.state;
     final playing = state.nowPlaying?.value.state;
+    final connection = _connectionIcon(device);
     final items = <(IconData, String, Observed<Object?>?)>[
+      (connection, deviceStatusLabel(device), null),
       if (makeAndModel(device) case final model?) (Icons.tv, model, null),
       if (state.power case final power?)
         (Icons.power_settings_new, powerModeLabel(power.value), power),
@@ -613,7 +757,6 @@ class _StatusLine extends StatelessWidget {
           state.nowPlaying,
         ),
     ];
-    if (items.isEmpty) return const SizedBox.shrink();
     return Wrap(
       spacing: 8,
       runSpacing: 8,
@@ -624,6 +767,15 @@ class _StatusLine extends StatelessWidget {
       ],
     );
   }
+}
+
+IconData _connectionIcon(DeviceView device) {
+  if (device.connected) return Icons.link;
+  if (device.needsPairing) return Icons.lock_outline;
+  final states = {for (final d in device.drivers) d.connection};
+  if (states.contains(ConnectionState.connecting)) return Icons.sync;
+  if (states.contains(ConnectionState.failed)) return Icons.error_outline;
+  return Icons.link_off;
 }
 
 class _StatusChip extends StatelessWidget {
@@ -637,11 +789,14 @@ class _StatusChip extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final observed = this.observed;
-    final certain =
-        observed == null || observed.confidence == Confidence.reported;
+    final label = switch (observed?.confidence) {
+      null || Confidence.reported => text,
+      Confidence.inferred => '$text?',
+      Confidence.stale => '$text (last known)',
+    };
     final chip = Chip(
       avatar: Icon(icon, size: 18),
-      label: Text(certain ? text : '$text?'),
+      label: Text(label),
       visualDensity: VisualDensity.compact,
       side: BorderSide(color: theme.colorScheme.outlineVariant),
     );

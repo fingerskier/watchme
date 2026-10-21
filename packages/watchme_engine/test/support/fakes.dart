@@ -54,7 +54,8 @@ class FakeDriver implements Driver {
   WatchmeError? connectError;
 
   final List<Endpoint> probes = [];
-  final List<({Endpoint endpoint, Credential? credential})> connects = [];
+  final List<({Endpoint endpoint, Credential? credential, bool allowWake})>
+  connects = [];
   final List<PairingContext> pairings = [];
   final List<FakeSession> sessions = [];
 
@@ -87,9 +88,14 @@ class FakeDriver implements Driver {
   Future<DriverSession> connect(
     Endpoint endpoint,
     Transports transports,
-    Credential? credential,
-  ) async {
-    connects.add((endpoint: endpoint, credential: credential));
+    Credential? credential, {
+    bool allowWake = true,
+  }) async {
+    connects.add((
+      endpoint: endpoint,
+      credential: credential,
+      allowWake: allowWake,
+    ));
     final error = connectError;
     if (error != null) throw error;
     final handler = onConnect;

@@ -5,7 +5,7 @@ import 'package:multicast_dns/multicast_dns.dart';
 import 'package:watchme_core/watchme_core.dart';
 
 import '../network/io_errors.dart';
-import '../network/io_network_stack.dart' show isLanAddress;
+import 'sender_filtered_socket.dart';
 import 'ssdp_discovery.dart' show isDnsSdServiceType;
 
 /// Multicast DNS-SD discovery (provider id `mdns`) over raw sockets, using
@@ -32,11 +32,14 @@ import 'ssdp_discovery.dart' show isDnsSdServiceType;
 /// instance label containing a dot can only be resolved from additional
 /// records, because its queries split names on dots.
 ///
-/// Safety: an instance whose A/AAAA record is not a local-network address
-/// ([isLanAddress]) is dropped, so a spoofed record cannot make watchme
-/// probe a host on the internet. Loopback addresses (this host's own
-/// services) are dropped too unless [allowLoopback] is set, which only
-/// loopback tests need.
+/// Safety, under [destinationPolicy] (LAN-only by default: private,
+/// link-local and unique-local addresses):
+/// * a datagram from a sender the policy refuses is dropped before the
+///   mDNS client parses it, so its records never reach the cache;
+/// * an instance whose A/AAAA address the policy refuses is dropped, so a
+///   spoofed record cannot make watchme probe a host on the internet, in
+///   the shared range 100.64.0.0/10 (carrier-grade NAT, VPN overlays), or
+///   this host's own loopback services. Only loopback tests allow loopback.
 ///
 /// The stream closes when the window ends and instances already announced
 /// have been resolved (each lookup bounded by [resolveTimeout]). It fails
@@ -53,7 +56,7 @@ final class MdnsDiscovery implements DiscoveryProvider {
     this.group,
     this.interfaces,
     this.socketFactory = RawDatagramSocket.bind,
-    this.allowLoopback = false,
+    this.destinationPolicy = DestinationPolicy.lanOnly,
   });
 
   /// The TV-related service types browsed when a scan names none.
@@ -86,9 +89,10 @@ final class MdnsDiscovery implements DiscoveryProvider {
   /// Creates the client's sockets.
   final RawDatagramSocketFactory socketFactory;
 
-  /// Whether instances resolving to a loopback address are reported (tests
-  /// with a responder on loopback).
-  final bool allowLoopback;
+  /// Which senders are heard and which resolved addresses are reported;
+  /// LAN-only by default. Loopback tests opt in with
+  /// `DestinationPolicy(allowLoopback: true)`.
+  final DestinationPolicy destinationPolicy;
 
   @override
   String get id => DiscoveryProviderId.mdns;
@@ -114,7 +118,7 @@ final class MdnsDiscovery implements DiscoveryProvider {
 
     Future<void> run() async {
       if (types.isEmpty) return;
-      final c = client = MDnsClient(rawDatagramSocketFactory: socketFactory);
+      final c = client = MDnsClient(rawDatagramSocketFactory: _openSocket);
       try {
         await c.start(
           listenAddress: InternetAddress.anyIPv4,
@@ -225,7 +229,25 @@ final class MdnsDiscovery implements DiscoveryProvider {
   }
 
   bool _acceptable(InternetAddress address) =>
-      isLanAddress(address) && (allowLoopback || !address.isLoopback);
+      destinationPolicy.allows(address.address);
+
+  /// [socketFactory]'s socket, hiding datagrams from refused senders.
+  Future<RawDatagramSocket> _openSocket(
+    dynamic host,
+    int port, {
+    bool reuseAddress = true,
+    bool reusePort = false,
+    int ttl = 1,
+  }) async => SenderFilteredSocket(
+    await socketFactory(
+      host,
+      port,
+      reuseAddress: reuseAddress,
+      reusePort: reusePort,
+      ttl: ttl,
+    ),
+    _acceptable,
+  );
 
   static Future<T?> _first<T>(Stream<T> stream) async {
     await for (final value in stream) {

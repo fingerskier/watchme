@@ -1,10 +1,12 @@
 import 'dart:io' hide Datagram;
 
+import 'package:multicast_dns/multicast_dns.dart' show RawDatagramSocketFactory;
 import 'package:test/test.dart';
 import 'package:watchme_core/watchme_core.dart';
 import 'package:watchme_io/watchme_io.dart';
 
 import '../support/fake_mdns_responder.dart';
+import '../support/policies.dart';
 
 void main() {
   group('parseMdnsTxt', () {
@@ -122,18 +124,21 @@ void main() {
           .firstWhere((i) => i.addresses.any((a) => a.isLoopback));
     });
 
+    // The responder is on loopback, so its datagrams come from 127.0.0.1:
+    // these tests opt into loopback unless they say otherwise.
     MdnsDiscovery provider(
       int port, {
       List<String>? types,
-      bool allowLoopback = true,
+      DestinationPolicy policy = loopbackAllowed,
+      RawDatagramSocketFactory socketFactory = loopbackSocketFactory,
     }) => MdnsDiscovery(
       serviceTypes: types ?? MdnsDiscovery.defaultServiceTypes,
       port: port,
       group: group,
       interfaces: (_) async => [lo],
-      socketFactory: loopbackSocketFactory,
+      socketFactory: socketFactory,
       resolveTimeout: const Duration(milliseconds: 500),
-      allowLoopback: allowLoopback,
+      destinationPolicy: policy,
     );
 
     for (final additionals in [true, false]) {
@@ -216,6 +221,14 @@ void main() {
         ipv4: '203.0.113.9',
         txt: ['fn=Spoofed TV'],
       );
+      const shared = FakeMdnsService(
+        type: '_googlecast._tcp',
+        instance: 'Overlay',
+        target: 'overlay.local',
+        port: 8009,
+        ipv4: '100.64.1.2',
+        txt: ['fn=Overlay TV'],
+      );
       const lan = FakeMdnsService(
         type: '_googlecast._tcp',
         instance: 'Lounge',
@@ -227,20 +240,74 @@ void main() {
       final responder = await FakeMdnsResponder.start(
         group: group,
         loopback: lo,
-        services: [internet, lan, cast],
+        services: [internet, shared, lan, cast],
       );
       if (responder == null) {
         markTestSkipped('cannot join a multicast group on loopback');
         return;
       }
       addTearDown(responder.close);
+      // The responder acts as a LAN host, so its records are heard and
+      // judged one by one under the default LAN-only policy.
       final hits = await provider(
         responder.port,
         types: ['_googlecast._tcp'],
-        allowLoopback: false,
+        policy: DestinationPolicy.lanOnly,
+        socketFactory: spoofedSenderSocketFactory(
+          InternetAddress('192.168.40.1'),
+        ),
       ).scan(const Duration(milliseconds: 700)).toList();
-      // The internet address and the loopback one (cast) are both dropped.
+      // The internet, shared-range (CGNAT / VPN overlay) and loopback
+      // (cast) addresses are all dropped.
       expect(hits.map((h) => h.host), ['192.168.40.12']);
+    });
+
+    test('drops every datagram from a sender outside the policy', () async {
+      const lan = FakeMdnsService(
+        type: '_googlecast._tcp',
+        instance: 'Lounge',
+        target: 'lounge.local',
+        port: 8009,
+        ipv4: '192.168.40.12',
+        txt: ['fn=Lounge TV'],
+      );
+      final responder = await FakeMdnsResponder.start(
+        group: group,
+        loopback: lo,
+        services: [lan],
+      );
+      if (responder == null) {
+        markTestSkipped('cannot join a multicast group on loopback');
+        return;
+      }
+      addTearDown(responder.close);
+      Future<List<DiscoveryHit>> scanFrom(
+        String? sender, {
+        DestinationPolicy policy = DestinationPolicy.lanOnly,
+      }) => provider(
+        responder.port,
+        types: ['_googlecast._tcp'],
+        policy: policy,
+        socketFactory: sender == null
+            ? loopbackSocketFactory
+            : spoofedSenderSocketFactory(InternetAddress(sender)),
+      ).scan(const Duration(milliseconds: 500)).toList();
+
+      // A LAN sender is heard...
+      expect((await scanFrom('192.168.40.12')).map((h) => h.host), [
+        '192.168.40.12',
+      ]);
+      // ...but the same records from the shared range, the internet or a
+      // reserved block never reach the client, whatever address they name.
+      for (final sender in ['100.64.0.9', '8.8.8.8', '203.0.113.5']) {
+        expect(await scanFrom(sender), isEmpty, reason: sender);
+      }
+      // Loopback is heard only when the policy says so.
+      expect(await scanFrom(null), isEmpty);
+      expect(
+        (await scanFrom(null, policy: loopbackAllowed)).map((h) => h.host),
+        ['192.168.40.12'],
+      );
     });
 
     test(

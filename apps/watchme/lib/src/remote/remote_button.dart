@@ -16,8 +16,9 @@ enum RemoteButtonTone {
 ///
 /// A tap calls [onPressed]. With [onHoldStart] and [onHoldEnd], a long
 /// press calls [onHoldStart] when the hold begins and [onHoldEnd] when it
-/// ends (including when the button disappears mid-hold), which the remote
-/// maps to key-down and key-up so the TV repeats the key itself.
+/// ends: the finger lifts, the system cancels the pointer, the button is
+/// disabled, or it disappears mid-hold. The remote maps these to key-down
+/// and key-up so the TV repeats the key itself.
 class RemoteButton extends StatefulWidget {
   /// Creates a button. [label] is the tooltip and the accessibility label.
   const RemoteButton({
@@ -147,24 +148,31 @@ class _RemoteButtonState extends State<RemoteButton> {
             onTap: widget.onPressed,
             onLongPress: canHold ? _startHold : null,
             onLongPressUp: canHold ? _endHold : null,
-            child: SizedBox(
-              width: widget.width,
-              height: widget.height,
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  Icon(widget.icon, color: foreground, size: 28),
-                  if (caption != null)
-                    ExcludeSemantics(
-                      child: Text(
-                        caption,
-                        style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                          color: foreground,
-                          fontWeight: FontWeight.w600,
+            child: Listener(
+              // The long-press recognizer reports no end for a cancelled
+              // pointer (e.g. the system took the gesture), and the TV
+              // would keep repeating the key.
+              onPointerCancel: (_) => _endHold(),
+              child: SizedBox(
+                width: widget.width,
+                height: widget.height,
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(widget.icon, color: foreground, size: 28),
+                    if (caption != null)
+                      ExcludeSemantics(
+                        child: Text(
+                          caption,
+                          style: Theme.of(context).textTheme.labelSmall
+                              ?.copyWith(
+                                color: foreground,
+                                fontWeight: FontWeight.w600,
+                              ),
                         ),
                       ),
-                    ),
-                ],
+                  ],
+                ),
               ),
             ),
           ),

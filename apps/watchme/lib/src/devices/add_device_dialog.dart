@@ -14,6 +14,12 @@ Future<DeviceView?> showAddDeviceDialog(BuildContext context) =>
       builder: (_) => const AddDeviceDialog(),
     );
 
+/// What to do about an address watchme refused because it is not on the
+/// local network (public, carrier-grade NAT or VPN, reserved, broadcast).
+const String _offLanHint =
+    "Check the address in the TV's network settings. Addresses on a home "
+    'network usually start with 192.168., 10. or 172.16. to 172.31.';
+
 /// The "Add by IP address" dialog.
 class AddDeviceDialog extends StatefulWidget {
   /// Creates the dialog.
@@ -113,6 +119,10 @@ class _AddDeviceDialogState extends State<AddDeviceDialog> {
                 ),
                 const SizedBox(height: 4),
                 Text(error.message),
+                if (error.code == WatchmeErrorCode.destinationRefused) ...[
+                  const SizedBox(height: 8),
+                  const Text(_offLanHint),
+                ],
                 if (raw != null && raw.isNotEmpty) ...[
                   const SizedBox(height: 8),
                   RawDeviceMessage(raw),

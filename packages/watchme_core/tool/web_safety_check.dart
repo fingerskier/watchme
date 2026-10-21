@@ -8,8 +8,9 @@ import 'package:watchme_core/watchme_core.dart';
 void main() {
   final packet = magicPacket('01:23:45:67:89:ab');
   final command = Command.fromJson(const PressKey(RemoteKey.home).toJson());
+  final lan = classifyHostAddress('fe80::1%25eth0');
   print(
     '${Capability.values.length} capabilities, ${packet.length}-byte '
-    'magic packet, $command',
+    'magic packet, $command, fe80::1%25eth0 is ${lan.name}',
   );
 }

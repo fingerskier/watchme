@@ -66,6 +66,48 @@ void main() {
       );
     });
 
+    test(
+      'refuses addresses off the local network, as the engine does',
+      () async {
+        final client = _demo();
+
+        for (final host in [
+          '8.8.8.8',
+          '100.64.0.7',
+          '0.0.0.0',
+          '2001:db8::1',
+        ]) {
+          await expectLater(
+            client.addManual(host),
+            throwsA(
+              isA<WatchmeError>().having(
+                (e) => e.code,
+                'code',
+                WatchmeErrorCode.destinationRefused,
+              ),
+            ),
+            reason: host,
+          );
+        }
+        // LAN, loopback (the app allows it) and host names get as far as a
+        // probe that finds nothing.
+        for (final host in ['192.168.1.50', '127.0.0.1', 'tv.lan']) {
+          await expectLater(
+            client.addManual(host),
+            throwsA(
+              isA<WatchmeError>().having(
+                (e) => e.code,
+                'code',
+                WatchmeErrorCode.unreachable,
+              ),
+            ),
+            reason: host,
+          );
+        }
+        expect(await client.watchDevices().first, isEmpty);
+      },
+    );
+
     test('Roku needs no pairing', () async {
       final client = _demo();
       await client.scan();
@@ -194,6 +236,77 @@ void main() {
       expect(roku.state.muted?.confidence, Confidence.inferred);
     });
 
+    test('the power key is a toggle intent', () async {
+      final client = _demo();
+      await client.scan();
+      await _pairWith(
+        client,
+        'demo-firetv',
+        'firetv.lightning',
+        pin: demoFireTvPin,
+      );
+      Future<PowerMode?> power(String id) async =>
+          (await client.watchDevices().first)
+              .firstWhere((d) => d.id == id)
+              .state
+              .power
+              ?.value;
+
+      // Each demo TV has one source for its power state (its own driver)
+      // and the engine needs two to toggle on its own, so it asks, even for
+      // the Roku that reports its state. This used to toggle the Roku
+      // directly, which the real engine never does (verifier follow-up to
+      // Codex finding #1).
+      expect(
+        await client.send('demo-roku', const PressKey(RemoteKey.power)),
+        const Unsupported(Unsupported.needsConfirmation),
+      );
+      expect(await power('demo-roku'), PowerMode.on);
+      expect(
+        await client.send(
+          'demo-roku',
+          const SetPower(false, userConfirmed: true),
+        ),
+        const Confirmed(),
+      );
+      expect(await power('demo-roku'), PowerMode.standby);
+      expect(
+        await client.send('demo-roku', const SetPower(true)),
+        const Confirmed(),
+        reason: 'a discrete power command needs no question',
+      );
+      expect(await power('demo-roku'), PowerMode.on);
+
+      // The same on the Fire TV, which cannot report its state at all.
+      expect(
+        await client.send('demo-firetv', const PressKey(RemoteKey.power)),
+        const Unsupported(Unsupported.needsConfirmation),
+      );
+      expect(await power('demo-firetv'), PowerMode.on);
+      expect(
+        await client.send(
+          'demo-firetv',
+          const SetPower(false, userConfirmed: true),
+        ),
+        const Confirmed(),
+      );
+      expect(await power('demo-firetv'), PowerMode.standby);
+
+      // A toggle cannot be held.
+      for (final action in [KeyAction.down, KeyAction.up]) {
+        final held = await client.send(
+          'demo-roku',
+          PressKey(RemoteKey.power, action),
+        );
+        expect(held, isA<Unsupported>());
+        expect(
+          (held as Unsupported).reason,
+          isNot(Unsupported.needsConfirmation),
+        );
+      }
+      expect(await power('demo-roku'), PowerMode.on);
+    });
+
     test(
       'Fire TV rewind fails with raw text; channels are unsupported',
       () async {
@@ -286,5 +399,64 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.textContaining('Rewind failed'), findsOneWidget);
     expect(find.textContaining('TV said: HTTP 400'), findsOneWidget);
+
+    // The Fire TV cannot report its power state, so the power key asks.
+    expect(find.text('On?'), findsOneWidget);
+    await tester.tap(find.byTooltip('Power'));
+    await tester.pumpAndSettle();
+    expect(find.text('Is the TV on?'), findsOneWidget);
+    await tester.tap(find.text("It's on, turn it off"));
+    await tester.pumpAndSettle();
+    expect(find.text('Is the TV on?'), findsNothing);
+    expect(find.text('Standby?'), findsOneWidget);
+  });
+
+  testWidgets('the power key asks about a demo Roku, which is one source '
+      'of its power state', (tester) async {
+    final client = _demo();
+    addTearDown(client.close);
+    useWindowSize(tester, const Size(1200, 1100));
+    await tester.pumpWidget(WatchmeApp(client: client, demo: true));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Scan'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Living Room Roku TV'));
+    await tester.pumpAndSettle();
+    expect(find.byType(RemoteScreen), findsOneWidget);
+    expect(find.text('On'), findsOneWidget);
+
+    await tester.tap(find.byTooltip('Power'));
+    await tester.pumpAndSettle();
+    expect(find.text('Is the TV on?'), findsOneWidget);
+    await tester.tap(find.text("It's on, turn it off"));
+    await tester.pumpAndSettle();
+    expect(find.text('Is the TV on?'), findsNothing);
+    expect(find.text('Standby'), findsOneWidget);
+    expect(find.byType(SnackBar), findsNothing);
+
+    // Power on is discrete: no question.
+    await tester.tap(find.byTooltip('Power on'));
+    await tester.pumpAndSettle();
+    expect(find.text('Is the TV on?'), findsNothing);
+    expect(find.text('On'), findsOneWidget);
+  });
+
+  testWidgets('the demo refuses an address off the LAN in the add dialog', (
+    tester,
+  ) async {
+    final client = _demo();
+    addTearDown(client.close);
+    useWindowSize(tester, const Size(1200, 1100));
+    await tester.pumpWidget(WatchmeApp(client: client, demo: true));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('Add by IP'));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byType(TextFormField), '100.64.0.7');
+    await tester.tap(find.widgetWithText(FilledButton, 'Add'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Not a local network address'), findsOneWidget);
+    expect(find.textContaining('carrier-grade NAT'), findsOneWidget);
   });
 }

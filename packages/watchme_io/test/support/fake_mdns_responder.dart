@@ -1,5 +1,6 @@
+import 'dart:async';
 import 'dart:convert';
-import 'dart:io' hide Datagram;
+import 'dart:io';
 import 'dart:typed_data';
 
 /// A DNS-SD service the fake responder announces.
@@ -225,4 +226,115 @@ Future<RawDatagramSocket> loopbackSocketFactory(
   );
   confineToLoopback(socket);
   return socket;
+}
+
+/// Like [loopbackSocketFactory], but every datagram the client receives
+/// appears to come from [sender]: lets loopback tests act out a responder
+/// on the LAN, in the shared range or on the internet.
+Future<RawDatagramSocket> Function(
+  dynamic host,
+  int port, {
+  bool reuseAddress,
+  bool reusePort,
+  int ttl,
+})
+spoofedSenderSocketFactory(InternetAddress sender) =>
+    (host, port, {reuseAddress = true, reusePort = false, ttl = 1}) async =>
+        _SpoofedSenderSocket(
+          await loopbackSocketFactory(
+            host,
+            port,
+            reuseAddress: reuseAddress,
+            reusePort: reusePort,
+            ttl: ttl,
+          ),
+          sender,
+        );
+
+final class _SpoofedSenderSocket extends Stream<RawSocketEvent>
+    implements RawDatagramSocket {
+  _SpoofedSenderSocket(this._socket, this._sender);
+
+  final RawDatagramSocket _socket;
+  final InternetAddress _sender;
+
+  @override
+  Datagram? receive() {
+    final d = _socket.receive();
+    return d == null ? null : Datagram(d.data, _sender, d.port);
+  }
+
+  @override
+  StreamSubscription<RawSocketEvent> listen(
+    void Function(RawSocketEvent event)? onData, {
+    Function? onError,
+    void Function()? onDone,
+    bool? cancelOnError,
+  }) => _socket.listen(
+    onData,
+    onError: onError,
+    onDone: onDone,
+    cancelOnError: cancelOnError,
+  );
+
+  @override
+  InternetAddress get address => _socket.address;
+
+  @override
+  int get port => _socket.port;
+
+  @override
+  bool get readEventsEnabled => _socket.readEventsEnabled;
+
+  @override
+  set readEventsEnabled(bool value) => _socket.readEventsEnabled = value;
+
+  @override
+  bool get writeEventsEnabled => _socket.writeEventsEnabled;
+
+  @override
+  set writeEventsEnabled(bool value) => _socket.writeEventsEnabled = value;
+
+  @override
+  bool get multicastLoopback => _socket.multicastLoopback;
+
+  @override
+  set multicastLoopback(bool value) => _socket.multicastLoopback = value;
+
+  @override
+  int get multicastHops => _socket.multicastHops;
+
+  @override
+  set multicastHops(int value) => _socket.multicastHops = value;
+
+  @override
+  NetworkInterface? multicastInterface;
+
+  @override
+  bool get broadcastEnabled => _socket.broadcastEnabled;
+
+  @override
+  set broadcastEnabled(bool value) => _socket.broadcastEnabled = value;
+
+  @override
+  void close() => _socket.close();
+
+  @override
+  int send(List<int> buffer, InternetAddress address, int port) =>
+      _socket.send(buffer, address, port);
+
+  @override
+  void joinMulticast(InternetAddress group, [NetworkInterface? interface]) =>
+      _socket.joinMulticast(group, interface);
+
+  @override
+  void leaveMulticast(InternetAddress group, [NetworkInterface? interface]) =>
+      _socket.leaveMulticast(group, interface);
+
+  @override
+  Uint8List getRawOption(RawSocketOption option) =>
+      _socket.getRawOption(option);
+
+  @override
+  void setRawOption(RawSocketOption option) => _socket.setRawOption(option);
 }

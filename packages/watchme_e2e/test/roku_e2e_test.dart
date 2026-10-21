@@ -307,6 +307,8 @@ void main() {
             network,
             group: '127.0.0.1',
             port: sim.ssdpPort!,
+            // The simulator answers from loopback, which LAN-only refuses.
+            destinationPolicy: e2ePolicy,
             mx: 1,
             attempts: 1,
           ),

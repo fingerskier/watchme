@@ -35,6 +35,11 @@ abstract interface class WatchmeEngine {
   /// Probes [host] with every enabled driver and adds the device if any
   /// matches. [ports] overrides protocol ports (simulators on loopback).
   /// Throws [WatchmeError] when nothing matches.
+  ///
+  /// An IP literal outside the engine's `DestinationPolicy` is refused up
+  /// front with [WatchmeErrorCode.destinationRefused], before any driver
+  /// runs. A host name is checked by the network stack, which resolves it
+  /// and refuses it if any address it resolves to is outside the policy.
   Future<DeviceView> addManual(
     String host, {
     Map<String, int> ports = const {},
@@ -50,7 +55,12 @@ abstract interface class WatchmeEngine {
   PairingFlow pair(String deviceId, String driverId);
 
   /// Routes [command] to the best session for the device, falling back down
-  /// the ranked list. Never throws.
+  /// the ranked list only while nothing has reached the device: never after
+  /// a timeout or [WatchmeErrorCode.partiallyDelivered], after which the
+  /// affected state is marked stale or refreshed. Never throws.
+  ///
+  /// [SetPower] and `PressKey(RemoteKey.power)` go to the power
+  /// orchestrator instead (see [PressKey] and [SetPower.userConfirmed]).
   Future<CommandResult> send(String deviceId, Command command);
 
   /// Re-reads the device's state through its sessions.
@@ -91,6 +101,10 @@ abstract interface class WatchmeClient {
   Future<PairingHandle> pair(String deviceId, String driverId);
 
   /// Sends a command. Never throws for device-level failures.
+  ///
+  /// When a power command returns
+  /// `Unsupported(Unsupported.needsConfirmation)`, ask the user whether the
+  /// TV is on right now and send `SetPower(!isOn, userConfirmed: true)`.
   Future<CommandResult> send(String deviceId, Command command);
 
   /// Re-reads the device's state.

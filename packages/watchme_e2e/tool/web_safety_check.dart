@@ -36,18 +36,36 @@ Future<void> main() async {
   );
   await engine.start();
   final client = InProcessClient(engine, ownsEngine: true);
-  String refusal;
-  try {
-    await client.addManual('192.0.2.1');
-    refusal = 'none';
-  } on WatchmeError catch (e) {
-    refusal = e.code.name;
+  Future<String> refusalOf(String host) async {
+    try {
+      await client.addManual(host);
+      return 'none';
+    } on WatchmeError catch (e) {
+      return e.code.name;
+    }
   }
+
+  // A LAN address passes the destination check and then finds no driver
+  // that can run without transports; a public one is refused before that.
+  // Nothing is contacted either way: there is no network stack.
+  final refusal = await refusalOf('10.0.2.1');
+  final publicRefusal = await refusalOf('8.8.8.8');
   final command = Command.fromJson(const PressKey(RemoteKey.home).toJson());
+  // The LAN-only classifier is pure Dart; prove it compiles and runs in JS.
+  final classes = [
+    for (final a in ['192.168.1.7', '::ffff:127.0.0.1', '100.64.0.1'])
+      classifyHostAddress(a).name,
+  ];
+  final power = Command.fromJson(
+    const SetPower(true, userConfirmed: true).toJson(),
+  );
   print(
     'drivers ${[rokuDescriptor.id, fireTvDescriptor.id]}, '
     'enabled ${engine.drivers.length}, manual add refused: $refusal, '
-    '$command',
+    'public host refused: $publicRefusal, '
+    '$command, $power, classes $classes, '
+    'LAN-only allows 192.168.1.7: '
+    '${DestinationPolicy.lanOnly.allows('192.168.1.7')}',
   );
   await client.close();
 }

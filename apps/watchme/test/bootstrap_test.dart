@@ -7,6 +7,7 @@ import 'dart:io' hide Datagram;
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:watchme/src/bootstrap.dart';
+import 'package:watchme/src/destination_policy.dart';
 import 'package:watchme_core/watchme_core.dart';
 import 'package:watchme_testkit/roku_simulator.dart';
 
@@ -53,5 +54,36 @@ void main() {
     addTearDown(reopened.close);
     final first = await reopened.watchDevices().first;
     expect(first.map((d) => d.id), [view.id]);
+  });
+
+  test('the app allows loopback but nothing else off the LAN', () {
+    // The simulators on 127.0.0.1 need loopback (the test above); the
+    // non-private escape hatch stays shut.
+    expect(appDestinationPolicy.allowLoopback, isTrue);
+    expect(appDestinationPolicy.allowNonPrivate, isFalse);
+  });
+
+  test('the engine client refuses an address off the LAN up front', () async {
+    final client = await createEngineClient(stateDirectory: state.path);
+    addTearDown(client.close);
+
+    // Documentation and benchmarking ranges: nothing real answers there,
+    // even if a refusal were missing.
+    for (final host in ['203.0.113.5', '198.18.0.1', '2001:db8::5']) {
+      await expectLater(
+        client.addManual(host),
+        throwsA(
+          isA<WatchmeError>()
+              .having(
+                (e) => e.code,
+                'code',
+                WatchmeErrorCode.destinationRefused,
+              )
+              .having((e) => e.message, 'message', contains(host)),
+        ),
+        reason: host,
+      );
+    }
+    expect(await client.watchDevices().first, isEmpty);
   });
 }

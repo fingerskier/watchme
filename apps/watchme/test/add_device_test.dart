@@ -134,6 +134,34 @@ void main() {
       expect(find.text('Connection refused'), findsOneWidget);
     });
 
+    testWidgets('an address off the LAN is refused with a clear message', (
+      tester,
+    ) async {
+      const refusal = DestinationPolicy(allowLoopback: true);
+      final client = FakeWatchmeClient()
+        ..onAddManual = (host) => throw refusal.refusal(host)!;
+      await openDialog(tester, client);
+
+      await submit(tester, '100.64.0.7');
+
+      expect(client.addedHosts, ['100.64.0.7']);
+      expect(find.text('Add a TV by IP address'), findsOneWidget);
+      expect(find.text('Not a local network address'), findsOneWidget);
+      expect(find.textContaining('Refused to contact 100.64.0.7'), findsOne);
+      expect(find.textContaining('192.168., 10. or 172.16.'), findsOneWidget);
+      expect(find.text("Couldn't reach the TV"), findsNothing);
+    });
+
+    testWidgets('the off-LAN hint is only for refusals', (tester) async {
+      final client = FakeWatchmeClient();
+      await openDialog(tester, client);
+
+      await submit(tester, '192.168.1.99');
+
+      expect(find.text("Couldn't reach the TV"), findsOneWidget);
+      expect(find.textContaining('192.168., 10. or 172.16.'), findsNothing);
+    });
+
     testWidgets('Cancel closes without probing', (tester) async {
       final client = FakeWatchmeClient();
       await openDialog(tester, client);

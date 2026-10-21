@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:watchme_core/watchme_core.dart';
 
+import '../destination_policy.dart';
 import 'demo_tvs.dart';
 
 export 'demo_tvs.dart' show demoFireTvHost, demoFireTvPin, demoRokuHost;
@@ -13,7 +14,12 @@ export 'demo_tvs.dart' show demoFireTvHost, demoFireTvPin, demoRokuHost;
 /// - "Bedroom Fire TV Stick" ([demoFireTvHost]): needs PIN pairing; the PIN
 ///   is [demoFireTvPin]. Until paired, commands fail as unauthorized.
 ///
-/// Both appear after a [scan], or when added by address.
+/// Both appear after a [scan], or when added by address. Other addresses
+/// fail as unreachable, or as refused when they are off the local network.
+/// The power key asks whether the TV is on, on both TVs, as the engine
+/// does for a TV with fewer than two independent sources for its power
+/// state: each demo TV has only its own driver. Power on and Power off are
+/// discrete on both and need no question.
 final class DemoWatchmeClient implements WatchmeClient {
   /// Creates the demo. [latency] delays every answer and [scanTime] caps a
   /// scan's duration; tests pass [Duration.zero] for both.
@@ -77,6 +83,13 @@ final class DemoWatchmeClient implements WatchmeClient {
         _emit();
         return tv.view();
       }
+    }
+    // Like the engine, refuse an IP literal off the local network before
+    // probing it. The demo's own TVs sit in TEST-NET-1 (192.0.2.0/24),
+    // which stands in for the LAN here.
+    if (!wanted.startsWith('192.0.2.') &&
+        classifyHostAddress(wanted) != HostAddressClass.invalid) {
+      appDestinationPolicy.check(wanted);
     }
     throw WatchmeError.unreachable(
       'Nothing answered at $host. The demo has TVs at $demoRokuHost and '

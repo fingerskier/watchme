@@ -7,6 +7,8 @@ import 'package:watchme_core/watchme_core.dart';
 import 'package:watchme_io/watchme_io.dart';
 import 'package:watchme_testkit/watchme_testkit.dart';
 
+import 'support/policies.dart';
+
 const mac = 'D8-31-34-AA-BB-CC';
 
 void main() {
@@ -26,7 +28,7 @@ void main() {
     });
     // Unicast to loopback only: no broadcast leaves this host.
     final report = await WakeOnLan(
-      IoNetworkStack(),
+      IoNetworkStack(destinationPolicy: loopbackAllowed),
       ports: [listener.port],
       limitedBroadcast: false,
       subnetBroadcasts: () async => [],

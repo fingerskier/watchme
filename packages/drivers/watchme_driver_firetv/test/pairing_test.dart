@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:test/test.dart';
 import 'package:watchme_core/watchme_core.dart';
@@ -154,7 +155,162 @@ void main() {
       HttpResult.json(200, {'description': 'OK'}),
     );
     final steps = await _drive(start(), ['1234']);
-    expect(steps.last, isPairingFailedWith(WatchmeErrorCode.protocol));
+    expect(
+      steps.last,
+      isPairingFailedWith(
+        WatchmeErrorCode.protocol,
+        rawDeviceMessage: '{"description":"OK"}',
+      ),
+    );
+  });
+
+  group('a failed PIN check never shows a token', () {
+    // Codex finding #8: a synthetic token ending in a newline.
+    const token = 'S3cr3t-T0ken-4b2f\n';
+
+    /// Every text the step reaches: its JSON (as the hub serialises it),
+    /// its string form, and the error's message, raw text and cause, which
+    /// the pairing screen shows or logs.
+    void expectNoToken(PairingStep step) {
+      final failed = step as PairingFailed;
+      for (final text in [
+        jsonEncode(failed.toJson()),
+        jsonEncode(failed.toJson(includeSecrets: true)),
+        '$failed',
+        '${failed.error}',
+        failed.error.message,
+        '${failed.rawDeviceMessage}',
+        '${failed.error.cause}',
+      ]) {
+        expect(text, isNot(contains('S3cr3t-T0ken')), reason: text);
+      }
+    }
+
+    Future<PairingStep> verifyAnswers(HttpResult answer) async {
+      net.respond('POST', '/v1/FireTV/pin/verify', answer);
+      return (await _drive(start(), ['1234'])).last;
+    }
+
+    test('a token refused for a non-printable character', () async {
+      final step = await verifyAnswers(
+        HttpResult.json(200, {'description': token}),
+      );
+      expect(
+        step,
+        isPairingFailedWith(
+          WatchmeErrorCode.protocol,
+          rawDeviceMessage: '{"description":"<redacted>"}',
+        ),
+      );
+      expect(
+        (step as PairingFailed).error.message,
+        contains('no usable token'),
+      );
+      expectNoToken(step);
+    });
+
+    test('a token outside the description field', () async {
+      final step = await verifyAnswers(
+        HttpResult.json(200, {'clientToken': 'S3cr3t-T0ken-4b2f', 'n': 1}),
+      );
+      // `"n":1` was kept before; numbers are redacted too now, since a
+      // numeric token stayed in the error (verifier follow-up to #8).
+      expect(
+        step,
+        isPairingFailedWith(
+          WatchmeErrorCode.protocol,
+          rawDeviceMessage: '{"clientToken":"<redacted>","n":"<redacted>"}',
+        ),
+      );
+      expectNoToken(step);
+    });
+
+    test('a 2xx answer that is not JSON', () async {
+      final step = await verifyAnswers(
+        HttpResult.text(200, 'S3cr3t-T0ken-4b2f'),
+      );
+      expect(step, isPairingFailedWith(WatchmeErrorCode.protocol));
+      expectNoToken(step);
+    });
+
+    // Verifier follow-up to Codex finding #8: a refusal (any non-2xx
+    // status) kept `description`, the field this endpoint puts the token
+    // in, and a non-JSON body whole.
+    for (final (name, answer) in [
+      ('HTTP 400', HttpResult.json(400, {'description': 'S3cr3t-T0ken-4b2f'})),
+      ('HTTP 401', HttpResult.json(401, {'description': 'S3cr3t-T0ken-4b2f'})),
+      ('HTTP 500', HttpResult.json(500, {'description': 'S3cr3t-T0ken-4b2f'})),
+      ('HTTP 302', HttpResult.json(302, {'description': 'S3cr3t-T0ken-4b2f'})),
+      ('HTTP 500, not JSON', HttpResult.text(500, 'S3cr3t-T0ken-4b2f')),
+      (
+        'HTTP 500, nested',
+        HttpResult.json(500, {
+          'error': {'detail': 'S3cr3t-T0ken-4b2f'},
+        }),
+      ),
+    ]) {
+      test('a refusal carrying the token: $name', () async {
+        final step = await verifyAnswers(answer);
+        expect(step, isA<PairingFailed>());
+        expect(
+          (step as PairingFailed).error.message,
+          contains('HTTP ${answer.status}'),
+        );
+        expectNoToken(step);
+      });
+    }
+
+    test('a numeric description', () async {
+      final step = await verifyAnswers(
+        HttpResult.text(200, '{"description": 987654321777}'),
+      );
+      expect(step, isPairingFailedWith(WatchmeErrorCode.protocol));
+      for (final text in [
+        jsonEncode((step as PairingFailed).toJson()),
+        '$step',
+        '${step.rawDeviceMessage}',
+      ]) {
+        expect(text, isNot(contains('987654321777')), reason: text);
+      }
+    });
+
+    test('wrong PINs whose answers carry a token elsewhere', () async {
+      net.respond(
+        'POST',
+        '/v1/FireTV/pin/verify',
+        HttpResult.json(200, {
+          'description': '',
+          'session': 'S3cr3t-T0ken-4b2f',
+        }),
+      );
+      final step = (await _drive(start(), ['0000', '1111', '2222'])).last;
+      expect(
+        step,
+        isPairingFailedWith(
+          WatchmeErrorCode.unauthorized,
+          rawDeviceMessage: '{"description":"","session":"<redacted>"}',
+        ),
+      );
+      expectNoToken(step);
+    });
+
+    test('a refusal keeps its words but not a token field', () async {
+      final step = await verifyAnswers(
+        HttpResult.json(400, {
+          'description': 'PIN expired',
+          'clientToken': 'S3cr3t-T0ken-4b2f',
+        }),
+      );
+      expect(
+        step,
+        isPairingFailedWith(
+          WatchmeErrorCode.rejected,
+          rawDeviceMessage:
+              '{"description":"PIN expired","clientToken":"<redacted>"}',
+        ),
+      );
+      expectNoToken(step);
+    });
   });
 
   test('waits for the API port to open after the wake', () async {

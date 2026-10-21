@@ -20,7 +20,8 @@ const List<CapabilitySupport> rokuCeiling = [
     flags: {_setup},
     note:
         'Discrete PowerOff key on Roku TVs; players reach the TV through '
-        'HDMI-CEC.',
+        'HDMI-CEC. The Power key is a separate toggle with no state, sent '
+        'only under the power rules.',
   ),
   CapabilitySupport.partial(
     Capability.powerOn,

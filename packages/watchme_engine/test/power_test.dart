@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:test/test.dart';
 import 'package:watchme_core/watchme_core.dart';
 import 'package:watchme_engine/watchme_engine.dart';
@@ -48,7 +50,7 @@ class Rig {
   late final String id;
 
   Future<Rig> add() async {
-    id = await h.add('192.0.2.40');
+    id = await h.add('10.0.2.40');
     return this;
   }
 
@@ -101,9 +103,9 @@ void main() {
       // both conventional ports.
       expect(net.sentDatagrams.map((d) => (d.host, d.port, d.broadcast)), [
         ('255.255.255.255', wakeOnLanPort, true),
-        ('192.0.2.40', wakeOnLanPort, false),
+        ('10.0.2.40', wakeOnLanPort, false),
         ('255.255.255.255', 7, true),
-        ('192.0.2.40', 7, false),
+        ('10.0.2.40', 7, false),
       ]);
       for (final d in net.sentDatagrams) {
         expect(d.bytes, magicPacket(mac));
@@ -217,7 +219,7 @@ void main() {
         rig.online = false;
         final result = rig.power(true);
         await rig.h.clock.flush();
-        expect(calls, [(mac, '192.0.2.40')]);
+        expect(calls, [(mac, '10.0.2.40')]);
         expect(rig.h.transports.net.sentDatagrams, isEmpty);
         await rig.h.clock.advance(const Duration(seconds: 31));
         expect(await result, isSentUnconfirmed);
@@ -247,6 +249,35 @@ void main() {
       expect(await result, isFailedWith(WatchmeErrorCode.cancelled));
       expect(dial.probes, hasLength(probesBefore));
       expect(dial.connects, isEmpty);
+    });
+
+    test('a later request for something else ends the wait after '
+        'Wake-on-LAN', () async {
+      // Verifier follow-up to Codex finding #2: serialising power commands
+      // held an "off" behind the 30 s wait of an earlier "on".
+      final dial = FakeDriver('dial');
+      final rig = await Rig([dial], mac: mac).add();
+      addTearDown(rig.h.close);
+      rig.online = false;
+      CommandResult? onResult;
+      unawaited(rig.power(true).then((r) => onResult = r));
+      await rig.h.clock.advance(const Duration(seconds: 3));
+      expect(onResult, isNull, reason: 'still waiting for the device');
+      final probes = dial.probes.length;
+
+      // Another "on" joins it and does not end the wait.
+      unawaited(rig.power(true));
+      await rig.h.clock.advance(const Duration(seconds: 2));
+      expect(onResult, isNull);
+
+      final off = rig.power(false);
+      await rig.h.clock.advance(const Duration(seconds: 2));
+      expect(onResult, isSentUnconfirmed);
+      expect(
+        await off,
+        isUnsupported('No driver for this device can turn it off'),
+      );
+      expect(dial.probes.length, lessThanOrEqualTo(probes + 1));
     });
 
     test('no toggle after Wake-on-LAN, even with agreeing sources', () async {
@@ -522,15 +553,448 @@ void main() {
     });
   });
 
-  test('an explicit power key press is the user\'s own toggle', () async {
-    final ws = FakeDriver('samsung.ws', ceiling: const [toggleOff]);
-    final rig = await Rig([ws]).add();
-    addTearDown(rig.h.close);
-    expect(
-      await rig.h.engine.send(rig.id, const PressKey(RemoteKey.power)),
-      isConfirmed,
+  group('the power key is a toggle intent', () {
+    const powerKey = PressKey(RemoteKey.power);
+
+    test('with one source it needs confirmation and sends nothing', () async {
+      // Replaces the M0 test that let the key through as "the user's own
+      // toggle": finding #1 (the raw key bypassed the two-source gate).
+      final ws = FakeDriver('samsung.ws', ceiling: const [toggleOn, toggleOff]);
+      final rig = await Rig([ws]).add();
+      addTearDown(rig.h.close);
+      rig.probeSays(ws, PowerMode.on);
+      expect(
+        await rig.h.engine.send(rig.id, powerKey),
+        isUnsupported(Unsupported.needsConfirmation),
+      );
+      expect(ws.executed, isEmpty);
+      expect(ws.connects, isEmpty, reason: 'connecting can wake a TV');
+      expect(rig.h.engine.power.lastCommand(rig.id), isNull);
+    });
+
+    test('two sources agreeing it is on turn it off', () async {
+      final ws = FakeDriver('samsung.ws', ceiling: const [toggleOn, toggleOff]);
+      final rest = FakeDriver('samsung.rest', ceiling: const [powerState]);
+      final rig = await Rig([ws, rest]).add();
+      addTearDown(rig.h.close);
+      rig
+        ..probeSays(ws, PowerMode.on)
+        ..probeSays(rest, PowerMode.on);
+      expect(await rig.h.engine.send(rig.id, powerKey), isConfirmed);
+      expect(ws.executed, [const SetPower(false)]);
+      expect(rig.h.engine.power.lastCommand(rig.id)?.on, isFalse);
+    });
+
+    test(
+      'two sources agreeing it is off turn it on, discretely first',
+      () async {
+        final roku = FakeDriver('roku.ecp', ceiling: const [discreteOn]);
+        final ws = FakeDriver('samsung.ws', ceiling: const [toggleOn]);
+        final rig = await Rig([ws, roku]).add();
+        addTearDown(rig.h.close);
+        rig
+          ..probeSays(ws, PowerMode.standby)
+          ..probeSays(roku, PowerMode.standby);
+        expect(await rig.h.engine.send(rig.id, powerKey), isConfirmed);
+        expect(roku.executed, [const SetPower(true)]);
+        expect(ws.executed, isEmpty);
+      },
     );
-    expect(ws.executed, [const PressKey(RemoteKey.power)]);
+
+    test('a quick second press does not toggle back', () async {
+      final ws = FakeDriver('samsung.ws', ceiling: const [toggleOn, toggleOff]);
+      final rest = FakeDriver('samsung.rest', ceiling: const [powerState]);
+      final rig = await Rig([ws, rest]).add();
+      addTearDown(rig.h.close);
+      rig
+        ..probeSays(ws, PowerMode.on)
+        ..probeSays(rest, PowerMode.on);
+      expect(await rig.h.engine.send(rig.id, powerKey), isConfirmed);
+      await rig.h.clock.advance(const Duration(seconds: 3));
+      rig
+        ..probeSays(ws, PowerMode.standby)
+        ..probeSays(rest, PowerMode.standby);
+      expect(
+        await rig.h.engine.send(rig.id, powerKey),
+        isUnsupported(Unsupported.needsConfirmation),
+        reason: 'quiet period',
+      );
+      expect(ws.executed, [const SetPower(false)]);
+    });
+
+    test('holding a power key is refused', () async {
+      final ws = FakeDriver('samsung.ws', ceiling: const [toggleOn, toggleOff]);
+      final roku = FakeDriver(
+        'roku.ecp',
+        ceiling: const [discreteOn, discreteOff],
+      );
+      final rig = await Rig([ws, roku]).add();
+      addTearDown(rig.h.close);
+      for (final key in [
+        RemoteKey.power,
+        RemoteKey.powerOn,
+        RemoteKey.powerOff,
+      ]) {
+        for (final action in [KeyAction.down, KeyAction.up]) {
+          expect(
+            await rig.h.engine.send(rig.id, PressKey(key, action)),
+            isUnsupported(contains('not held')),
+          );
+        }
+      }
+      expect([...ws.executed, ...roku.executed], isEmpty);
+      expect([...ws.connects, ...roku.connects], isEmpty);
+    });
+
+    test('the discrete power keys are SetPower, so a driver mapping them to '
+        'a toggle cannot bypass the gate', () async {
+      final ws = FakeDriver('samsung.ws', ceiling: const [toggleOn, toggleOff]);
+      final rig = await Rig([ws]).add();
+      addTearDown(rig.h.close);
+      rig.probeSays(ws, PowerMode.on);
+      for (final key in [RemoteKey.powerOff, RemoteKey.powerOn]) {
+        expect(
+          await rig.h.engine.send(rig.id, PressKey(key)),
+          isUnsupported(Unsupported.needsConfirmation),
+        );
+      }
+      expect(ws.executed, isEmpty);
+
+      final roku = FakeDriver('roku.ecp', ceiling: const [discreteOff]);
+      final rig2 = await Rig([roku]).add();
+      addTearDown(rig2.h.close);
+      expect(
+        await rig2.h.engine.send(rig2.id, const PressKey(RemoteKey.powerOff)),
+        isConfirmed,
+      );
+      expect(roku.executed, [const SetPower(false)]);
+      expect(rig2.h.engine.power.lastCommand(rig2.id)?.on, isFalse);
+    });
+
+    test('a device nothing can switch is Unsupported without asking', () async {
+      final rig = await Rig([FakeDriver('dial')]).add();
+      addTearDown(rig.h.close);
+      expect(
+        await rig.h.engine.send(rig.id, powerKey),
+        isUnsupported(isNot(Unsupported.needsConfirmation)),
+      );
+    });
+  });
+
+  group('SetPower(userConfirmed: true)', () {
+    test('counts as agreement: the toggle goes out on one source', () async {
+      final ws = FakeDriver('samsung.ws', ceiling: const [toggleOn, toggleOff]);
+      final rig = await Rig([ws]).add();
+      addTearDown(rig.h.close);
+      expect(
+        await rig.power(false),
+        isUnsupported(Unsupported.needsConfirmation),
+      );
+      // The UI asked "Is the TV on right now?" and the user said yes.
+      expect(
+        await rig.h.engine.send(
+          rig.id,
+          const SetPower(false, userConfirmed: true),
+        ),
+        isConfirmed,
+      );
+      expect(ws.executed, [const SetPower(false)]);
+      expect(rig.h.engine.power.lastCommand(rig.id)?.on, isFalse);
+    });
+
+    test('still prefers a discrete route', () async {
+      final roku = FakeDriver('roku.ecp', ceiling: const [discreteOff]);
+      final ws = FakeDriver('samsung.ws', ceiling: const [toggleOff]);
+      final rig = await Rig([ws, roku]).add();
+      addTearDown(rig.h.close);
+      expect(
+        await rig.h.engine.send(
+          rig.id,
+          const SetPower(false, userConfirmed: true),
+        ),
+        isConfirmed,
+      );
+      expect(roku.executed, [const SetPower(false)]);
+      expect(ws.executed, isEmpty);
+    });
+
+    test('still sends no toggle in the quiet period, and does not ask '
+        'again', () async {
+      final ws = FakeDriver('samsung.ws', ceiling: const [toggleOn, toggleOff]);
+      final rig = await Rig([ws]).add();
+      addTearDown(rig.h.close);
+      const confirmedOff = SetPower(false, userConfirmed: true);
+      const confirmedOn = SetPower(true, userConfirmed: true);
+      expect(await rig.h.engine.send(rig.id, confirmedOff), isConfirmed);
+      await rig.h.clock.advance(const Duration(seconds: 5));
+      expect(
+        await rig.h.engine.send(rig.id, confirmedOn),
+        isUnsupported(PowerOrchestrator.quietPeriodReason),
+      );
+      expect(ws.executed, [const SetPower(false)]);
+      await rig.h.clock.advance(const Duration(seconds: 20));
+      expect(await rig.h.engine.send(rig.id, confirmedOn), isConfirmed);
+      expect(ws.executed, [const SetPower(false), const SetPower(true)]);
+    });
+
+    test('still sends no toggle after Wake-on-LAN', () async {
+      final ws = FakeDriver('samsung.ws', ceiling: const [toggleOn]);
+      final rig = await Rig([ws], mac: mac).add();
+      addTearDown(rig.h.close);
+      rig.online = false;
+      final result = rig.h.engine.send(
+        rig.id,
+        const SetPower(true, userConfirmed: true),
+      );
+      await rig.h.clock.advance(const Duration(seconds: 31));
+      expect(await result, isSentUnconfirmed);
+      expect(rig.h.transports.net.sentDatagrams, isNotEmpty);
+      expect(ws.executed.where(isPowerCommand), isEmpty);
+    });
+  });
+
+  test('no toggle after a discrete command that may have acted', () async {
+    final roku = FakeDriver(
+      'roku.ecp',
+      ceiling: const [discreteOff],
+      onExecute: (_) =>
+          const Failed(WatchmeError.timeout('no answer after sending')),
+    );
+    final ws = FakeDriver('samsung.ws', ceiling: const [toggleOff]);
+    final rig = await Rig([ws, roku]).add();
+    addTearDown(rig.h.close);
+    rig
+      ..probeSays(ws, PowerMode.on)
+      ..probeSays(roku, PowerMode.on);
+    expect(await rig.power(false), isFailedWith(WatchmeErrorCode.timeout));
+    expect(roku.executed, [const SetPower(false)]);
+    expect(ws.executed, isEmpty, reason: 'the toggle could undo the off');
+    expect(
+      rig.h.engine.power.lastCommand(rig.id)?.on,
+      isFalse,
+      reason: 'it may have acted, so the quiet period starts',
+    );
+    expect(
+      await rig.h.engine.send(
+        rig.id,
+        const SetPower(false, userConfirmed: true),
+      ),
+      isFailedWith(WatchmeErrorCode.timeout),
+    );
+    expect(ws.executed, isEmpty);
+  });
+
+  group('one power operation per device at a time', () {
+    test('two concurrent offs send one toggle', () async {
+      final ws = FakeDriver('samsung.ws', ceiling: const [toggleOff]);
+      final rest = FakeDriver('samsung.rest', ceiling: const [powerState]);
+      final rig = await Rig([ws, rest]).add();
+      addTearDown(rig.h.close);
+      rig
+        ..probeSays(ws, PowerMode.on)
+        ..probeSays(rest, PowerMode.on);
+      final results = await Future.wait([rig.power(false), rig.power(false)]);
+      expect(results, everyElement(isConfirmed));
+      expect(ws.executed, [const SetPower(false)]);
+    });
+
+    test('a double press of the power key toggles once', () async {
+      final ws = FakeDriver('samsung.ws', ceiling: const [toggleOn, toggleOff]);
+      final rest = FakeDriver('samsung.rest', ceiling: const [powerState]);
+      final rig = await Rig([ws, rest]).add();
+      addTearDown(rig.h.close);
+      rig
+        ..probeSays(ws, PowerMode.on)
+        ..probeSays(rest, PowerMode.on);
+      const key = PressKey(RemoteKey.power);
+      final results = await Future.wait([
+        rig.h.engine.send(rig.id, key),
+        rig.h.engine.send(rig.id, key),
+      ]);
+      expect(results, everyElement(isConfirmed));
+      expect(ws.executed, [const SetPower(false)]);
+    });
+
+    test('a power command that never finishes holds later ones until the '
+        'engine closes, and no longer', () async {
+      // Verifier follow-up to Codex finding #2: the queue waited forever
+      // behind a hung session, even after close().
+      final hang = Completer<CommandResult>();
+      final ws = FakeDriver(
+        'samsung.ws',
+        ceiling: const [toggleOn, toggleOff],
+        onExecute: (c) => c is SetPower ? hang.future : const Confirmed(),
+      );
+      final rig = await Rig([ws]).add();
+      CommandResult? first;
+      CommandResult? second;
+      unawaited(
+        rig.h.engine
+            .send(rig.id, const SetPower(false, userConfirmed: true))
+            .then((r) => first = r),
+      );
+      await pump();
+      expect(ws.executed, [const SetPower(false)]);
+      unawaited(
+        rig.h.engine
+            .send(rig.id, const SetPower(true, userConfirmed: true))
+            .then((r) => second = r),
+      );
+      await pump();
+      expect(second, isNull, reason: 'queued behind the hung one');
+
+      await rig.h.close();
+      expect(first, isFailedWith(WatchmeErrorCode.cancelled));
+      expect(second, isFailedWith(WatchmeErrorCode.cancelled));
+      expect(ws.executed, [const SetPower(false)]);
+    });
+
+    test('off then on: the second waits and decides on fresh evidence, '
+        'meeting the quiet period', () async {
+      final ws = FakeDriver('samsung.ws', ceiling: const [toggleOn, toggleOff]);
+      final rest = FakeDriver('samsung.rest', ceiling: const [powerState]);
+      final rig = await Rig([ws, rest]).add();
+      addTearDown(rig.h.close);
+      rig
+        ..probeSays(ws, PowerMode.on)
+        ..probeSays(rest, PowerMode.on);
+      final off = rig.power(false);
+      final on = rig.power(true);
+      expect(await off, isConfirmed);
+      expect(await on, isUnsupported(Unsupported.needsConfirmation));
+      expect(ws.executed, [const SetPower(false)]);
+    });
+  });
+
+  group('PowerOrchestrator serialisation', () {
+    late FakeClock clock;
+    late PowerOrchestrator orchestrator;
+    late _GatedTarget target;
+
+    setUp(() {
+      clock = FakeClock(DateTime.utc(2026, 10, 21, 12));
+      orchestrator = PowerOrchestrator(
+        transports: FakeTransports(),
+        clock: clock,
+      );
+      target = _GatedTarget(clock);
+    });
+
+    test('concurrent offs that both see agreeing evidence toggle once, and '
+        'the second joins the first', () async {
+      target.evidence = [PowerMode.on, PowerMode.on];
+      final a = orchestrator.setPower(target, false);
+      final b = orchestrator.setPower(target, false);
+      await pump();
+      target.release();
+      expect(await a, isConfirmed);
+      expect(await b, isConfirmed);
+      expect(target.executed, [const SetPower(false)]);
+      expect(target.evidenceReads, 1);
+    });
+
+    test(
+      'a different request waits for the first, then re-evaluates',
+      () async {
+        target.evidence = [PowerMode.on, PowerMode.on];
+        final off = orchestrator.setPower(target, false);
+        final on = orchestrator.setPower(target, true);
+        await pump();
+        expect(target.evidenceReads, 1, reason: 'the second waits its turn');
+        target.release();
+        expect(await off, isConfirmed);
+        expect(await on, isUnsupported(Unsupported.needsConfirmation));
+        expect(target.executed, [const SetPower(false)]);
+      },
+    );
+
+    test('a confirmed request does not join an unconfirmed one', () async {
+      // Only one source: the unconfirmed off needs confirmation.
+      target.evidence = [PowerMode.on];
+      final asked = orchestrator.setPower(target, false);
+      final confirmed = orchestrator.setPower(
+        target,
+        false,
+        userConfirmed: true,
+      );
+      await pump();
+      target.release();
+      expect(await asked, isUnsupported(Unsupported.needsConfirmation));
+      expect(await confirmed, isConfirmed);
+      expect(target.executed, [const SetPower(false)]);
+    });
+
+    test('close releases a running request that never finishes and the '
+        'requests queued behind it', () async {
+      target.evidence = [PowerMode.on, PowerMode.on];
+      CommandResult? first;
+      CommandResult? second;
+      unawaited(orchestrator.setPower(target, false).then((r) => first = r));
+      unawaited(orchestrator.setPower(target, true).then((r) => second = r));
+      await pump();
+      expect(first, isNull);
+      expect(second, isNull);
+      // The gate is never released: the first request hangs.
+      orchestrator.close();
+      await pump();
+      expect(first, isFailedWith(WatchmeErrorCode.cancelled));
+      expect(second, isFailedWith(WatchmeErrorCode.cancelled));
+      expect(target.executed, isEmpty);
+    });
+
+    test('queued requests fail as cancelled once it is closed', () async {
+      target.evidence = [PowerMode.on, PowerMode.on];
+      final first = orchestrator.setPower(target, false);
+      final second = orchestrator.setPower(target, true);
+      await pump();
+      orchestrator.close();
+      target.release();
+      expect(await first, isFailedWith(WatchmeErrorCode.cancelled));
+      expect(await second, isFailedWith(WatchmeErrorCode.cancelled));
+      expect(target.executed, isEmpty);
+    });
+  });
+
+  group('waking while connecting', () {
+    test('turning off and toggling never connect with waking allowed; a '
+        'discrete power-on may', () async {
+      final ws = FakeDriver('samsung.ws', ceiling: const [toggleOn, toggleOff]);
+      final rest = FakeDriver('samsung.rest', ceiling: const [powerState]);
+      final rig = await Rig([ws, rest]).add();
+      addTearDown(rig.h.close);
+      rig
+        ..probeSays(ws, PowerMode.on)
+        ..probeSays(rest, PowerMode.on);
+      expect(await rig.power(false), isConfirmed);
+      expect(ws.connects.single.allowWake, isFalse);
+
+      final roku = FakeDriver(
+        'roku.ecp',
+        ceiling: const [discreteOn, discreteOff],
+      );
+      final rig2 = await Rig([roku]).add();
+      addTearDown(rig2.h.close);
+      expect(await rig2.power(false), isConfirmed);
+      expect(roku.connects.single.allowWake, isFalse);
+
+      final roku2 = FakeDriver('roku.ecp', ceiling: const [discreteOn]);
+      final rig3 = await Rig([roku2]).add();
+      addTearDown(rig3.h.close);
+      expect(await rig3.power(true), isConfirmed);
+      expect(roku2.connects.single.allowWake, isTrue);
+    });
+
+    test('a toggle to turn it on does not wake it first', () async {
+      final ws = FakeDriver('samsung.ws', ceiling: const [toggleOn]);
+      final rest = FakeDriver('samsung.rest', ceiling: const [powerState]);
+      final rig = await Rig([ws, rest]).add();
+      addTearDown(rig.h.close);
+      rig
+        ..probeSays(ws, PowerMode.standby)
+        ..probeSays(rest, PowerMode.standby);
+      expect(await rig.power(true), isConfirmed);
+      expect(ws.connects.single.allowWake, isFalse);
+    });
   });
 
   test('PowerOrchestrator never throws', () async {
@@ -545,12 +1009,65 @@ void main() {
   });
 }
 
+/// A device with one toggle route for each direction whose evidence is
+/// held at a gate until [release], so two calls can interleave.
+class _GatedTarget implements PowerTarget {
+  _GatedTarget(this.clock);
+
+  final FakeClock clock;
+  final List<Command> executed = [];
+  Completer<void> _gate = Completer();
+  List<PowerMode> evidence = const [];
+  int evidenceReads = 0;
+
+  void release() {
+    if (!_gate.isCompleted) _gate.complete();
+  }
+
+  @override
+  String get deviceId => 'tv';
+
+  @override
+  String get host => '10.0.2.50';
+
+  @override
+  Set<String> get macs => const {};
+
+  @override
+  List<RouteCandidate> routes(Capability capability) => [
+    RouteCandidate(
+      driverId: 'samsung.ws',
+      support: CapabilitySupport.yes(capability, flags: {CapFlag.toggleOnly}),
+    ),
+  ];
+
+  @override
+  Future<RouteAttempt> execute(RouteCandidate route, Command command) async {
+    executed.add(command);
+    return const RouteAttempt(Confirmed());
+  }
+
+  @override
+  Future<List<Observed<PowerMode>>> powerEvidence() async {
+    evidenceReads++;
+    await _gate.future;
+    _gate = Completer()..complete();
+    return [
+      for (final (i, mode) in evidence.indexed)
+        Observed.reported(mode, 'source$i', clock.now()),
+    ];
+  }
+
+  @override
+  Future<bool> answers() async => false;
+}
+
 class _ThrowingTarget implements PowerTarget {
   @override
   String get deviceId => 'x';
 
   @override
-  String get host => '192.0.2.1';
+  String get host => '10.0.2.1';
 
   @override
   Set<String> get macs => const {};

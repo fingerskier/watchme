@@ -151,6 +151,47 @@ final class FireTvSimApp {
   };
 }
 
+/// An answer the simulator holds back (see [FireTvSimulator.holdNext]).
+final class FireTvSimGate {
+  FireTvSimGate._(this.method, this.path, this.action);
+
+  /// The method it waits for.
+  final String method;
+
+  /// The exact path it waits for.
+  final String path;
+
+  /// The `action` query value it waits for, or `null` for any.
+  final String? action;
+
+  final Completer<FireTvSimRequest> _reached = Completer();
+  final Completer<void> _release = Completer();
+
+  /// Completes with the request once it arrived and was handled; its answer
+  /// is then held until [release].
+  Future<FireTvSimRequest> get reached => _reached.future;
+
+  /// Whether the request arrived.
+  bool get isReached => _reached.isCompleted;
+
+  /// Sends the held answer (at once if the request already arrived,
+  /// otherwise as soon as it does).
+  void release() {
+    if (!_release.isCompleted) _release.complete();
+  }
+
+  bool _matches(FireTvSimRequest req) =>
+      !_reached.isCompleted &&
+      req.method == method &&
+      req.path == path &&
+      (action == null || req.action == action);
+
+  Future<void> _hold(FireTvSimRequest req) {
+    _reached.complete(req);
+    return _release.future;
+  }
+}
+
 /// A Fire TV remote-API simulator on loopback: a DIAL server and an HTTPS
 /// API on random ports.
 ///
@@ -180,10 +221,15 @@ final class FireTvSimApp {
 /// * Key and app-launch POSTs must have no body. A body that is not a
 ///   `{"keyActionType": "keyDown"|"keyUp"}` hold edge on a d-pad or select
 ///   action, including `{}`, answers 500.
+///
+/// Test controls besides [wake] and [sleep]: [respondOnce] replaces one
+/// answer, [holdNext] holds one answer back until released (a command
+/// caught mid-way), and [vanish] / [reappear] take the whole device off
+/// the network and back (API and DIAL both refusing connections).
 class FireTvSimulator {
   FireTvSimulator._(
     this.host,
-    this._dial,
+    HttpServer dial,
     this.apiPort,
     this._certificate, {
     required this.fixedPin,
@@ -192,9 +238,10 @@ class FireTvSimulator {
     required List<FireTvSimApp> apps,
     required Map<String, String> status,
     required this._random,
-  }) : apps = List.of(apps),
+  }) : dialPort = dial.port,
+       apps = List.of(apps),
        status = Map.of(status) {
-    _dial.listen(_handleDial);
+    _attachDial(dial);
   }
 
   /// Starts a simulator on [host] (loopback by default).
@@ -282,6 +329,9 @@ class FireTvSimulator {
   /// The HTTPS API port. Stable across sleep, wake and certificate restarts.
   final int apiPort;
 
+  /// The DIAL port. Stable across [vanish] and [reappear].
+  final int dialPort;
+
   /// The fixed PIN, if one was given to [start].
   final String? fixedPin;
 
@@ -297,7 +347,7 @@ class FireTvSimulator {
   /// Body of `GET /v1/FireTV/status`. Mutable.
   final Map<String, String> status;
 
-  final HttpServer _dial;
+  HttpServer? _dial;
   final Random _random;
   HttpServer? _api;
   FireTvSimulatorCertificate _certificate;
@@ -308,13 +358,11 @@ class FireTvSimulator {
   final List<String> _pinDisplayNames = [];
   final Set<String> _tokens = {};
   final List<_Fault> _faults = [];
+  final List<FireTvSimGate> _gates = [];
   String? _displayedPin;
   int _wrongPins = 0;
   int _wakeCount = 0;
   bool _closed = false;
-
-  /// The DIAL port.
-  int get dialPort => _dial.port;
 
   /// The endpoint a driver uses: [host] with ports `dial` and `api`.
   Endpoint get endpoint =>
@@ -322,6 +370,9 @@ class FireTvSimulator {
 
   /// Whether the API port is listening.
   bool get awake => _api != null;
+
+  /// Whether the device is off the network (see [vanish]).
+  bool get vanished => _dial == null;
 
   /// How many DIAL wakes were accepted.
   int get wakeCount => _wakeCount;
@@ -404,9 +455,37 @@ class FireTvSimulator {
     String body = '',
   }) => _faults.add(_Fault(method.toUpperCase(), path, status, body));
 
+  /// Holds the answer to the next request matching [method] and [path]
+  /// (exact path, query ignored; with [action], only that `action` query
+  /// value), on either server, until [FireTvSimGate.release]. The request
+  /// is handled at once, so its effect happens; only the answer waits, as
+  /// with a device slow to reply.
+  FireTvSimGate holdNext(String method, String path, {String? action}) {
+    final gate = FireTvSimGate._(method.toUpperCase(), path, action);
+    _gates.add(gate);
+    return gate;
+  }
+
+  /// The device drops off the network (unplugged, Wi-Fi lost): the API and
+  /// the DIAL server both stop listening, so every connection is refused.
+  /// It stays gone, even for [wake], until [reappear].
+  Future<void> vanish() async {
+    await sleep();
+    final dial = _dial;
+    _dial = null;
+    await dial?.close(force: true);
+  }
+
+  /// Undoes [vanish]: the DIAL server listens again on [dialPort], and the
+  /// device is asleep.
+  Future<void> reappear() async {
+    if (_closed || _dial != null) return;
+    _attachDial(await HttpServer.bind(host, dialPort));
+  }
+
   /// Wakes the simulated device as a DIAL launch would (test control).
   Future<void> wake() async {
-    if (_closed || _api != null) return;
+    if (_closed || _api != null || vanished) return;
     _attachApi(
       await HttpServer.bindSecure(host, apiPort, _certificate._context()),
     );
@@ -437,9 +516,16 @@ class FireTvSimulator {
   Future<void> close() async {
     if (_closed) return;
     _closed = true;
-    await sleep();
-    await _dial.close(force: true);
+    await vanish();
+    for (final gate in _gates) {
+      gate.release();
+    }
     await _requestEvents.close();
+  }
+
+  void _attachDial(HttpServer dial) {
+    _dial = dial;
+    dial.listen(_handleDial);
   }
 
   void _attachApi(HttpServer api) {
@@ -454,6 +540,7 @@ class FireTvSimulator {
     final res = request.response;
     try {
       final (status, body) = await _routeDial(req, request.headers);
+      await _gate(req);
       if (status == 201) {
         res.headers.set(
           HttpHeaders.locationHeader,
@@ -503,6 +590,7 @@ class FireTvSimulator {
     final res = request.response;
     try {
       final (status, body) = _routeApi(req, request.headers);
+      await _gate(req);
       res.headers.contentType = ContentType.json;
       await _send(res, status, body);
       if (status == 200 && req.path == '/v1/FireTV' && req.action == 'sleep') {
@@ -740,6 +828,12 @@ class FireTvSimulator {
     _requests.add(req);
     if (!_requestEvents.isClosed) _requestEvents.add(req);
     return req;
+  }
+
+  Future<void> _gate(FireTvSimRequest req) async {
+    final i = _gates.indexWhere((g) => g._matches(req));
+    if (i < 0) return;
+    await _gates.removeAt(i)._hold(req);
   }
 
   _Fault? _fault(FireTvSimRequest req) {

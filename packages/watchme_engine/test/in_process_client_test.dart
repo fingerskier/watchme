@@ -49,7 +49,7 @@ void main() {
       DiscoveryProviderId.ssdp,
       hits: const [
         DiscoveryHit(
-          host: '192.0.2.7',
+          host: '10.0.2.7',
           provider: DiscoveryProviderId.ssdp,
           port: 8009,
           serviceType: 'urn:dial-multiscreen-org:service:dial:1',
@@ -96,7 +96,7 @@ void main() {
 
   test('nothing the client returns contains a secret', () async {
     final events = <DeviceEvent>[];
-    final view = await client.addManual('192.0.2.7');
+    final view = await client.addManual('10.0.2.7');
     client.events(view.id).listen(events.add);
     final handle = await client.pair(view.id, 'firetv.lightning');
     final steps = await handle.steps.map((s) {
@@ -136,7 +136,7 @@ void main() {
   });
 
   test('pairing ids are unique and close cancels open pairings', () async {
-    final view = await client.addManual('192.0.2.7');
+    final view = await client.addManual('10.0.2.7');
     final a = await client.pair(view.id, 'firetv.lightning');
     final steps = a.steps.toList();
     final b = await client.pair('other', 'firetv.lightning');
@@ -157,7 +157,7 @@ void main() {
   });
 
   test('forget goes through to the engine', () async {
-    final view = await client.addManual('192.0.2.7');
+    final view = await client.addManual('10.0.2.7');
     await client.forget(view.id);
     expect(h.engine.currentDevices, isEmpty);
   });

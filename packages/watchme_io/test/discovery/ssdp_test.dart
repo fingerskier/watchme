@@ -7,6 +7,7 @@ import 'package:watchme_core/watchme_core.dart';
 import 'package:watchme_io/watchme_io.dart';
 import 'package:watchme_testkit/watchme_testkit.dart';
 
+import '../support/policies.dart';
 import '../support/ssdp_samples.dart';
 
 const dialSt = 'urn:dial-multiscreen-org:service:dial:1';
@@ -188,17 +189,73 @@ void main() {
         ssdpPlacement('10.0.0.7', Uri.parse('http://169.254.3.4:49152/d')),
         (host: '169.254.3.4', port: 49152, fetchable: true),
       );
-      // A loopback simulator may name loopback.
-      expect(ssdpPlacement('127.0.0.1', Uri.parse('http://127.0.0.2:8060/')), (
-        host: '127.0.0.2',
-        port: 8060,
-        fetchable: true,
-      ));
-      // A device naming its own shared-range address is still itself.
+      // A loopback simulator may name loopback, once loopback is allowed.
+      expect(
+        ssdpPlacement('127.0.0.1', Uri.parse('http://127.0.0.2:8060/')),
+        isNull,
+      );
+      expect(
+        ssdpPlacement(
+          '127.0.0.1',
+          Uri.parse('http://127.0.0.2:8060/'),
+          policy: loopbackAllowed,
+        ),
+        (host: '127.0.0.2', port: 8060, fetchable: true),
+      );
+      // Even then a LAN host may not point at this host's own services.
+      expect(
+        ssdpPlacement(
+          '10.0.0.7',
+          Uri.parse('http://127.0.0.1:631/x'),
+          policy: loopbackAllowed,
+        ),
+        untrusted,
+      );
+      // A device in the shared range is not on the LAN, even when it names
+      // itself (finding #5: sender equality used to override the check).
       expect(
         ssdpPlacement('100.100.1.2', Uri.parse('http://100.100.1.2:80/x')),
+        isNull,
+      );
+      expect(
+        ssdpPlacement(
+          '100.100.1.2',
+          Uri.parse('http://100.100.1.2:80/x'),
+          policy: const DestinationPolicy(allowNonPrivate: true),
+        ),
         (host: '100.100.1.2', port: 80, fetchable: true),
       );
+    });
+
+    test('ssdpPlacement ignores refused senders, whatever they name', () {
+      for (final sender in [
+        '8.8.8.8',
+        '100.64.0.9',
+        '203.0.113.9',
+        '::ffff:8.8.8.8',
+        '2001:4860::8888',
+        '0.0.0.0',
+        '224.0.0.1',
+        'tv.example',
+      ]) {
+        for (final location in [
+          Uri(scheme: 'http', host: sender, port: 60000, path: '/d'),
+          Uri.parse('http://10.0.0.8:8060/'),
+          null,
+        ]) {
+          expect(
+            ssdpPlacement(sender, location),
+            isNull,
+            reason: '$sender $location',
+          );
+        }
+      }
+      final reply = SsdpMessage.tryParse(
+        fireTvDialResponse(locationHost: '8.8.8.8'),
+      )!;
+      expect(ssdpHit('8.8.8.8', reply), isNull);
+      expect(ssdpHit('10.0.0.7', reply)?.host, '10.0.0.7');
+      expect(ssdpHit('10.0.0.7', reply)?.port, isNull);
     });
 
     test('isPrivateLanAddress', () {
@@ -227,24 +284,47 @@ void main() {
       }
     });
 
+    // isLanAddress used to admit loopback and 100.64.0.0/10 (finding #7);
+    // it now applies a DestinationPolicy, LAN-only by default.
     test('isLanAddress', () {
       for (final lan in [
         '10.1.2.3',
         '172.16.0.1',
         '172.31.255.255',
         '192.168.1.7',
-        '100.64.0.1',
         '169.254.10.10',
-        '127.0.0.1',
-        '::1',
         'fe80::1',
         'fd12:3456::1',
+        '::ffff:10.1.2.3',
       ]) {
         expect(isLanAddress(InternetAddress(lan)), isTrue, reason: lan);
       }
-      for (final wan in ['8.8.8.8', '172.32.0.1', '192.0.2.1', '2001:db8::1']) {
+      for (final wan in [
+        '8.8.8.8',
+        '172.32.0.1',
+        '192.0.2.1',
+        '2001:db8::1',
+        '100.64.0.1',
+        '127.0.0.1',
+        '::1',
+        '::ffff:127.0.0.1',
+      ]) {
         expect(isLanAddress(InternetAddress(wan)), isFalse, reason: wan);
       }
+      for (final local in ['127.0.0.1', '::1', '::ffff:127.0.0.1']) {
+        expect(
+          isLanAddress(InternetAddress(local), policy: loopbackAllowed),
+          isTrue,
+          reason: local,
+        );
+      }
+      expect(
+        isLanAddress(
+          InternetAddress('100.64.0.1'),
+          policy: const DestinationPolicy(allowNonPrivate: true),
+        ),
+        isTrue,
+      );
     });
   });
 
@@ -403,6 +483,72 @@ void main() {
       expect(net.httpCalls, isEmpty);
     });
 
+    test('ignores replies from senders outside the LAN, even naming '
+        'themselves', () async {
+      Datagram d(String host, String text) =>
+          Datagram(host, ssdpPort, utf8.encode(text));
+      net = FakeNetworkStack()
+        ..onMulticast(
+          ssdpGroup,
+          ssdpPort,
+          (_) => [
+            // A public sender whose LOCATION is itself.
+            d('8.8.8.8', fireTvDialResponse(locationHost: '8.8.8.8')),
+            // A shared-range (CGNAT / VPN overlay) sender naming itself.
+            d(
+              '100.100.1.2',
+              fireTvRootResponse().replaceAll('10.0.0.7', '100.100.1.2'),
+            ),
+            // A reserved sender naming a LAN address.
+            d('203.0.113.9', fireTvDialResponse(locationHost: '10.0.0.7')),
+            // A public sender with no LOCATION at all.
+            d(
+              '8.8.4.4',
+              crlf('''
+HTTP/1.1 200 OK
+ST: roku:ecp
+USN: uuid:roku:ecp:SPOOFED
+
+'''),
+            ),
+            // The control: a LAN device is still found.
+            d('10.0.0.20', rokuResponse()),
+          ],
+        )
+        ..respond(
+          'GET',
+          '/',
+          HttpResult.text(200, rokuDescription, contentType: 'text/xml'),
+          host: '10.0.0.20',
+          port: 8060,
+        );
+      final hits = await provider(attempts: 1)
+          .scan(const Duration(seconds: 1))
+          .toList();
+      expect(hits.map((h) => h.host), ['10.0.0.20']);
+      expect(net.httpLog.map((e) => e.call.uri.host), ['10.0.0.20']);
+    });
+
+    test('a refused sender cannot claim a LAN device\'s USN', () async {
+      // Heard first, a spoofed off-LAN copy of the Roku's reply must not
+      // take its place in the de-duplication of the real one.
+      net = FakeNetworkStack()
+        ..onMulticast(
+          ssdpGroup,
+          ssdpPort,
+          (_) => [
+            Datagram('8.8.8.8', ssdpPort, utf8.encode(rokuResponse())),
+            Datagram('10.0.0.20', ssdpPort, utf8.encode(rokuResponse())),
+          ],
+        );
+      final hits = await SsdpDiscovery(
+        net,
+        attempts: 1,
+        fetchDescriptions: false,
+      ).scan(const Duration(seconds: 1)).toList();
+      expect(hits.map((h) => h.host), ['10.0.0.20']);
+    });
+
     test('refuses an oversized description without buffering it', () async {
       net.respond(
         'GET',
@@ -515,11 +661,14 @@ USN: uuid:noisy-$i::upnp:rootdevice
     late HttpServer descriptions;
     late RawDatagramSocket responder;
     late List<String> searchTargets;
+    late int descriptionFetches;
 
     Future<void> startResponder(InternetAddress bindTo) async {
       searchTargets = [];
+      descriptionFetches = 0;
       descriptions = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
       descriptions.listen((request) {
+        descriptionFetches++;
         request.response
           ..headers.contentType = ContentType('text', 'xml')
           ..headers.set('Application-URL', 'http://127.0.0.1:8009/apps/')
@@ -556,10 +705,11 @@ USN: uuid:noisy-$i::upnp:rootdevice
         await startResponder(InternetAddress.loopbackIPv4);
         final hits =
             await SsdpDiscovery(
-                  IoNetworkStack(),
+                  IoNetworkStack(destinationPolicy: loopbackAllowed),
                   group: '127.0.0.1',
                   port: responder.port,
                   attempts: 1,
+                  destinationPolicy: loopbackAllowed,
                 )
                 .scan(const Duration(milliseconds: 600), serviceTypes: {dialSt})
                 .toList();
@@ -581,6 +731,42 @@ USN: uuid:noisy-$i::upnp:rootdevice
       },
     );
 
+    test(
+      'loopback replies are ignored unless the policy allows them',
+      () async {
+        await startResponder(InternetAddress.loopbackIPv4);
+        // The stack may reach the loopback responder, but discovery itself
+        // keeps the default LAN-only policy.
+        final hits =
+            await SsdpDiscovery(
+                  IoNetworkStack(destinationPolicy: loopbackAllowed),
+                  group: '127.0.0.1',
+                  port: responder.port,
+                  attempts: 1,
+                )
+                .scan(const Duration(milliseconds: 600), serviceTypes: {dialSt})
+                .toList();
+        expect(searchTargets, [dialSt]);
+        expect(hits, isEmpty);
+        expect(descriptionFetches, 0);
+      },
+    );
+
+    test('a default stack refuses a unicast loopback "group"', () async {
+      await startResponder(InternetAddress.loopbackIPv4);
+      await expectLater(
+        SsdpDiscovery(
+          IoNetworkStack(),
+          group: '127.0.0.1',
+          port: responder.port,
+          attempts: 1,
+          destinationPolicy: loopbackAllowed,
+        ).scan(const Duration(milliseconds: 300)).toList(),
+        throwsWatchmeError(WatchmeErrorCode.destinationRefused),
+      );
+      expect(searchTargets, isEmpty);
+    });
+
     test('real multicast M-SEARCH confined to loopback', () async {
       await startResponder(InternetAddress.anyIPv4);
       final group = InternetAddress('239.255.77.2');
@@ -592,15 +778,19 @@ USN: uuid:noisy-$i::upnp:rootdevice
         markTestSkipped('cannot join a multicast group on loopback: $e');
         return;
       }
+      // The multicast query needs no policy; the replies and the
+      // description fetch come from loopback, which is opted into.
       final hits = await SsdpDiscovery(
         IoNetworkStack(
           multicastInterfaces: [InternetAddress.loopbackIPv4],
           multicastHops: 0,
+          destinationPolicy: loopbackAllowed,
         ),
         group: group.address,
         port: responder.port,
         attempts: 2,
         resendDelay: const Duration(milliseconds: 50),
+        destinationPolicy: loopbackAllowed,
       ).scan(const Duration(milliseconds: 600)).toList();
       expect(searchTargets.toSet(), SsdpDiscovery.defaultSearchTargets.toSet());
       expect(

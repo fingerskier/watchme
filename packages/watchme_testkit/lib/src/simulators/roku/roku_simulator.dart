@@ -29,6 +29,11 @@ import 'roku_sim_xml.dart';
 /// get 400, unknown apps on `launch` get 404, standby refusals and Host
 /// refusals have empty bodies, and the disabled level answers
 /// `ECP command not allowed.`
+///
+/// Test controls: [holdNext] holds one answer back until released (a
+/// command caught mid-way), and `stop(force: false)` stops listening while
+/// a held answer still goes out (a device that drops off the network right
+/// after acting on a request).
 class RokuSimulator {
   /// Creates a simulator (not yet listening; call [start]).
   ///
@@ -229,12 +234,45 @@ class RokuSimulator {
   }
 
   /// Stops listening. Further requests are refused (unreachable).
-  Future<void> stop() async {
+  ///
+  /// With [force] (the default) open connections are dropped and held
+  /// answers released. Without it, connections already open finish first:
+  /// a held answer still goes out once released, and the returned future
+  /// completes after that.
+  Future<void> stop({bool force = true}) async {
     _ssdp?.close();
     _ssdp = null;
     final server = _server;
     _server = null;
-    await server?.close(force: true);
+    if (force) {
+      for (final gate in _gates) {
+        gate.release();
+      }
+      _gates.clear();
+    }
+    await server?.close(force: force);
+  }
+
+  /// Holds the answer to the next request matching [method] and [path]
+  /// (exact path, query ignored) until [RokuSimGate.release]. The request
+  /// is handled at once, so its effect happens (a key lands in [keyLog]);
+  /// only the answer waits, as with a device slow to reply.
+  RokuSimGate holdNext(String method, String path) {
+    final gate = RokuSimGate._(method.toUpperCase(), path);
+    _gates.add(gate);
+    return gate;
+  }
+
+  final List<RokuSimGate> _gates = [];
+
+  Future<void> _gate(HttpRequest request) {
+    for (final gate in _gates) {
+      if (gate._matches(request)) {
+        _gates.remove(gate);
+        return gate._hold();
+      }
+    }
+    return Future.value();
   }
 
   /// Clears [keyLog], [launches], [requests] and [typedText].
@@ -275,6 +313,7 @@ class RokuSimulator {
     if (latency > Duration.zero) await Future<void>.delayed(latency);
     // Drain any request body before answering.
     await request.drain<void>();
+    await _gate(request);
     _send(request, reply);
     try {
       await request.response.close();
@@ -535,3 +574,40 @@ const List<int> _onePixelPng = [
   0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49,
   0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
 ];
+
+/// An answer the simulator holds back (see [RokuSimulator.holdNext]).
+final class RokuSimGate {
+  RokuSimGate._(this.method, this.path);
+
+  /// The method it waits for.
+  final String method;
+
+  /// The exact path it waits for.
+  final String path;
+
+  final Completer<void> _reached = Completer();
+  final Completer<void> _release = Completer();
+
+  /// Completes once the request arrived and was handled; its answer is
+  /// then held until [release].
+  Future<void> get reached => _reached.future;
+
+  /// Whether the request arrived.
+  bool get isReached => _reached.isCompleted;
+
+  /// Sends the held answer (at once if the request already arrived,
+  /// otherwise as soon as it does).
+  void release() {
+    if (!_release.isCompleted) _release.complete();
+  }
+
+  bool _matches(HttpRequest request) =>
+      !_reached.isCompleted &&
+      request.method == method &&
+      request.uri.path == path;
+
+  Future<void> _hold() {
+    _reached.complete();
+    return _release.future;
+  }
+}

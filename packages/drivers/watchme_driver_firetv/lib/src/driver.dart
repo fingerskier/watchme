@@ -22,7 +22,12 @@ import 'session.dart';
 ///   first use.
 /// * [connect] wakes the device through DIAL every time (the API port does
 ///   not listen while the device sleeps), then verifies the token with the
-///   recorded certificate pinned.
+///   recorded certificate pinned. With `allowWake: false` (connections the
+///   user did not ask for) it sends no DIAL launch and fails at once as
+///   unreachable while the API port is closed.
+/// * No error carries a bearer value: the client token, a token a PIN
+///   verification returned, and the `X-Api-Key` value are redacted from
+///   every error text, along with token-bearing JSON fields.
 ///
 /// Ports come from the endpoint names [FireTvPorts.dial] and
 /// [FireTvPorts.api].
@@ -239,12 +244,33 @@ final class FireTvDriver implements Driver {
 
   // ---------------------------------------------------------------- pairing
 
+  /// Errors never carry a token: a PIN-verify answer that fails, whatever
+  /// its status, is shown with every value redacted except plain words in
+  /// a refusal (see [redactSecrets]), and every known bearer value (the
+  /// `X-Api-Key` value, a token the device sent) is removed from every
+  /// error text, in any escaped form.
   @override
   PairingFlow? startPairing(
     Endpoint endpoint,
     Transports transports,
     PairingContext context,
   ) => PairingFlowController.run((flow) async {
+    final secrets = [fireTvApiKey];
+    try {
+      return await _pair(flow, endpoint, transports, context, secrets);
+    } on WatchmeError catch (e) {
+      throw redactError(e, secrets);
+    }
+  });
+
+  /// Runs pairing, adding every token the device sends to [secrets].
+  Future<TokenCredential> _pair(
+    PairingFlowController flow,
+    Endpoint endpoint,
+    Transports transports,
+    PairingContext context,
+    List<String> secrets,
+  ) async {
     final network = transports.requireNetwork();
     // A flow cancelled before (or while) the device wakes must not wake it
     // or put a PIN on the TV for a pairing nobody is doing.
@@ -297,12 +323,22 @@ final class FireTvDriver implements Driver {
         FireTvPaths.pinVerify,
         json: {'pin': pin},
       );
-      if (!verified.ok) throw _pairingError(verified, 'Checking the PIN');
+      // This answer carries the new token in `description`, whatever its
+      // status, and an unexpected one may carry it anywhere: an error shows
+      // it with every value redacted, keeping only plain words ("PIN
+      // expired") in a refusal.
+      String shown() => redactSecrets(
+        verified.text,
+        secrets: secrets,
+        allValues: true,
+        keepProse: !verified.ok,
+      );
+      if (!verified.ok) throw _pinVerifyError(verified, shown());
       final token = description(verified);
       if (token == null) {
         throw WatchmeError.protocol(
           'The Fire TV answered the PIN without a description field',
-          rawDeviceMessage: verified.text,
+          rawDeviceMessage: shown(),
         );
       }
       if (token.isEmpty) {
@@ -310,7 +346,7 @@ final class FireTvDriver implements Driver {
         if (attempt >= maxPinAttempts) {
           throw WatchmeError.unauthorized(
             'Wrong PIN ($attempt attempts)',
-            rawDeviceMessage: verified.text,
+            rawDeviceMessage: shown(),
           );
         }
         label = 'Wrong PIN. Enter the PIN shown on the TV';
@@ -318,10 +354,12 @@ final class FireTvDriver implements Driver {
       }
       if (token == 'OK' || !isPrintableToken(token)) {
         // hms-firetv sees "OK" when the PIN is accepted but no token is
-        // issued yet; there is no documented way to fetch it later.
+        // issued yet; there is no documented way to fetch it later. A token
+        // refused for its characters is still a token: never show it.
+        if (token != 'OK') secrets.add(token);
         throw WatchmeError.protocol(
           'The Fire TV accepted the PIN but returned no usable token',
-          rawDeviceMessage: verified.text,
+          rawDeviceMessage: shown(),
         );
       }
       return TokenCredential(
@@ -333,7 +371,7 @@ final class FireTvDriver implements Driver {
         attributes: {'friendlyName': context.clientName},
       );
     }
-  });
+  }
 
   static Future<String> _askPin(
     PairingFlowController flow,
@@ -351,6 +389,18 @@ final class FireTvDriver implements Driver {
     }
   }
 
+  /// [_pairingError] for a refused PIN check, showing [shown] (the answer,
+  /// redacted) instead of the body: the status is in the message.
+  static WatchmeError _pinVerifyError(HttpResult result, String shown) {
+    final error = _pairingError(result, 'Checking the PIN');
+    return WatchmeError(
+      error.code,
+      error.message,
+      rawDeviceMessage: result.body.isEmpty ? error.rawDeviceMessage : shown,
+      cause: error.cause,
+    );
+  }
+
   static WatchmeError _pairingError(HttpResult result, String what) =>
       switch (result.status) {
         401 || 403 => result.toError(
@@ -366,8 +416,9 @@ final class FireTvDriver implements Driver {
   Future<DriverSession> connect(
     Endpoint endpoint,
     Transports transports,
-    Credential? credential,
-  ) async {
+    Credential? credential, {
+    bool allowWake = true,
+  }) async {
     final token = switch (credential) {
       null => throw const WatchmeError.unauthorized(
         'Pair with the Fire TV first',
@@ -389,31 +440,60 @@ final class FireTvDriver implements Driver {
     }
     final network = transports.requireNetwork();
     final api = FireTvApi(endpoint, network, tls: tls, token: token.token);
-
-    // Port 8080 does not listen while the device sleeps: wake it first,
-    // every time.
-    final wakeFailure = await tryWake(api);
-    final HttpResult result;
     try {
-      result = await _untilListening(
+      final result = allowWake
+          ? await _wakeAndReadStatus(api)
+          : await _readStatusWithoutWaking(api, endpoint);
+      if (isAuthFailure(result)) throw api.errorFor(result, 'Connecting');
+      // A firmware without the status endpoint still takes commands; the
+      // token is then checked by the first one.
+      if (!result.ok && result.status != 404) {
+        throw api.errorFor(result, 'Connecting');
+      }
+      return FireTvSession(
+        api,
+        _clock,
+        status: result.ok ? parseStatus(result) : null,
+        apiStartupTimeout: apiStartupTimeout,
+        apiPollInterval: apiPollInterval,
+      );
+    } on WatchmeError catch (e) {
+      throw api.redact(e);
+    }
+  }
+
+  /// Port 8080 does not listen while the device sleeps: wakes it through
+  /// DIAL first, every time, then waits for the API to answer.
+  Future<HttpResult> _wakeAndReadStatus(FireTvApi api) async {
+    final wakeFailure = await tryWake(api);
+    try {
+      return await _untilListening(
         (timeout) => api.get(FireTvPaths.status, timeout: timeout),
       );
     } on WatchmeError catch (e) {
       throw withWakeContext(e, wakeFailure);
     }
-    if (isAuthFailure(result)) throw apiError(result, 'Connecting');
-    // A firmware without the status endpoint still takes commands; the
-    // token is then checked by the first one.
-    if (!result.ok && result.status != 404) {
-      throw apiError(result, 'Connecting');
+  }
+
+  /// Reads the status once and sends nothing that could wake the device. A
+  /// closed API port (the device sleeps, or is gone) fails at once as
+  /// unreachable.
+  static Future<HttpResult> _readStatusWithoutWaking(
+    FireTvApi api,
+    Endpoint endpoint,
+  ) async {
+    try {
+      return await api.get(FireTvPaths.status);
+    } on WatchmeError catch (e) {
+      if (e.code != WatchmeErrorCode.unreachable) rethrow;
+      final port = endpoint.port(FireTvPorts.api, FireTvPorts.apiDefault);
+      throw WatchmeError.unreachable(
+        'The Fire TV remote API on port $port is not listening (the device '
+        'is asleep or gone), and connecting without waking it was asked',
+        rawDeviceMessage: e.rawDeviceMessage,
+        cause: e,
+      );
     }
-    return FireTvSession(
-      api,
-      _clock,
-      status: result.ok ? parseStatus(result) : null,
-      apiStartupTimeout: apiStartupTimeout,
-      apiPollInterval: apiPollInterval,
-    );
   }
 
   Future<T> _untilListening<T>(

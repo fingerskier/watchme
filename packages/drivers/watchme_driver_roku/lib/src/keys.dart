@@ -28,6 +28,13 @@ const Set<String> rokuEcpKeyNames = {
 /// player first so a "pause" never resumes, and refuses holding them.
 /// [RemoteKey.menu] maps to `Info`, the options (`*`) key, as the nearest
 /// equivalent. `FindRemote` has no [RemoteKey].
+///
+/// [RemoteKey.power] maps to `Power`, a toggle. The engine never routes
+/// `PressKey(RemoteKey.power)` as a key: its power orchestrator turns it
+/// into `SetPower`, which this driver sends as the discrete `PowerOn` /
+/// `PowerOff` keys (its power capabilities are not `toggleOnly`, so the
+/// orchestrator has no need to fall back to `Power`). The session refuses
+/// to hold it.
 const Map<RemoteKey, String> rokuKeyNames = {
   RemoteKey.up: 'Up',
   RemoteKey.down: 'Down',

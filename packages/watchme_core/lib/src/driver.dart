@@ -484,8 +484,10 @@ final class ProbeResult {
 ///   change on the TV. It may read device-info style endpoints and use
 ///   discovery attributes. (Fire TV's DIAL `POST /apps/FireTVRemote` is a
 ///   launch, so it is not allowed in [probe].)
-/// * Waking (Fire TV DIAL wake, Wake-on-LAN) happens only in [connect] or
-///   during pairing.
+/// * Waking (Fire TV DIAL wake, Wake-on-LAN) happens only in [connect] with
+///   `allowWake: true`, during pairing, or in a session executing a command
+///   the user sent (a Fire TV that fell asleep under its session is woken
+///   and the command resent once). [DriverSession.refresh] never wakes.
 /// * A key or command the driver cannot map returns [Unsupported]; it never
 ///   silently succeeds.
 /// * The device's own error text is preserved in
@@ -509,7 +511,20 @@ abstract interface class Driver {
     PairingContext context,
   );
 
-  /// Opens a session, waking the device if the protocol needs it.
+  /// Opens a session.
+  ///
+  /// With [allowWake] (the default) the driver may wake the device first
+  /// when the protocol needs it, e.g. Fire TV's DIAL launch. Callers allow
+  /// it only for a command the user just sent (or right after pairing).
+  ///
+  /// With `allowWake: false` the driver must not do anything that can wake
+  /// the device or change what it shows: no DIAL launch, no Wake-on-LAN, no
+  /// CEC power-on or Image View On, no app launch, no power key. If the
+  /// device cannot be reached without waking it (Fire TV's API port is
+  /// closed while it sleeps), [connect] fails fast with
+  /// [WatchmeErrorCode.unreachable]. The engine passes `false` for every
+  /// connection the user did not ask for: background and engine-initiated
+  /// reconnects, refreshes and polling.
   ///
   /// Throws [WatchmeError]: [WatchmeErrorCode.unauthorized] when pairing is
   /// required and [credential] is `null`; [WatchmeErrorCode.reauthRequired]
@@ -517,8 +532,9 @@ abstract interface class Driver {
   Future<DriverSession> connect(
     Endpoint endpoint,
     Transports transports,
-    Credential? credential,
-  );
+    Credential? credential, {
+    bool allowWake = true,
+  });
 }
 
 /// A live connection from one driver to one device.
@@ -535,19 +551,39 @@ abstract interface class DriverSession {
 
   /// State, connection, capability and re-auth events. Broadcast; closes on
   /// [close].
+  ///
+  /// A [ConnectionChanged] to [ConnectionState.disconnected] or
+  /// [ConnectionState.failed] that the session emits on its own (not from
+  /// [close]) means the device stopped answering. The engine then closes
+  /// the session, marks every observation it made stale, and recovers only
+  /// passively (a probe, or [Driver.connect] with `allowWake: false`).
   Stream<DeviceEvent> get events;
 
   /// Executes [command]. Never throws: failures are [Failed], unmappable
   /// commands are [Unsupported]. A session that detects a revoked
   /// credential returns [Failed] with [WatchmeErrorCode.reauthRequired] and
   /// emits [ReauthRequired].
+  ///
+  /// A command the session carries out as several requests (volume steps,
+  /// key presses, characters) fails with [WatchmeErrorCode.unreachable]
+  /// only when none of them was delivered; after the first one it fails
+  /// with [WatchmeErrorCode.partiallyDelivered], whatever stopped it,
+  /// including [close].
   Future<CommandResult> execute(Command command);
 
   /// Re-reads device state (polling protocols) and returns it, emitting
   /// [StateChanged] for any change. Push-based sessions may return [state].
   /// Throws [WatchmeError] when the device cannot be read.
+  ///
+  /// Passive: it never wakes the device. When nothing answers at all (every
+  /// way of reading the device is [WatchmeErrorCode.unreachable]), the
+  /// session marks its [state] stale ([DeviceState.markStale]), emits
+  /// [ConnectionChanged] with [ConnectionState.disconnected] and the error,
+  /// and throws that error.
   Future<DeviceState> refresh();
 
-  /// Closes the session. Later [execute] calls return [Failed].
+  /// Closes the session. Later [execute] calls return [Failed], and a
+  /// command in progress sends nothing more: it stops before its next
+  /// request.
   Future<void> close();
 }

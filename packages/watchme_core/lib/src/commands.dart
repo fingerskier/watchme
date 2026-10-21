@@ -148,8 +148,13 @@ enum RemoteKey {
   /// Jump back a few seconds (Roku `InstantReplay`).
   instantReplay(Capability.mediaTransport),
 
-  /// Power toggle. The engine sends toggles only under the power rules
-  /// (two agreeing state sources); prefer [powerOn] / [powerOff].
+  /// Power toggle.
+  ///
+  /// `PressKey(RemoteKey.power)` sent to the engine is a power-toggle
+  /// intent, not a raw key press: the engine's power orchestrator handles it
+  /// under the power rules (see [PressKey]). Drivers still map the key,
+  /// because the orchestrator sends it as its toggle route. Prefer
+  /// [powerOn] / [powerOff], or `SetPower`.
   power(Capability.powerOff),
 
   /// Discrete power on.
@@ -325,7 +330,10 @@ sealed class Command {
       reqEnum(json, 'key', RemoteKey.values),
       optEnum(json, 'action', KeyAction.values) ?? KeyAction.click,
     ),
-    'setPower' => SetPower(req<bool>(json, 'on')),
+    'setPower' => SetPower(
+      req<bool>(json, 'on'),
+      userConfirmed: opt<bool>(json, 'userConfirmed') ?? false,
+    ),
     'setVolume' => SetVolume(reqInt(json, 'level')),
     'stepVolume' => StepVolume(reqInt(json, 'steps')),
     'setMute' => SetMute(opt<bool>(json, 'muted')),
@@ -376,6 +384,19 @@ sealed class Command {
 }
 
 /// Press, hold or release a remote key.
+///
+/// The engine treats `PressKey(RemoteKey.power)` as a power-toggle intent
+/// and hands it to the power orchestrator instead of routing it as a key:
+///
+/// * When the evidence agrees on the current power state (two independent
+///   sources, overview section 2.8), it executes `SetPower(!current)`: a
+///   discrete route first, a toggle only under the two-source rule.
+/// * Otherwise it returns `Unsupported(Unsupported.needsConfirmation)`, and
+///   the UI asks the user (see [SetPower.userConfirmed]).
+/// * [KeyAction.down] and [KeyAction.up] are refused with `Unsupported`:
+///   holding a toggle makes no sense.
+///
+/// Drivers receive the power key only from the orchestrator, as its toggle.
 final class PressKey extends Command {
   /// Creates a key command; [action] defaults to a click.
   const PressKey(this.key, [this.action = KeyAction.click]);
@@ -403,13 +424,30 @@ final class PressKey extends Command {
   int get hashCode => Object.hash(type, key, action);
 }
 
-/// Discrete power on or off. The engine's power orchestrator decides how.
+/// Discrete power on or off. The engine's power orchestrator decides how
+/// (overview section 2.8): a discrete route first, then Wake-on-LAN for
+/// "on", and a power toggle only when two independent sources agree on the
+/// current state. When they do not, the result is
+/// `Unsupported(Unsupported.needsConfirmation)` and the UI asks the user.
 final class SetPower extends Command {
   /// Creates a power command.
-  const SetPower(this.on);
+  const SetPower(this.on, {this.userConfirmed = false});
 
   /// `true` to turn on, `false` to turn off.
   final bool on;
+
+  /// The user has just looked at the TV and says it is in the opposite
+  /// state: off for `SetPower(true, ...)`, on for `SetPower(false, ...)`.
+  ///
+  /// The UI sets it only from the user's explicit answer to "Is the TV on
+  /// right now?", after a `needsConfirmation` result; never on a guess. The
+  /// power orchestrator counts it as the agreement the two-source rule asks
+  /// for, so it may send a toggle. It still prefers a discrete route, still
+  /// serialises power commands per device, and still sends no toggle within
+  /// the quiet period after the last power command watchme delivered.
+  ///
+  /// Omitted from JSON when `false`.
+  final bool userConfirmed;
 
   @override
   String get type => 'setPower';
@@ -418,13 +456,16 @@ final class SetPower extends Command {
   Capability get capability => on ? Capability.powerOn : Capability.powerOff;
 
   @override
-  JsonMap _fields() => {'on': on};
+  JsonMap _fields() => {'on': on, if (userConfirmed) 'userConfirmed': true};
 
   @override
-  bool operator ==(Object other) => other is SetPower && other.on == on;
+  bool operator ==(Object other) =>
+      other is SetPower &&
+      other.on == on &&
+      other.userConfirmed == userConfirmed;
 
   @override
-  int get hashCode => Object.hash(type, on);
+  int get hashCode => Object.hash(type, on, userConfirmed);
 }
 
 /// Set the absolute volume, 0..100.

@@ -45,7 +45,12 @@ const int rokuMaxTextRunes = 256;
 /// `ECP command not allowed in Limited mode.`).
 ///
 /// Commands run one at a time in the order given, so key presses and text
-/// arrive in order.
+/// arrive in order. [close] stops a command in progress before its next
+/// request. A command sent as several requests (volume steps, typed
+/// characters, backspaces) that fails after one of them took effect
+/// reports [WatchmeErrorCode.partiallyDelivered], never
+/// [WatchmeErrorCode.unreachable]: sending it again would repeat what was
+/// delivered.
 final class RokuSession implements DriverSession {
   RokuSession._(
     this._client,
@@ -117,6 +122,9 @@ final class RokuSession implements DriverSession {
   bool _polling = false;
   bool _closed = false;
 
+  /// ECP commands of the running command that the device accepted.
+  int _delivered = 0;
+
   @override
   String get driverId => rokuDriverId;
 
@@ -149,6 +157,7 @@ final class RokuSession implements DriverSession {
 
   Future<CommandResult> _execute(Command command) async {
     if (_closed) return const Failed(_closedError);
+    _delivered = 0;
     try {
       return await switch (command) {
         PressKey(:final key, :final action) => _pressKey(key, action),
@@ -177,13 +186,29 @@ final class RokuSession implements DriverSession {
         ),
       };
     } on WatchmeError catch (e) {
-      return Failed(e);
+      return Failed(_failure(command, e));
     } on Object catch (e) {
       return Failed(
-        WatchmeError.internal('Roku driver failed on $command: $e', cause: e),
+        _failure(
+          command,
+          WatchmeError.internal('Roku driver failed on $command: $e', cause: e),
+        ),
       );
     }
   }
+
+  /// The error of a command that stopped with [error]: [error] itself while
+  /// none of its ECP commands took effect, otherwise
+  /// [WatchmeErrorCode.partiallyDelivered] with [error] as the cause.
+  WatchmeError _failure(Command command, WatchmeError error) =>
+      _delivered == 0 || error.code == WatchmeErrorCode.partiallyDelivered
+      ? error
+      : WatchmeError.partiallyDelivered(
+          'Roku ${command.type} stopped after $_delivered of its requests '
+          'reached the device: ${error.message}',
+          rawDeviceMessage: error.rawDeviceMessage,
+          cause: error,
+        );
 
   Future<CommandResult> _pressKey(RemoteKey key, KeyAction action) async {
     if (key == RemoteKey.play || key == RemoteKey.pause) {
@@ -201,6 +226,12 @@ final class RokuSession implements DriverSession {
     final name = rokuKeyNames[key];
     if (name == null) {
       return Unsupported('Roku ECP has no ${key.name} key');
+    }
+    if (key == RemoteKey.power && action != KeyAction.click) {
+      // The engine refuses these too; a toggle held down means nothing.
+      return const Unsupported(
+        'The Roku Power key is a toggle, so it cannot be held',
+      );
     }
     if (_gate(key.capability) case final refused?) return refused;
     await _command('/${rokuKeyVerb(action)}/$name');
@@ -323,7 +354,8 @@ final class RokuSession implements DriverSession {
         await _command('/keypress/Backspace');
       }
     }
-    // Each key goes through _request, which stops at close().
+    // Each key goes through _request, which stops at close(); what was
+    // typed by then makes the failure a partial delivery.
     for (final key in rokuLiteralKeys(text)) {
       await _command('/keypress/$key');
     }
@@ -423,8 +455,9 @@ final class RokuSession implements DriverSession {
 
   static const _closedError = WatchmeError.cancelled('Roku session is closed');
 
-  /// POSTs an ECP command. A success of a [gated] command proves "Control
-  /// by mobile apps" is Enabled.
+  /// POSTs an ECP command; an accepted one counts towards what the running
+  /// command delivered. A success of a [gated] command proves "Control by
+  /// mobile apps" is Enabled.
   Future<void> _command(
     String path, {
     Map<String, String>? query,
@@ -432,6 +465,7 @@ final class RokuSession implements DriverSession {
   }) async {
     final r = await _request(() => _client.post(path, query: query));
     if (!r.ok) throw _refused(r, path.substring(1));
+    _delivered++;
     if (gated) _setAccess(RokuEcpAccess.enabled);
   }
 
@@ -443,6 +477,9 @@ final class RokuSession implements DriverSession {
     return r.text;
   }
 
+  /// Sends one request unless the session was closed meanwhile. Every
+  /// request goes through here, so a command stops before its next request
+  /// once [close] is called.
   Future<HttpResult> _request(Future<HttpResult> Function() send) async {
     if (_closed) throw _closedError;
     final HttpResult r;

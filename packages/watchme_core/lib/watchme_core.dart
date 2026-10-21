@@ -20,6 +20,7 @@ export 'src/events.dart';
 export 'src/pairing.dart';
 export 'src/results.dart';
 export 'src/state.dart';
+export 'src/transports/destination.dart';
 export 'src/transports/network.dart';
 export 'src/transports/peripherals.dart';
 export 'src/transports/tls.dart';

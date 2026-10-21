@@ -8,20 +8,32 @@ import 'package:watchme_driver_roku/watchme_driver_roku.dart';
 import 'package:watchme_engine/watchme_engine.dart';
 import 'package:watchme_io/watchme_io.dart';
 
+/// The destination policy of every e2e stack and engine: LAN-only, plus
+/// loopback, where the simulators run. Tests opt into loopback explicitly;
+/// the defaults refuse it.
+const DestinationPolicy e2ePolicy = DestinationPolicy(allowLoopback: true);
+
 /// The real `dart:io` transports, wrapped so that nothing can leave the
 /// machine: every destination must be a loopback address. A blocked attempt
 /// fails like an unreachable host and is recorded in [blocked], which each
 /// test checks is empty.
+///
+/// A second guard sits below the stack, at the `dart:io` socket API (see
+/// [nativeBlocked]), so even a stack that ignored its own policy could not
+/// open a TCP connection beyond loopback.
 final class LoopbackTransports implements Transports {
-  /// Wraps a fresh [IoTransports] whose multicast stays on `lo` with TTL 0.
-  LoopbackTransports()
+  /// Wraps a fresh [IoTransports] whose multicast stays on `lo` with TTL 0,
+  /// enforcing [e2ePolicy]. [lookup] replaces the stack's resolver.
+  LoopbackTransports({HostLookup? lookup})
     : io = IoTransports(
         network: IoNetworkStack(
           multicastInterfaces: [InternetAddress.loopbackIPv4],
           multicastHops: 0,
+          destinationPolicy: e2ePolicy,
+          lookup: lookup,
         ),
       ) {
-    network = _LoopbackOnlyStack(io.network, blocked);
+    network = _LoopbackOnlyStack(io.network, blocked, passThrough, httpLog);
   }
 
   /// The wrapped transports.
@@ -29,6 +41,15 @@ final class LoopbackTransports implements Transports {
 
   /// Destinations the guard refused, as `host:port`.
   final List<String> blocked = [];
+
+  /// Hosts this guard hands to the real stack unchecked, for a test that
+  /// proves the stack's own policy refuses them. The socket guard below the
+  /// stack still stops any connection they would open.
+  final Set<String> passThrough = {};
+
+  /// Every HTTP request the engine asked for, as `METHOD uri`, whether it
+  /// connected or not (a refused port leaves no trace in a simulator).
+  final List<String> httpLog = [];
 
   @override
   late final NetworkStack network;
@@ -61,13 +82,20 @@ bool _isLoopback(String host) {
 }
 
 final class _LoopbackOnlyStack implements NetworkStack {
-  _LoopbackOnlyStack(this._inner, this._blocked);
+  _LoopbackOnlyStack(
+    this._inner,
+    this._blocked,
+    this._passThrough,
+    this._httpLog,
+  );
 
   final NetworkStack _inner;
   final List<String> _blocked;
+  final Set<String> _passThrough;
+  final List<String> _httpLog;
 
   void _check(String host, int port) {
-    if (_isLoopback(host)) return;
+    if (_isLoopback(host) || _passThrough.contains(host)) return;
     _blocked.add('$host:$port');
     throw WatchmeError.unreachable(
       'e2e loopback guard: refusing to contact $host:$port',
@@ -80,6 +108,7 @@ final class _LoopbackOnlyStack implements NetworkStack {
     TlsPolicy tls = TlsPolicy.platform,
     ClientIdentity? identity,
   }) async {
+    _httpLog.add('${call.method} ${call.uri}');
     _check(call.uri.host, call.uri.port);
     return _inner.http(call, tls: tls, identity: identity);
   }
@@ -150,6 +179,74 @@ final class _LoopbackOnlyStack implements NetworkStack {
   }
 }
 
+/// TCP connections the socket guard refused, as `host:port`. Checked
+/// empty when each [E2eSystem] closes.
+final List<String> nativeBlocked = [];
+
+/// The `dart:io` half of the loopback guard: every `Socket.connect` and
+/// `Socket.startConnect` in this isolate (simulators and stacks alike)
+/// must name a loopback address. Anything else is recorded in
+/// [nativeBlocked] and refused before a packet is sent.
+final class _LoopbackSockets extends IOOverrides {
+  static bool _installed = false;
+
+  /// Installs the guard for the rest of this isolate (one test file).
+  static void install() {
+    if (_installed) return;
+    _installed = true;
+    IOOverrides.global = _LoopbackSockets();
+  }
+
+  static void _check(Object? host, int port) {
+    final loopback = switch (host) {
+      final InternetAddress a => a.isLoopback,
+      final String h => _isLoopback(h),
+      _ => false,
+    };
+    if (loopback) return;
+    final name = host is InternetAddress ? host.address : '$host';
+    nativeBlocked.add('$name:$port');
+    throw SocketException(
+      'e2e socket guard: refusing to connect to $name:$port',
+      port: port,
+    );
+  }
+
+  @override
+  Future<Socket> socketConnect(
+    dynamic host,
+    int port, {
+    dynamic sourceAddress,
+    int sourcePort = 0,
+    Duration? timeout,
+  }) {
+    _check(host, port);
+    return super.socketConnect(
+      host,
+      port,
+      sourceAddress: sourceAddress,
+      sourcePort: sourcePort,
+      timeout: timeout,
+    );
+  }
+
+  @override
+  Future<ConnectionTask<Socket>> socketStartConnect(
+    dynamic host,
+    int port, {
+    dynamic sourceAddress,
+    int sourcePort = 0,
+  }) {
+    _check(host, port);
+    return super.socketStartConnect(
+      host,
+      port,
+      sourceAddress: sourceAddress,
+      sourcePort: sourcePort,
+    );
+  }
+}
+
 /// A TCP port on loopback that nothing listens on (bound, then released),
 /// for pointing the drivers a test does not exercise at a refusal instead
 /// of whatever may run on the standard port of the machine.
@@ -184,13 +281,23 @@ const EngineConfig e2eConfig = EngineConfig(
 final class E2eSystem {
   E2eSystem._(this.engine, this.transports, this.credentials, this.devices);
 
-  /// Builds and starts an engine with the Roku and Fire TV drivers.
+  /// Builds and starts an engine with the Roku and Fire TV drivers, with
+  /// [e2ePolicy] on the engine and the stack and the socket guard
+  /// installed. [lookup] replaces the stack's name resolver; [passThrough]
+  /// seeds [LoopbackTransports.passThrough]; [config] defaults to
+  /// [e2eConfig].
   static Future<E2eSystem> start(
     Directory stateDir, {
     Iterable<DiscoveryProvider> Function(NetworkStack network)? discovery,
     Duration? rokuPollInterval,
+    HostLookup? lookup,
+    Set<String> passThrough = const {},
+    EngineConfig config = e2eConfig,
   }) async {
-    final transports = LoopbackTransports();
+    _LoopbackSockets.install();
+    addTearDown(nativeBlocked.clear);
+    final transports = LoopbackTransports(lookup: lookup)
+      ..passThrough.addAll(passThrough);
     final credentials = FileCredentialStore(credentialsPath(stateDir));
     final devices = FileDeviceRepository(devicesPath(stateDir));
     final engine = Engine(
@@ -202,7 +309,8 @@ final class E2eSystem {
       discoveryProviders: discovery?.call(transports.network) ?? const [],
       credentials: credentials,
       repository: devices,
-      config: e2eConfig,
+      config: config,
+      destinationPolicy: e2ePolicy,
     );
     await engine.start();
     final system = E2eSystem._(engine, transports, credentials, devices);
@@ -222,13 +330,19 @@ final class E2eSystem {
   /// The device file store.
   final FileDeviceRepository devices;
 
-  /// Closes the engine and checks that nothing tried to leave loopback.
+  /// Closes the engine and checks that nothing tried to leave loopback,
+  /// at the stack or at the socket API.
   Future<void> close() async {
     await engine.close();
     expect(
       transports.blocked,
       isEmpty,
       reason: 'the system tried to reach a non-loopback host',
+    );
+    expect(
+      nativeBlocked,
+      isEmpty,
+      reason: 'a socket was opened to a non-loopback host',
     );
   }
 

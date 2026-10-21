@@ -253,14 +253,18 @@ final class RokuDriver implements Driver {
   ) => null;
 
   /// Opens a [RokuSession]. [credential] is ignored: ECP has none.
+  /// [allowWake] is ignored too: connecting only sends ECP queries
+  /// (device-info, the active app, the media player), which never wake the
+  /// device.
   ///
   /// Throws [WatchmeError] as described in [RokuSession.connect].
   @override
   Future<DriverSession> connect(
     Endpoint endpoint,
     Transports transports,
-    Credential? credential,
-  ) => RokuSession.connect(
+    Credential? credential, {
+    bool allowWake = true,
+  }) => RokuSession.connect(
     endpoint,
     transports,
     clock: clock,

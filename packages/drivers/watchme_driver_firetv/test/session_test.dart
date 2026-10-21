@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:test/test.dart';
 import 'package:watchme_core/watchme_core.dart';
@@ -204,6 +205,125 @@ void main() {
       ]);
     });
 
+    test('allowWake: false sends no DIAL launch and fails at once while the '
+        'API port is closed', () async {
+      final started = clock.now();
+      await expectLater(
+        driver.connect(
+          tv.endpoint,
+          transports,
+          tv.credential(),
+          allowWake: false,
+        ),
+        throwsWatchmeError(
+          WatchmeErrorCode.unreachable,
+          message: contains('without waking'),
+        ),
+      );
+      expect(net.callsTo('POST', '/apps/FireTVRemote'), isEmpty);
+      expect(tv.wakes, 0);
+      expect(tv.awake, isFalse);
+      expect(
+        net.callsTo('GET', '/v1/FireTV/status'),
+        hasLength(1),
+        reason: 'no waiting for the port to open',
+      );
+      expect(clock.now(), started);
+    });
+
+    test('allowWake: false connects to an awake device without a DIAL '
+        'launch', () async {
+      tv.wakeUp();
+      final session = await driver.connect(
+        tv.endpoint,
+        transports,
+        tv.credential(),
+        allowWake: false,
+      );
+      expect(
+        session.state.connections.values.single,
+        ConnectionState.connected,
+      );
+      expect(tv.wakes, 0);
+      expect(
+        [for (final c in net.httpCalls) '${c.method} ${c.uri.path}'],
+        ['GET /v1/FireTV/status'],
+      );
+    });
+
+    test('a refusal that echoes the token does not repeat it', () async {
+      net.respond(
+        'GET',
+        '/v1/FireTV/status',
+        HttpResult.json(401, {
+          'description': 'bad token ${tv.token}',
+          'clientToken': tv.token,
+        }),
+      );
+      Object? error;
+      try {
+        await driver.connect(tv.endpoint, transports, tv.credential());
+      } on WatchmeError catch (e) {
+        error = e;
+      }
+      expect(error, isWatchmeError(WatchmeErrorCode.reauthRequired));
+      final e = error! as WatchmeError;
+      expect(
+        e.rawDeviceMessage,
+        '{"description":"bad token <redacted>","clientToken":"<redacted>"}',
+      );
+      for (final text in ['$e', jsonEncode(e.toJson())]) {
+        expect(text, isNot(contains(tv.token)));
+      }
+    });
+
+    test('a DIAL wake that timed out is not reported as unreachable: it may '
+        'have reached the device', () async {
+      // Verifier follow-up to Codex finding #4.
+      tv.sleep();
+      net.onHttp('POST', '/apps/FireTVRemote', (_) {
+        tv.wakes++;
+        throw const WatchmeError.timeout('No answer from DIAL');
+      });
+      final result = driver.connect(tv.endpoint, transports, tv.credential());
+      final expectation = expectLater(
+        result,
+        throwsWatchmeError(
+          WatchmeErrorCode.timeout,
+          message: contains('DIAL wake may have reached the device'),
+        ),
+      );
+      await clock.advance(const Duration(seconds: 7));
+      await expectation;
+      expect(tv.wakes, 1);
+    });
+
+    test('a refusal echoing the client token JSON-escaped does not show '
+        'it', () async {
+      // Verifier follow-up to Codex finding #8: Android's org.json writes
+      // `/` as `\/`, which the verbatim match missed.
+      final slashed = FakeFireTv(FakeNetworkStack(), token: 'abc/tok/9');
+      slashed.wakeUp();
+      slashed.net.respond(
+        'GET',
+        '/v1/FireTV/status',
+        HttpResult.text(403, r'{"msg":"token abc\/tok\/9 revoked"}'),
+      );
+      Object? error;
+      try {
+        await driver.connect(
+          slashed.endpoint,
+          FakeTransports(network: slashed.net),
+          slashed.credential(),
+        );
+      } on WatchmeError catch (e) {
+        error = e;
+      }
+      final e = error! as WatchmeError;
+      expect(e.code, WatchmeErrorCode.reauthRequired);
+      expect(e.rawDeviceMessage, '{"msg":"token <redacted> revoked"}');
+    });
+
     test('reports both failures when the device stays unreachable', () async {
       net.setUnreachable(tv.host);
       final result = driver.connect(tv.endpoint, transports, tv.credential());
@@ -320,6 +440,43 @@ void main() {
         'start dpad_up',
         'end dpad_up',
       ]);
+    });
+
+    group('the end of a hold never wakes the device', () {
+      // Verifier follow-up to Codex finding #9: apps send the key-up on
+      // their own, and it woke a sleeping Fire TV through DIAL.
+      test(
+        'asleep: nothing is held, so it is released without a wake',
+        () async {
+          tv.sleep();
+          expect(
+            await session.execute(const PressKey(RemoteKey.down, KeyAction.up)),
+            isConfirmed,
+          );
+          expect(tv.wakes, 1, reason: 'only the connect');
+          expect(tv.awake, isFalse);
+          expect(session.state.power?.value, PowerMode.standby);
+        },
+      );
+
+      test('gone: unreachable, still without a wake', () async {
+        net.setUnreachable(tv.host);
+        expect(
+          await session.execute(const PressKey(RemoteKey.down, KeyAction.up)),
+          isFailedWith(WatchmeErrorCode.unreachable),
+        );
+        expect(net.callsTo('POST', '/apps/FireTVRemote'), hasLength(1));
+      });
+
+      test('the start of a hold still wakes it', () async {
+        tv.sleep();
+        final down = session.execute(
+          const PressKey(RemoteKey.down, KeyAction.down),
+        );
+        await clock.advance(const Duration(seconds: 1));
+        expect(await down, isConfirmed);
+        expect(tv.wakes, 2);
+      });
     });
 
     test('hold is refused for keys other than the d-pad and select', () async {
@@ -529,15 +686,97 @@ void main() {
       },
     );
 
-    test('a wake that does not open the API fails the command as '
-        'unreachable', () async {
+    // Was `unreachable`, which Codex finding #4 makes wrong: the DIAL wake
+    // was delivered (and may be turning the TV on), so the command must not
+    // be replayed through another route.
+    test('a wake that does not open the API fails the command as partly '
+        'delivered, not unreachable', () async {
       tv
         ..sleep()
         ..wakeOnDial = false;
       final result = session.execute(const PressKey(RemoteKey.home));
       await clock.advance(const Duration(seconds: 7));
-      expect(await result, isFailedWith(WatchmeErrorCode.unreachable));
+      final failed = await result;
+      expect(failed, isFailedWith(WatchmeErrorCode.partiallyDelivered));
+      expect(failed.partiallyDelivered, isTrue);
+      expect(
+        (failed as Failed).error.cause,
+        isWatchmeError(WatchmeErrorCode.unreachable),
+      );
       expect(tv.wakes, 2);
+    });
+
+    group('a DIAL wake that timed out may have reached the device', () {
+      // Verifier follow-up to Codex finding #4: it came back as
+      // `unreachable`, which promises nothing reached the device, while the
+      // launch may have woken it (and the TV over HDMI-CEC).
+      void wakeTimesOut() {
+        tv.sleep();
+        net.onHttp('POST', '/apps/FireTVRemote', (_) {
+          tv.wakes++;
+          tv.wakeUp();
+          throw const WatchmeError.timeout('No answer from DIAL');
+        });
+      }
+
+      test('a key press fails as a timeout, and the power observation goes '
+          'stale', () async {
+        wakeTimesOut();
+        final failed = await session.execute(const PressKey(RemoteKey.home));
+        expect(
+          failed,
+          isFailedWith(
+            WatchmeErrorCode.timeout,
+            message: contains('DIAL wake may have reached the device'),
+          ),
+        );
+        expect(tv.awake, isTrue);
+        expect(session.state.power?.confidence, Confidence.stale);
+        await clock.flush();
+        expect(
+          events.whereType<ConnectionChanged>(),
+          isEmpty,
+          reason: 'the device is not lost',
+        );
+      });
+
+      test('after an earlier step it is a partial delivery', () async {
+        net.onHttp('POST', '/v1/FireTV', (_) {
+          // The first step lands, then the device falls asleep.
+          tv.sleep();
+          return HttpResult.json(200, {'description': 'OK'});
+        });
+        net.onHttp('POST', '/apps/FireTVRemote', (_) {
+          tv.wakes++;
+          throw const WatchmeError.timeout('No answer from DIAL');
+        });
+        final failed = await session.execute(const StepVolume(2));
+        expect(
+          failed,
+          isFailedWith(
+            WatchmeErrorCode.partiallyDelivered,
+            message: contains('1 of its requests'),
+          ),
+        );
+        expect(
+          (failed as Failed).error.cause,
+          isWatchmeError(WatchmeErrorCode.timeout),
+        );
+        expect(tv.wakes, 2);
+      });
+    });
+
+    test('a command whose wake failed too is unreachable: nothing was '
+        'delivered', () async {
+      tv.sleep();
+      net.respond('POST', '/apps/FireTVRemote', HttpResult(403));
+      expect(
+        await session.execute(const PressKey(RemoteKey.home)),
+        isFailedWith(
+          WatchmeErrorCode.unreachable,
+          message: contains('DIAL wake failed too'),
+        ),
+      );
     });
 
     test('SetPower(false) on a device that is already asleep does not wake '
@@ -783,6 +1022,337 @@ void main() {
         session.refresh(),
         throwsWatchmeError(WatchmeErrorCode.protocol, rawDeviceMessage: 'x'),
       );
+    });
+
+    test('a device error echoing the token in escaped form does not repeat '
+        'it', () async {
+      // Verifier follow-up to Codex finding #8: only the verbatim form was
+      // removed, and a JSON decoder recovers the token from `\u0074ok...`.
+      final escaped = r'{"e":"bad \u0074ok-abc123"}';
+      expect(tv.token, 'tok-abc123');
+      net.respond('POST', '/v1/FireTV', HttpResult.text(500, escaped));
+      expect(
+        await session.execute(const PressKey(RemoteKey.home)),
+        isFailedWith(
+          WatchmeErrorCode.protocol,
+          rawDeviceMessage: '{"e":"bad <redacted>"}',
+        ),
+      );
+      net.respond('POST', '/v1/FireTV', HttpResult.text(401, escaped));
+      final refused = await session.execute(const PressKey(RemoteKey.home));
+      expect(
+        refused,
+        isFailedWith(
+          WatchmeErrorCode.reauthRequired,
+          rawDeviceMessage: '{"e":"bad <redacted>"}',
+        ),
+      );
+      await clock.flush();
+      for (final event in events) {
+        expect(jsonEncode(event.toJson()), isNot(contains('u0074ok')));
+      }
+    });
+
+    test('device errors and events never repeat the token or the API '
+        'key', () async {
+      net.respond(
+        'POST',
+        '/v1/FireTV',
+        HttpResult.text(500, 'boom ${tv.token} 0987654321'),
+      );
+      expect(
+        await session.execute(const PressKey(RemoteKey.home)),
+        isFailedWith(
+          WatchmeErrorCode.protocol,
+          rawDeviceMessage: 'boom <redacted> <redacted>',
+        ),
+      );
+      net.respond(
+        'POST',
+        '/v1/FireTV',
+        HttpResult.json(401, {'description': 'authn error', 'token': tv.token}),
+      );
+      final refused = await session.execute(const PressKey(RemoteKey.home));
+      expect(refused, isFailedWith(WatchmeErrorCode.reauthRequired));
+      net.respond(
+        'GET',
+        '/v1/FireTV/appsV2',
+        HttpResult.text(200, 'not json, ${tv.token}'),
+      );
+      final malformed = await session.execute(const ListApps());
+      expect(malformed, isFailedWith(WatchmeErrorCode.protocol));
+      await clock.flush();
+      expect(events.whereType<ReauthRequired>(), hasLength(1));
+      for (final text in [
+        '$refused',
+        jsonEncode(refused.toJson()),
+        '$malformed',
+        '${(malformed as Failed).error.cause}',
+        for (final e in events) ...['$e', jsonEncode(e.toJson())],
+      ]) {
+        expect(text, isNot(contains(tv.token)));
+      }
+    });
+
+    group('close stops a command in progress', () {
+      /// Holds the answer to the [nth] request matching [method] [path]
+      /// until [release] completes; [reached] completes when it arrives.
+      ({Completer<void> reached, Completer<void> release, List<HttpCall> seen})
+      hold(String method, String path, {int nth = 1}) {
+        final reached = Completer<void>();
+        final release = Completer<void>();
+        final seen = <HttpCall>[];
+        net.onHttp(method, path, (call) async {
+          seen.add(call);
+          if (seen.length == nth) {
+            reached.complete();
+            await release.future;
+          }
+          return path == '/apps/FireTVRemote'
+              ? HttpResult(201)
+              : HttpResult.json(200, {'description': 'OK'});
+        });
+        return (reached: reached, release: release, seen: seen);
+      }
+
+      test('StepVolume(3): first answer paused, session closed, answer '
+          'released: no more presses, and not Confirmed', () async {
+        // Codex finding #3, reproduced as reported.
+        final gate = hold('POST', '/v1/FireTV');
+        final result = session.execute(const StepVolume(3));
+        await gate.reached.future;
+        await session.close();
+        gate.release.complete();
+        final failed = await result;
+        expect(gate.seen, hasLength(1), reason: 'steps 2 and 3 never sent');
+        expect(failed, isFailedWith(WatchmeErrorCode.partiallyDelivered));
+        expect(
+          (failed as Failed).error.cause,
+          isWatchmeError(WatchmeErrorCode.cancelled),
+        );
+        expect(failed.error.message, contains('1 of its requests'));
+      });
+
+      test('a command queued behind the closing one sends nothing', () async {
+        final gate = hold('POST', '/v1/FireTV');
+        final first = session.execute(const PressKey(RemoteKey.up));
+        final second = session.execute(const PressKey(RemoteKey.down));
+        await gate.reached.future;
+        await session.close();
+        gate.release.complete();
+        expect(await first, isConfirmed, reason: 'fully sent before close');
+        expect(await second, isFailedWith(WatchmeErrorCode.cancelled));
+        expect(gate.seen, hasLength(1));
+      });
+
+      test(
+        'TypeText closed while reading the keyboard sends no text',
+        () async {
+          final gate = hold('GET', '/v1/FireTV/keyboard');
+          final result = session.execute(const TypeText('abc'));
+          await gate.reached.future;
+          await session.close();
+          gate.release.complete();
+          expect(await result, isFailedWith(WatchmeErrorCode.cancelled));
+          expect(net.callsTo('POST', '/v1/FireTV/keyboard'), isEmpty);
+        },
+      );
+
+      test('the wake-and-resend path stops before the resend', () async {
+        tv.sleep();
+        final gate = hold('POST', '/apps/FireTVRemote');
+        final result = session.execute(const LaunchApp('com.netflix.ninja'));
+        await gate.reached.future;
+        await session.close();
+        gate.release.complete();
+        await clock.advance(const Duration(seconds: 7));
+        final failed = await result;
+        // The wake was delivered; the launch was not resent.
+        expect(failed, isFailedWith(WatchmeErrorCode.partiallyDelivered));
+        expect(
+          (failed as Failed).error.cause,
+          isWatchmeError(WatchmeErrorCode.cancelled),
+        );
+        expect(net.callsTo('POST', RegExp('^/v1/FireTV/app/')), hasLength(1));
+        expect(
+          net.callsTo('GET', '/v1/FireTV/status'),
+          hasLength(1),
+          reason: 'only the connect: no wait for the API after close',
+        );
+      });
+
+      test('a session closed before a wake sends no wake', () async {
+        // The keyboard read finds the port closed, so the session would wake
+        // the device; the session is closed while that read is under way.
+        net.onHttp('GET', '/v1/FireTV/keyboard', (_) async {
+          await session.close();
+          throw const WatchmeError.unreachable('refused');
+        });
+        expect(
+          await session.execute(const TypeText('abc')),
+          isFailedWith(WatchmeErrorCode.cancelled),
+        );
+        expect(tv.wakes, 1, reason: 'only the connect');
+        expect(net.callsTo('POST', '/v1/FireTV/keyboard'), isEmpty);
+      });
+    });
+
+    group('partial delivery', () {
+      test('StepVolume failing at step 2 is partly delivered', () async {
+        var presses = 0;
+        net.onHttp('POST', '/v1/FireTV', (_) {
+          if (++presses == 2) return HttpResult.text(500, 'boom');
+          return HttpResult.json(200, {'description': 'OK'});
+        });
+        final failed = await session.execute(const StepVolume(3));
+        expect(
+          failed,
+          isFailedWith(
+            WatchmeErrorCode.partiallyDelivered,
+            rawDeviceMessage: 'boom',
+          ),
+        );
+        expect(
+          (failed as Failed).error.cause,
+          isWatchmeError(WatchmeErrorCode.protocol),
+        );
+        expect(presses, 2);
+      });
+
+      test('a device that vanishes after a step is partly delivered, never '
+          'unreachable', () async {
+        var presses = 0;
+        net.onHttp('POST', '/v1/FireTV', (_) {
+          if (++presses == 1) net.setUnreachable(tv.host);
+          return HttpResult.json(200, {'description': 'OK'});
+        });
+        final failed = await session.execute(const StepVolume(3));
+        expect(failed, isFailedWith(WatchmeErrorCode.partiallyDelivered));
+        expect(
+          (failed as Failed).error.cause,
+          isWatchmeError(WatchmeErrorCode.unreachable),
+        );
+        expect(failed.delivered, isFalse);
+      });
+
+      test('a timeout after a step is partly delivered', () async {
+        var presses = 0;
+        net.onHttp('POST', '/v1/FireTV', (_) {
+          if (++presses == 2) {
+            throw const WatchmeError.timeout('No answer');
+          }
+          return HttpResult.json(200, {'description': 'OK'});
+        });
+        final failed = await session.execute(const StepVolume(-3));
+        expect(failed, isFailedWith(WatchmeErrorCode.partiallyDelivered));
+        expect(
+          (failed as Failed).error.cause,
+          isWatchmeError(WatchmeErrorCode.timeout),
+        );
+      });
+
+      test('a 401 after a step is partly delivered and still emits '
+          'ReauthRequired', () async {
+        var presses = 0;
+        net.onHttp(
+          'POST',
+          '/v1/FireTV',
+          (_) => ++presses == 2
+              ? HttpResult.json(401, {'description': 'authn error'})
+              : HttpResult.json(200, {'description': 'OK'}),
+        );
+        final failed = await session.execute(const StepVolume(3));
+        expect(failed, isFailedWith(WatchmeErrorCode.partiallyDelivered));
+        expect(
+          (failed as Failed).error.cause,
+          isWatchmeError(WatchmeErrorCode.reauthRequired),
+        );
+        await clock.flush();
+        expect(events.whereType<ReauthRequired>(), hasLength(1));
+      });
+
+      test('a first step that reaches nothing stays unreachable', () async {
+        net.setUnreachable(tv.host);
+        expect(
+          await session.execute(const StepVolume(3)),
+          isFailedWith(WatchmeErrorCode.unreachable),
+        );
+      });
+    });
+
+    group('a device that is gone', () {
+      test('refresh marks observations stale and reports disconnected, '
+          'without waking', () async {
+        await session.execute(const LaunchApp('com.netflix.ninja'));
+        net.setUnreachable(tv.host);
+        final mark = net.httpCalls.length;
+        Object? thrown;
+        try {
+          await session.refresh();
+        } on WatchmeError catch (e) {
+          thrown = e;
+        }
+        expect(thrown, isWatchmeError(WatchmeErrorCode.unreachable));
+        expect(
+          [for (final c in net.httpCalls.skip(mark)) '${c.method} ${c.uri}'],
+          [
+            'GET https://10.0.0.7:8080/v1/FireTV/status',
+            'GET http://10.0.0.7:8009/apps/FireTVRemote',
+          ],
+          reason: 'passive: no DIAL launch',
+        );
+        expect(session.state.power?.confidence, Confidence.stale);
+        expect(session.state.foregroundApp?.confidence, Confidence.stale);
+        expect(
+          session.state.connections['firetv.lightning'],
+          ConnectionState.disconnected,
+        );
+        await clock.flush();
+        final changed = events.whereType<ConnectionChanged>().single;
+        expect(changed.state, ConnectionState.disconnected);
+        expect(changed.error, same(thrown));
+        // Reported once.
+        await expectLater(
+          session.refresh(),
+          throwsWatchmeError(WatchmeErrorCode.unreachable),
+        );
+        await clock.flush();
+        expect(events.whereType<ConnectionChanged>(), hasLength(1));
+      });
+
+      test('an answer after that reports it connected again', () async {
+        net.setUnreachable(tv.host);
+        await expectLater(
+          session.refresh(),
+          throwsWatchmeError(WatchmeErrorCode.unreachable),
+        );
+        net.setReachable(tv.host);
+        tv.sleep();
+        expect((await session.refresh()).power?.value, PowerMode.standby);
+        await clock.flush();
+        expect(events.whereType<ConnectionChanged>().map((e) => e.state), [
+          ConnectionState.disconnected,
+          ConnectionState.connected,
+        ]);
+        expect(
+          session.state.connections['firetv.lightning'],
+          ConnectionState.connected,
+        );
+      });
+
+      test('a refresh that only times out does not disconnect', () async {
+        net.onHttp(
+          'GET',
+          '/v1/FireTV/status',
+          (_) => throw const WatchmeError.timeout('slow'),
+        );
+        await expectLater(
+          session.refresh(),
+          throwsWatchmeError(WatchmeErrorCode.timeout),
+        );
+        await clock.flush();
+        expect(events.whereType<ConnectionChanged>(), isEmpty);
+      });
     });
 
     test('close emits disconnected and later commands fail', () async {

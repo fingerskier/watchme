@@ -68,6 +68,54 @@ void main() {
       );
     });
 
+    test('holdNext acts on the request at once but holds its answer', () async {
+      sim = await startSim();
+      final gate = sim.holdNext('POST', '/keypress/VolumeUp');
+      var answered = false;
+      final response = post('/keypress/VolumeUp').then((r) {
+        answered = true;
+        return r;
+      });
+      await gate.reached;
+      expect(gate.isReached, isTrue);
+      expect(sim.keyLog.single.key, 'VolumeUp');
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      expect(answered, isFalse);
+      gate.release();
+      expect((await response).status, 200);
+      // Only the next matching request is held.
+      expect((await post('/keypress/VolumeUp')).status, 200);
+    });
+
+    test('a graceful stop refuses new connections but sends a held '
+        'answer', () async {
+      sim = await startSim();
+      final port = sim.port;
+      final gate = sim.holdNext('POST', '/keypress/VolumeUp');
+      final response = post('/keypress/VolumeUp');
+      await gate.reached;
+      final stopped = sim.stop(force: false);
+      expect(sim.isRunning, isFalse);
+      await expectLater(
+        client.getUrl(Uri.parse('http://127.0.0.1:$port/query/device-info')),
+        throwsA(isA<SocketException>()),
+      );
+      gate.release();
+      expect((await response).status, 200);
+      await stopped;
+    });
+
+    test('a forced stop releases held answers', () async {
+      sim = await startSim();
+      final gate = sim.holdNext('POST', '/keypress/Home');
+      final response = post('/keypress/Home')
+          .then<Object?>((r) => r, onError: (Object e) => e);
+      await gate.reached;
+      await sim.stop();
+      // The connection was dropped; the call ends either way.
+      await response;
+    });
+
     test('can serve on IPv6 loopback', () async {
       final s = RokuSimulator();
       try {

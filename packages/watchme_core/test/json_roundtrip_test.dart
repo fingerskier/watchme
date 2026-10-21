@@ -17,6 +17,8 @@ void main() {
       const PressKey(RemoteKey.volumeUp, KeyAction.down),
       const SetPower(true),
       const SetPower(false),
+      const SetPower(true, userConfirmed: true),
+      const SetPower(false, userConfirmed: true),
       const SetVolume(42),
       const StepVolume(-3),
       const SetMute(null),
@@ -102,6 +104,77 @@ void main() {
         const SetVolume(30),
       );
     });
+
+    group('SetPower.userConfirmed', () {
+      test('defaults to false and is omitted from JSON when false', () {
+        expect(const SetPower(true).userConfirmed, isFalse);
+        expect(const SetPower(true).toJson(), {'type': 'setPower', 'on': true});
+        expect(const SetPower(false, userConfirmed: true).toJson(), {
+          'type': 'setPower',
+          'on': false,
+          'userConfirmed': true,
+        });
+      });
+
+      test('absent or null decodes as false; true survives the wire', () {
+        expect(
+          Command.fromJson({'type': 'setPower', 'on': true}),
+          const SetPower(true),
+        );
+        expect(
+          Command.fromJson({
+            'type': 'setPower',
+            'on': true,
+            'userConfirmed': null,
+          }),
+          const SetPower(true),
+        );
+        final decoded = Command.fromJson(
+          wire(const SetPower(true, userConfirmed: true).toJson()),
+        );
+        expect(decoded, isA<SetPower>());
+        expect((decoded as SetPower).userConfirmed, isTrue);
+        expect(decoded.on, isTrue);
+      });
+
+      test('is part of equality: a confirmed command is a different '
+          'command', () {
+        expect(
+          const SetPower(true, userConfirmed: true),
+          isNot(const SetPower(true)),
+        );
+        expect(
+          const SetPower(false, userConfirmed: true),
+          isNot(const SetPower(true, userConfirmed: true)),
+        );
+        expect(
+          const SetPower(true, userConfirmed: true).hashCode,
+          const SetPower(true, userConfirmed: true).hashCode,
+        );
+      });
+
+      test('does not change the capability', () {
+        expect(
+          const SetPower(true, userConfirmed: true).capability,
+          Capability.powerOn,
+        );
+        expect(
+          const SetPower(false, userConfirmed: true).capability,
+          Capability.powerOff,
+        );
+      });
+
+      test('rejects a non-boolean value', () {
+        expect(
+          () => Command.fromJson({
+            'type': 'setPower',
+            'on': true,
+            'userConfirmed': 'yes',
+          }),
+          throwsFormatException,
+        );
+      });
+    });
   });
 
   group('CommandResult', () {
@@ -121,6 +194,16 @@ void main() {
       ),
       const SentUnconfirmed(),
       const Unsupported(Unsupported.needsConfirmation),
+      const Failed(
+        WatchmeError.partiallyDelivered(
+          'Stepped the volume 1 of 3 times before the TV stopped answering',
+        ),
+      ),
+      const Failed(
+        WatchmeError.destinationRefused(
+          'Refused to contact 8.8.8.8: it is a public internet address.',
+        ),
+      ),
       const Failed(
         WatchmeError.rejected(
           'Roku refused the key press',
@@ -145,6 +228,63 @@ void main() {
       );
       expect(failed.delivered, isFalse);
       expect(const SentUnconfirmed().delivered, isTrue);
+    });
+
+    test('partiallyDelivered is true only for a partial-delivery failure, '
+        'which is not delivered', () {
+      const partial = Failed(
+        WatchmeError.partiallyDelivered('1 of 3 volume steps'),
+      );
+      expect(partial.partiallyDelivered, isTrue);
+      expect(partial.delivered, isFalse);
+      final decoded = CommandResult.fromJson(wire(partial.toJson()));
+      expect(decoded.partiallyDelivered, isTrue);
+      for (final other in <CommandResult>[
+        const Confirmed(),
+        const SentUnconfirmed(),
+        const Unsupported(Unsupported.needsConfirmation),
+        for (final code in WatchmeErrorCode.values)
+          if (code != WatchmeErrorCode.partiallyDelivered)
+            Failed(WatchmeError(code, 'x')),
+      ]) {
+        expect(other.partiallyDelivered, isFalse, reason: '$other');
+      }
+    });
+  });
+
+  group('WatchmeError codes', () {
+    test('every code round-trips by name', () {
+      for (final code in WatchmeErrorCode.values) {
+        final error = WatchmeError(code, 'm', rawDeviceMessage: 'raw');
+        final decoded = WatchmeError.fromJson(wire(error.toJson()));
+        expect(decoded, error);
+        expect(decoded.toJson()['code'], code.name);
+      }
+    });
+
+    test('named constructors set their code', () {
+      expect(
+        const WatchmeError.partiallyDelivered('m').code,
+        WatchmeErrorCode.partiallyDelivered,
+      );
+      expect(
+        const WatchmeError.destinationRefused('m').code,
+        WatchmeErrorCode.destinationRefused,
+      );
+      final cause = StateError('second request failed');
+      final partial = WatchmeError.partiallyDelivered('m', cause: cause);
+      expect(partial.cause, same(cause));
+      expect(WatchmeError.fromJson(wire(partial.toJson())).cause, isNull);
+    });
+
+    test('the wire names of the new codes are stable', () {
+      expect(WatchmeErrorCode.partiallyDelivered.name, 'partiallyDelivered');
+      expect(WatchmeErrorCode.destinationRefused.name, 'destinationRefused');
+      expect(
+        WatchmeError.fromJson({'code': 'partiallyDelivered', 'message': 'm'})
+            .code,
+        WatchmeErrorCode.partiallyDelivered,
+      );
     });
   });
 

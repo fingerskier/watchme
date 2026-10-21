@@ -36,6 +36,27 @@ Future<T> withClockTimeout<T>(
   return done.future;
 }
 
+/// Failure codes that prove the device did not act on a command: nothing
+/// reached it, or it understood and declined.
+const Set<WatchmeErrorCode> _nothingDone = {
+  WatchmeErrorCode.unreachable,
+  WatchmeErrorCode.destinationRefused,
+  WatchmeErrorCode.unauthorized,
+  WatchmeErrorCode.reauthRequired,
+  WatchmeErrorCode.rejected,
+  WatchmeErrorCode.unsupported,
+  WatchmeErrorCode.cancelled,
+};
+
+/// Whether [result] is a failure after which the device may still have
+/// acted on the command, in full or in part: a timeout, a partial delivery,
+/// a malformed answer or a driver bug. The state the command changes is
+/// then uncertain, and nothing may be retried or toggled on top of it.
+bool mayHaveActed(CommandResult result) => switch (result) {
+  Failed(:final error) => !_nothingDone.contains(error.code),
+  _ => false,
+};
+
 /// 32-bit FNV-1a of [text]'s UTF-16 code units, as 8 hex digits.
 ///
 /// The multiply is split so the result is the same when compiled to

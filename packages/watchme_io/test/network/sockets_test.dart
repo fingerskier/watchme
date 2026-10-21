@@ -8,6 +8,7 @@ import 'package:watchme_core/watchme_core.dart';
 import 'package:watchme_io/watchme_io.dart';
 import 'package:watchme_testkit/watchme_testkit.dart';
 
+import '../support/policies.dart';
 import '../support/tls_fixtures.dart';
 
 void main() {
@@ -64,11 +65,12 @@ void main() {
     });
 
     test('echoes text and binary frames over ws', () async {
-      final socket = await IoNetworkStack().webSocket(
-        Uri.parse('ws://127.0.0.1:${plain.port}/ws'),
-        protocols: ['ecp-2', 'other'],
-        headers: {'Origin': 'http://watchme.test', 'X-Custom': 'yes'},
-      );
+      final socket = await IoNetworkStack(destinationPolicy: loopbackAllowed)
+          .webSocket(
+            Uri.parse('ws://127.0.0.1:${plain.port}/ws'),
+            protocols: ['ecp-2', 'other'],
+            headers: {'Origin': 'http://watchme.test', 'X-Custom': 'yes'},
+          );
       final messages = StreamIterator(socket.messages);
       socket.send('hello');
       expect(await messages.moveNext(), isTrue);
@@ -94,9 +96,8 @@ void main() {
     });
 
     test('reports the server close code and reason', () async {
-      final socket = await IoNetworkStack().webSocket(
-        Uri.parse('ws://127.0.0.1:${plain.port}/'),
-      );
+      final socket = await IoNetworkStack(destinationPolicy: loopbackAllowed)
+          .webSocket(Uri.parse('ws://127.0.0.1:${plain.port}/'));
       final received = socket.messages.toList();
       socket.send('close');
       expect(await received, isEmpty);
@@ -106,10 +107,11 @@ void main() {
     });
 
     test('echoes over wss with a self-signed certificate', () async {
-      final socket = await IoNetworkStack().webSocket(
-        Uri.parse('wss://127.0.0.1:${secure.port}/'),
-        tls: const TlsPolicy.firstUse(),
-      );
+      final socket = await IoNetworkStack(destinationPolicy: loopbackAllowed)
+          .webSocket(
+            Uri.parse('wss://127.0.0.1:${secure.port}/'),
+            tls: const TlsPolicy.firstUse(),
+          );
       expect(socket.peerCertificateSha256, selfSignedSha);
       final reply = socket.messages.first;
       socket.send('over tls');
@@ -122,14 +124,12 @@ void main() {
       () async {
         final uri = Uri.parse('wss://127.0.0.1:${secure.port}/');
         await expectLater(
-          IoNetworkStack().webSocket(uri),
+          IoNetworkStack(destinationPolicy: loopbackAllowed).webSocket(uri),
           throwsWatchmeError(WatchmeErrorCode.protocol),
         );
         await expectLater(
-          IoNetworkStack().webSocket(
-            uri,
-            tls: TlsPolicy.pinned([fakeFingerprint('x')]),
-          ),
+          IoNetworkStack(destinationPolicy: loopbackAllowed)
+              .webSocket(uri, tls: TlsPolicy.pinned([fakeFingerprint('x')])),
           throwsWatchmeError(WatchmeErrorCode.protocol),
         );
         expect(handshakes, isEmpty);
@@ -138,9 +138,8 @@ void main() {
 
     test('a refused upgrade carries the device body', () async {
       await expectLater(
-        IoNetworkStack().webSocket(
-          Uri.parse('ws://127.0.0.1:${plain.port}/forbidden'),
-        ),
+        IoNetworkStack(destinationPolicy: loopbackAllowed)
+            .webSocket(Uri.parse('ws://127.0.0.1:${plain.port}/forbidden')),
         throwsWatchmeError(
           WatchmeErrorCode.rejected,
           rawDeviceMessage: '{"error":"blacklisted certificate"}',
@@ -151,7 +150,8 @@ void main() {
     test('a closed port is unreachable', () async {
       final port = await _closedPort();
       await expectLater(
-        IoNetworkStack().webSocket(Uri.parse('ws://127.0.0.1:$port/')),
+        IoNetworkStack(destinationPolicy: loopbackAllowed)
+            .webSocket(Uri.parse('ws://127.0.0.1:$port/')),
         throwsWatchmeError(WatchmeErrorCode.unreachable),
       );
     });
@@ -162,7 +162,8 @@ void main() {
       final server = await ServerSocket.bind(loopback, 0);
       addTearDown(server.close);
       server.listen((s) => s.listen(s.add, onDone: s.close));
-      final socket = await IoNetworkStack().tcp('127.0.0.1', server.port);
+      final socket = await IoNetworkStack(destinationPolicy: loopbackAllowed)
+          .tcp('127.0.0.1', server.port);
       final input = StreamIterator(socket.input);
       socket.send([0x08, 0x02, 0x10, 0xc8, 0x01]);
       await socket.flush();
@@ -190,15 +191,16 @@ void main() {
         s.write(s.peerCertificate?.subject ?? 'anonymous');
         s.close();
       });
-      final socket = await IoNetworkStack().tcp(
-        '127.0.0.1',
-        server.port,
-        tls: TlsPolicy.pinned([selfSignedSha]),
-        identity: ClientIdentity.pem(
-          certificateChain: TlsFixtures.clientPem,
-          privateKey: TlsFixtures.clientKey,
-        ),
-      );
+      final socket = await IoNetworkStack(destinationPolicy: loopbackAllowed)
+          .tcp(
+            '127.0.0.1',
+            server.port,
+            tls: TlsPolicy.pinned([selfSignedSha]),
+            identity: ClientIdentity.pem(
+              certificateChain: TlsFixtures.clientPem,
+              privateKey: TlsFixtures.clientKey,
+            ),
+          );
       final text = await utf8.decodeStream(socket.input);
       expect(text, contains('watchme test client'));
       expect(socket.peerCertificateSha256, selfSignedSha);
@@ -229,16 +231,17 @@ void main() {
           .split('\n')
           .where((l) => l.isNotEmpty && !l.startsWith('-----'))
           .join();
-      final socket = await IoNetworkStack().tcp(
-        '127.0.0.1',
-        server.port,
-        tls: const TlsPolicy(allowSelfSigned: true),
-        identity: ClientIdentity(
-          certificateChain: TlsFixtures.der(TlsFixtures.clientPem),
-          privateKey: base64.decode(key),
-          encoding: IdentityEncoding.der,
-        ),
-      );
+      final socket = await IoNetworkStack(destinationPolicy: loopbackAllowed)
+          .tcp(
+            '127.0.0.1',
+            server.port,
+            tls: const TlsPolicy(allowSelfSigned: true),
+            identity: ClientIdentity(
+              certificateChain: TlsFixtures.der(TlsFixtures.clientPem),
+              privateKey: base64.decode(key),
+              encoding: IdentityEncoding.der,
+            ),
+          );
       expect(await utf8.decodeStream(socket.input), contains('test client'));
     });
 
@@ -254,7 +257,7 @@ void main() {
       addTearDown(server.close);
       server.listen((s) => s.close());
       await expectLater(
-        IoNetworkStack().tcp(
+        IoNetworkStack(destinationPolicy: loopbackAllowed).tcp(
           '127.0.0.1',
           server.port,
           tls: TlsPolicy.pinned([fakeFingerprint('nope')]),
@@ -266,7 +269,8 @@ void main() {
     test('a refused connection is unreachable', () async {
       final port = await _closedPort();
       await expectLater(
-        IoNetworkStack().tcp('127.0.0.1', port),
+        IoNetworkStack(destinationPolicy: loopbackAllowed)
+            .tcp('127.0.0.1', port),
         throwsWatchmeError(WatchmeErrorCode.unreachable),
       );
     });
@@ -281,11 +285,8 @@ void main() {
         final d = listener.receive();
         if (d != null && !received.isCompleted) received.complete(d.data);
       });
-      await IoNetworkStack().sendDatagram('127.0.0.1', listener.port, [
-        1,
-        2,
-        3,
-      ]);
+      await IoNetworkStack(destinationPolicy: loopbackAllowed)
+          .sendDatagram('127.0.0.1', listener.port, [1, 2, 3]);
       expect(await received.future.timeout(const Duration(seconds: 2)), [
         1,
         2,
@@ -332,7 +333,7 @@ void main() {
           ..send(utf8.encode('reply 2'), d.address, d.port);
       });
       final stopwatch = Stopwatch()..start();
-      final replies = await IoNetworkStack()
+      final replies = await IoNetworkStack(destinationPolicy: loopbackAllowed)
           .multicastQuery(
             '127.0.0.1',
             responder.port,

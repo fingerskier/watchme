@@ -118,6 +118,26 @@ void main() {
       expect(rokuDescriptor.ceiling, rokuCeiling);
     });
 
+    test('power routes are discrete: the Power toggle is not one', () {
+      // The engine's power orchestrator sends a toggle only through routes
+      // flagged toggleOnly, and only on agreed state. Roku's power
+      // capabilities are the discrete PowerOn/PowerOff keys; the Power
+      // toggle (mapped for the orchestrator) must not make them toggles.
+      expect(RemoteKey.power.capability, Capability.powerOff);
+      expect(rokuKeyNames[RemoteKey.power], 'Power');
+      for (final capability in [Capability.powerOn, Capability.powerOff]) {
+        expect(
+          rokuCeiling.supportFor(capability).has(CapFlag.toggleOnly),
+          isFalse,
+          reason: capability.name,
+        );
+      }
+      expect(
+        rokuCeiling.supportFor(Capability.powerOff).note,
+        contains('toggle'),
+      );
+    });
+
     test('ceiling marks the access-gated capabilities', () {
       final keys = rokuCeiling.supportFor(Capability.dpadNavigation);
       expect(keys.has(CapFlag.userSetupRequired), isTrue);

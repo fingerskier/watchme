@@ -18,6 +18,15 @@ final class _DeviceEntry {
   /// gets an answer again.
   final Map<String, DateTime> unreachable = {};
 
+  /// When a command that may have changed the volume failed without saying
+  /// how far it got (a partial delivery, a timeout). A volume observation
+  /// made at or before then describes the device before that command, so
+  /// it is not believed; a newer one ends the uncertainty.
+  DateTime? volumeUncertainSince;
+
+  /// The same for mute.
+  DateTime? mutedUncertainSince;
+
   /// `off`, inferred, while some driver gets no answer (e.g. the Samsung
   /// WebSocket is down while REST still answers). All such failures share
   /// one cause, so together they count as a single power source.
@@ -79,6 +88,9 @@ final class _DriverSlot {
   DriverSession? session;
   StreamSubscription<DeviceEvent>? subscription;
   Future<DriverSession>? connecting;
+
+  /// Whether [connecting] may wake the device.
+  bool connectingMayWake = false;
 
   /// Bumped whenever the session is reset, so a connect that was in flight
   /// knows its result is unwanted.

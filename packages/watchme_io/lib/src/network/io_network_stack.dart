@@ -8,12 +8,29 @@ import 'package:crypto/crypto.dart';
 import 'package:watchme_core/watchme_core.dart';
 
 import 'connector.dart';
+import 'destinations.dart';
 import 'io_errors.dart';
 import 'io_sockets.dart';
 import 'tls_support.dart';
 
 /// The `dart:io` [NetworkStack]: HTTP(S), WebSocket, TCP/TLS, UDP and
 /// multicast for native platforms (Linux, macOS, Windows, Android, iOS).
+///
+/// LAN only: every unicast destination (HTTP, WebSocket, TCP, TLS and
+/// unicast UDP, including a unicast "group" given to [multicastQuery]) must
+/// be allowed by [destinationPolicy], which by default admits private
+/// (RFC 1918), link-local and unique-local IPv6 addresses only. The stack
+/// resolves a host name itself (with [lookup]), checks every address it
+/// resolves to, refuses the name if any of them is refused, and connects to
+/// the checked address, so DNS cannot answer differently between the check
+/// and the connection. IP literals are parsed, never resolved, and are
+/// judged by the parsed address, not the text. A refusal is a
+/// [WatchmeErrorCode.destinationRefused] error raised before any packet is
+/// sent. HTTP keeps the URI's host in the `Host` header, and TLS verifies
+/// the certificate against (and sends as SNI) the host as named, not the
+/// address connected to. Multicast groups and, with `broadcast: true`, the
+/// limited broadcast address 255.255.255.255 are not unicast destinations
+/// and are not subject to the policy.
 ///
 /// TLS: every connection gets the caller's [TlsPolicy], checked against the
 /// peer's leaf certificate right after the handshake and before any request
@@ -34,7 +51,9 @@ import 'tls_support.dart';
 ///   within the deadline or the connection was lost (the request may have
 ///   been delivered);
 /// * [WatchmeErrorCode.protocol]: TLS failure (including a pin mismatch),
-///   malformed HTTP, a failed WebSocket handshake.
+///   malformed HTTP, a failed WebSocket handshake;
+/// * [WatchmeErrorCode.destinationRefused]: the host, or an address it
+///   resolved to, is outside [destinationPolicy]. Nothing was sent.
 final class IoNetworkStack implements NetworkStack {
   /// Creates a stack.
   ///
@@ -49,6 +68,11 @@ final class IoNetworkStack implements NetworkStack {
   /// * [multicastAllowed]: whether multicast and broadcast may be used.
   ///   Defaults to false on iOS, where they need Apple's multicast
   ///   entitlement, and true elsewhere.
+  /// * [destinationPolicy]: which unicast destinations may be contacted;
+  ///   LAN-only by default. The in-process app allows loopback for its
+  ///   simulators; a hub must not (see `DestinationPolicy.allowLoopback`).
+  /// * [lookup]: resolves host names (default `InternetAddress.lookup`).
+  ///   Every address it returns is checked against [destinationPolicy].
   IoNetworkStack({
     this.clock = const SystemClock(),
     List<int>? extraTrustedRootsPem,
@@ -57,12 +81,15 @@ final class IoNetworkStack implements NetworkStack {
     this.multicastHops = 2,
     this.multicastInterfaces,
     bool? multicastAllowed,
+    this.destinationPolicy = DestinationPolicy.lanOnly,
+    HostLookup? lookup,
   }) : multicastAllowed = multicastAllowed ?? !Platform.isIOS,
        _connector = Connector(
          SecurityContexts(
            usePlatformRoots: usePlatformRoots,
            extraTrustedRootsPem: extraTrustedRootsPem,
          ),
+         DestinationResolver(destinationPolicy, lookup: lookup),
        );
 
   /// Time source for deadlines and multicast windows.
@@ -81,8 +108,17 @@ final class IoNetworkStack implements NetworkStack {
   /// Whether multicast and broadcast are permitted on this platform.
   final bool multicastAllowed;
 
+  /// The unicast destinations this stack may contact.
+  final DestinationPolicy destinationPolicy;
+
+  /// Resolves host names; every address it returns is checked against
+  /// [destinationPolicy] before it is used.
+  HostLookup get lookup => _destinations.lookup;
+
   final Connector _connector;
   final Random _random = Random.secure();
+
+  DestinationResolver get _destinations => _connector.destinations;
 
   /// What this stack can do: every network feature, minus multicast and
   /// broadcast when [multicastAllowed] is false.
@@ -161,16 +197,20 @@ final class IoNetworkStack implements NetworkStack {
     ..userAgent = null
     ..autoUncompress = false
     ..findProxy = ((_) => 'DIRECT')
-    ..connectionFactory = (uri, _, _) async => ConnectionTask.fromSocket(
-      _connector.connect(
-        uri.host,
+    ..connectionFactory = (uri, _, _) async {
+      final socket = _connector.connect(
+        uriHost(uri),
         uri.port,
         attempt: attempt,
         tls: tls,
         identity: identity,
-      ),
-      attempt.cancel,
-    );
+      );
+      // A refused destination fails at once, possibly before HttpClient
+      // listens to the task. It still receives the error; this only stops
+      // the error from also being reported as unhandled.
+      socket.ignore();
+      return ConnectionTask.fromSocket(socket, attempt.cancel);
+    };
 
   static void _prepare(HttpClientRequest request, Map<String, String> headers) {
     request
@@ -380,7 +420,12 @@ final class IoNetworkStack implements NetworkStack {
     final target = '$host:$port';
     RawDatagramSocket? socket;
     try {
-      final address = await _resolve(host);
+      // The policy governs unicast; the limited broadcast is allowed here,
+      // and a subnet-directed broadcast is in a private range anyway.
+      final address = (await _destinations.resolve(
+        host,
+        exempt: broadcast ? const {HostAddressClass.broadcast} : const {},
+      )).first;
       socket = await RawDatagramSocket.bind(
         address.type == InternetAddressType.IPv6
             ? InternetAddress.anyIPv6
@@ -432,7 +477,12 @@ final class IoNetworkStack implements NetworkStack {
           'Multicast is not permitted on this platform',
         );
       }
-      final address = await _resolve(group);
+      // A multicast group is not a unicast destination; anything else
+      // (a unicast "group", as tests use) is one and must pass the policy.
+      final address = (await _destinations.resolve(
+        group,
+        exempt: const {HostAddressClass.multicast},
+      )).first;
       final v6 = address.type == InternetAddressType.IPv6;
       final s = socket = await RawDatagramSocket.bind(
         v6 ? InternetAddress.anyIPv6 : InternetAddress.anyIPv4,
@@ -514,20 +564,11 @@ final class IoNetworkStack implements NetworkStack {
     }
   }
 
-  static Future<InternetAddress> _resolve(String host) async {
-    final literal = InternetAddress.tryParse(host);
-    if (literal != null) return literal;
-    final found = await InternetAddress.lookup(host);
-    if (found.isEmpty) {
-      throw WatchmeError.unreachable('Cannot resolve $host');
-    }
-    return found.first;
-  }
-
-  /// The private (RFC 1918), shared (RFC 6598) and link-local IPv4 addresses
-  /// of this host's interfaces: a sensible [multicastInterfaces] value for a
-  /// hub with several LAN interfaces. VPN and public addresses are left out
-  /// so queries are not sent beyond the LAN.
+  /// The private (RFC 1918) and link-local IPv4 addresses of this host's
+  /// interfaces: a sensible [multicastInterfaces] value for a hub with
+  /// several LAN interfaces. Shared-range (100.64.0.0/10, carrier-grade NAT
+  /// and VPN overlays), public and loopback addresses are left out so
+  /// queries are not sent beyond the LAN.
   static Future<List<InternetAddress>> privateIPv4Addresses() async {
     final interfaces = await NetworkInterface.list(
       type: InternetAddressType.IPv4,
@@ -536,53 +577,26 @@ final class IoNetworkStack implements NetworkStack {
     return [
       for (final interface in interfaces)
         for (final address in interface.addresses)
-          if (isLanAddress(address) && !address.isLoopback) address,
+          if (isPrivateLanAddress(address)) address,
     ];
   }
 }
 
-/// Whether [address] is a local-network address: loopback, link-local,
-/// RFC 1918 private, RFC 6598 shared (CGNAT) or an IPv6 unique-local
-/// address.
+/// Whether [policy] allows a unicast connection to [address]. With the
+/// default `DestinationPolicy.lanOnly` that means a private (RFC 1918),
+/// link-local (IPv4 or IPv6) or unique-local IPv6 address, or an IPv4-mapped
+/// form of one; loopback, the shared range 100.64.0.0/10, public, reserved,
+/// multicast and broadcast addresses are not.
 ///
-/// Used to decide which discovered addresses watchme will contact, so a
-/// spoofed discovery reply cannot point it at a host on the internet. See
-/// [isPrivateLanAddress] for the stricter test applied to an address that
-/// one LAN host names on behalf of another.
-bool isLanAddress(InternetAddress address) {
-  if (address.isLoopback || address.isLinkLocal) return true;
-  final b = address.rawAddress;
-  if (address.type == InternetAddressType.IPv4) {
-    return b[0] == 10 ||
-        (b[0] == 172 && b[1] >= 16 && b[1] <= 31) ||
-        (b[0] == 192 && b[1] == 168) ||
-        (b[0] == 100 && b[1] >= 64 && b[1] <= 127);
-  }
-  if (address.type == InternetAddressType.IPv6) {
-    return (b[0] & 0xfe) == 0xfc;
-  }
-  return false;
-}
+/// A thin wrapper over `DestinationPolicy.allows`, so the stack, discovery
+/// and the engine can never disagree about what the LAN is.
+bool isLanAddress(
+  InternetAddress address, {
+  DestinationPolicy policy = DestinationPolicy.lanOnly,
+}) => policy.allows(address.address);
 
-/// Whether [address] is a private or link-local address that another LAN
-/// host may legitimately point watchme at: RFC 1918, IPv4 and IPv6
-/// link-local, and IPv6 unique-local.
-///
-/// Unlike [isLanAddress] it excludes loopback (this host's own services,
-/// which a spoofed discovery reply must not make watchme probe) and the
-/// RFC 6598 shared range (carrier-grade NAT and overlay VPNs such as
-/// Tailscale, which reach beyond the LAN).
-bool isPrivateLanAddress(InternetAddress address) {
-  if (address.isLoopback) return false;
-  if (address.isLinkLocal) return true;
-  final b = address.rawAddress;
-  if (address.type == InternetAddressType.IPv4) {
-    return b[0] == 10 ||
-        (b[0] == 172 && b[1] >= 16 && b[1] <= 31) ||
-        (b[0] == 192 && b[1] == 168);
-  }
-  if (address.type == InternetAddressType.IPv6) {
-    return (b[0] & 0xfe) == 0xfc;
-  }
-  return false;
-}
+/// Whether [address] is private (RFC 1918), link-local or unique-local:
+/// what `DestinationPolicy.lanOnly` allows, whatever policy a stack uses.
+/// Loopback and the shared range 100.64.0.0/10 are excluded.
+bool isPrivateLanAddress(InternetAddress address) =>
+    DestinationPolicy.lanOnly.allows(address.address);

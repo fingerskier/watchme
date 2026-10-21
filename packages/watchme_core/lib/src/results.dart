@@ -28,9 +28,25 @@ sealed class CommandResult {
     final other => throw FormatException('Unknown result type: $other'),
   };
 
-  /// Whether the command reached the device without an error
+  /// Whether the whole command reached the device without an error
   /// ([Confirmed] or [SentUnconfirmed]).
+  ///
+  /// `false` does not prove that nothing happened: after a [Failed] with
+  /// [WatchmeErrorCode.timeout] or [WatchmeErrorCode.partiallyDelivered]
+  /// the device may have acted. Only [Unsupported], and failures such as
+  /// [WatchmeErrorCode.unreachable] and [WatchmeErrorCode.destinationRefused],
+  /// mean nothing was delivered.
   bool get delivered => this is Confirmed || this is SentUnconfirmed;
+
+  /// Whether part of a command made of several requests reached the device
+  /// before it failed ([Failed] with [WatchmeErrorCode.partiallyDelivered]).
+  ///
+  /// The device state is then uncertain. Never retry the command or fall
+  /// back to another route after it.
+  bool get partiallyDelivered => switch (this) {
+    Failed(:final error) => error.code == WatchmeErrorCode.partiallyDelivered,
+    _ => false,
+  };
 
   /// JSON form: `{"type": ..., ...fields}`.
   JsonMap toJson();
@@ -89,7 +105,11 @@ final class Unsupported extends CommandResult {
   const Unsupported(this.reason);
 
   /// The reason the power orchestrator gives when it refuses to send a power
-  /// toggle without two agreeing state sources. The UI asks the user.
+  /// toggle without two agreeing state sources, for [SetPower] and for
+  /// `PressKey(RemoteKey.power)`.
+  ///
+  /// The UI then asks the user "Is the TV on right now?" and sends
+  /// `SetPower(!isOn, userConfirmed: true)` (see [SetPower.userConfirmed]).
   static const String needsConfirmation = 'needs confirmation';
 
   /// Why the command was not sent.

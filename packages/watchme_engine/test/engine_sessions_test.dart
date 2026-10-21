@@ -53,7 +53,7 @@ void main() {
         onProbe: (_) => matched(name: 'Roku', capabilities: keys),
       );
       h = Harness(drivers: [roku]);
-      id = await h.add('192.0.2.10');
+      id = await h.add('10.0.2.10');
     });
     tearDown(() => h.close());
 
@@ -161,6 +161,159 @@ void main() {
       expect(roku.connects, hasLength(3));
     });
 
+    test('background reconnects never wake the device; a command the user '
+        'sends may', () async {
+      await h.engine.send(id, home);
+      roku.connectError = const WatchmeError.unreachable('asleep');
+      roku.lastSession.emit(
+        const ConnectionChanged(
+          ConnectionState.disconnected,
+          driverId: 'roku.ecp',
+        ),
+      );
+      await h.clock.advance(const Duration(seconds: 3));
+      expect(roku.connects.map((c) => c.allowWake), [true, false, false]);
+      roku.connectError = null;
+      expect(await h.engine.send(id, home), isConfirmed);
+      expect(roku.connects.last.allowWake, isTrue);
+    });
+
+    test('the end of a hold never wakes the device; its start may', () async {
+      // Verifier follow-up to Codex finding #9: apps send the key-up on
+      // their own (focus loss, the app going to the background), and it
+      // woke a sleeping Fire TV through DIAL.
+      expect(
+        await h.engine.send(id, const PressKey(RemoteKey.down, KeyAction.up)),
+        isConfirmed,
+      );
+      expect(roku.connects.single.allowWake, isFalse);
+      roku.lastSession.emit(
+        const ConnectionChanged(
+          ConnectionState.disconnected,
+          driverId: 'roku.ecp',
+        ),
+      );
+      await pump();
+      expect(
+        await h.engine.send(id, const PressKey(RemoteKey.down, KeyAction.down)),
+        isConfirmed,
+      );
+      expect(roku.connects.map((c) => c.allowWake), [false, true]);
+    });
+
+    test('a refresh that reaches nothing shows the device stale and '
+        'disconnected, and recovery is passive', () async {
+      await h.engine.send(id, home);
+      final session = roku.lastSession;
+      session.report(
+        DeviceState(
+          power: Observed.inferred(PowerMode.on, 'roku.ecp', h.clock.now()),
+        ),
+      );
+      await pump();
+      expect(h.view(id).state.power?.confidence, Confidence.inferred);
+
+      // Codex finding #9: the session's refresh finds nothing answering,
+      // and (unlike the contract asks) does not say so itself.
+      session.onRefresh = () =>
+          throw const WatchmeError.unreachable('no route to host');
+      roku.connectError = const WatchmeError.unreachable('no route to host');
+      await h.engine.refresh(id);
+      final view = h.view(id);
+      expect(view.state.power?.value, PowerMode.on);
+      expect(view.state.power?.confidence, Confidence.stale);
+      final driver = h.driverView(id, 'roku.ecp');
+      expect(driver.connection, ConnectionState.disconnected);
+      expect(driver.lastError?.code, WatchmeErrorCode.unreachable);
+      expect(session.closed, isTrue);
+
+      await h.clock.advance(const Duration(seconds: 1));
+      expect(roku.connects, hasLength(2));
+      expect(roku.connects.last.allowWake, isFalse);
+    });
+
+    test(
+      'a session saying its own observation went stale is believed',
+      () async {
+        await h.engine.send(id, home);
+        final at = h.clock.now();
+        final session = roku.lastSession
+          ..report(
+            DeviceState(power: Observed.inferred(PowerMode.on, 'roku.ecp', at)),
+          );
+        await pump();
+        // Another source going quiet says nothing about this observation.
+        session.emit(
+          StateChanged(
+            DeviceState(
+              power: Observed(PowerMode.on, 'upnp', at, Confidence.stale),
+            ),
+            driverId: 'roku.ecp',
+          ),
+        );
+        await pump();
+        expect(h.view(id).state.power?.confidence, Confidence.inferred);
+
+        // DeviceState.merge keeps a live observation over a stale one from
+        // the same instant; the engine must not.
+        session.emit(
+          StateChanged(
+            DeviceState(
+              power: Observed(PowerMode.on, 'roku.ecp', at, Confidence.stale),
+            ),
+            driverId: 'roku.ecp',
+          ),
+        );
+        await pump();
+        expect(h.view(id).state.power?.confidence, Confidence.stale);
+      },
+    );
+
+    test('a command that joins a passive reconnect finding the device '
+        'asleep connects again, waking it', () async {
+      await h.engine.send(id, home);
+      final asleep = Completer<void>();
+      roku.onConnect = (_, _) async {
+        if (!roku.connects.last.allowWake) {
+          await asleep.future;
+          throw const WatchmeError.unreachable('API port closed');
+        }
+        final s = FakeSession('roku.ecp', capabilities: keys);
+        roku.sessions.add(s);
+        return s;
+      };
+      roku.lastSession.emit(
+        const ConnectionChanged(
+          ConnectionState.disconnected,
+          driverId: 'roku.ecp',
+        ),
+      );
+      await h.clock.advance(const Duration(seconds: 1));
+      expect(roku.connects.last.allowWake, isFalse);
+      final result = h.engine.send(id, home);
+      await pump();
+      asleep.complete();
+      expect(await result, isConfirmed);
+      expect(roku.connects.map((c) => c.allowWake), [true, false, true]);
+    });
+
+    test('no background reconnect to a refused destination', () async {
+      await h.engine.send(id, home);
+      roku.connectError = const WatchmeError.destinationRefused(
+        'Refused to contact 8.8.8.8: it is a public internet address.',
+      );
+      roku.lastSession.emit(
+        const ConnectionChanged(
+          ConnectionState.disconnected,
+          driverId: 'roku.ecp',
+        ),
+      );
+      await h.clock.advance(const Duration(seconds: 1));
+      expect(roku.connects, hasLength(2));
+      await h.clock.advance(const Duration(minutes: 10));
+      expect(roku.connects, hasLength(2), reason: 'retrying cannot help');
+    });
+
     test('no background reconnect after watchme turned the TV off', () async {
       expect(await h.engine.send(id, const SetPower(false)), isConfirmed);
       roku.lastSession.emit(
@@ -186,7 +339,7 @@ void main() {
       );
       final h2 = Harness(drivers: [roku, upnp]);
       addTearDown(h2.close);
-      final id2 = await h2.add('192.0.2.11');
+      final id2 = await h2.add('10.0.2.11');
       await h2.engine.refresh(id2);
       await h2.engine.send(id2, home);
       // upnp has no session yet; connect it so its state counts.
@@ -274,7 +427,7 @@ void main() {
             matched(name: 'Roku', mac: 'aa:bb:cc:dd:ee:10', capabilities: keys),
       );
       h = Harness(drivers: [roku], credentials: store);
-      id = await h.add('192.0.2.10');
+      id = await h.add('10.0.2.10');
     });
     tearDown(() => h.close());
 
@@ -319,10 +472,10 @@ void main() {
       await pump();
       expect(store.reads, 1);
       // Same MAC at a new address: the slot is reset mid-connect.
-      expect(await h.add('192.0.2.11'), id);
+      expect(await h.add('10.0.2.11'), id);
       store.gate!.complete();
       expect(await result, isConfirmed);
-      expect(roku.connects.map((c) => c.endpoint.host), ['192.0.2.11']);
+      expect(roku.connects.map((c) => c.endpoint.host), ['10.0.2.11']);
       expect(h.driverView(id, 'roku.ecp').connected, isTrue);
     });
 
@@ -361,7 +514,7 @@ void main() {
     setUp(() async {
       fire = pinDriver();
       h = Harness(drivers: [fire]);
-      id = await h.add('192.0.2.20');
+      id = await h.add('10.0.2.20');
     });
     tearDown(() => h.close());
 
@@ -479,7 +632,7 @@ void main() {
         final roku = FakeDriver('roku.ecp', onProbe: (_) => matched(name: 'R'));
         final h2 = Harness(drivers: [roku]);
         addTearDown(h2.close);
-        final rokuId = await h2.add('192.0.2.30');
+        final rokuId = await h2.add('10.0.2.30');
         expect(
           await h2.engine.pair(rokuId, 'roku.ecp').steps.single,
           isPairingFailedWith(WatchmeErrorCode.unsupported),
@@ -504,7 +657,7 @@ void main() {
     setUp(() async {
       fire = pinDriver();
       h = Harness(drivers: [fire]);
-      id = await h.add('192.0.2.20');
+      id = await h.add('10.0.2.20');
       await h.credentials.write(token(id, 'firetv.lightning'));
       expect(await h.engine.send(id, home), isConfirmed);
     });

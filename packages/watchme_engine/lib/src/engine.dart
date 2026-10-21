@@ -58,15 +58,32 @@ final class EngineConfig {
 ///   device keyed by MAC, then stable id, then host (see
 ///   [resolveIdentity]), so a device keeps its id across IP changes.
 /// * **Sessions.** A driver connects lazily on the first command that needs
-///   it. A session that reports `disconnected` is reconnected in the
-///   background with [EngineConfig.reconnect] backoff, except after watchme
-///   turned the device off or while it is known to be off, so a reconnect
-///   never wakes a TV the user switched off. A revoked credential
-///   ([ReauthRequired]) marks the pairing invalid: the driver shows as
-///   needing pairing and is not used until paired again.
+///   it, and only a command the user sent may wake the device while
+///   connecting (`Driver.connect(allowWake: true)`); turning a device off,
+///   sending a power toggle or ending a hold (a key-up, which apps also
+///   send on their own) never does. A session that reports
+///   `disconnected`, or whose refresh reaches nothing, is closed, its
+///   observations show as stale, and it is reconnected in the background
+///   with [EngineConfig.reconnect] backoff, passively: background
+///   reconnects never wake the device (`allowWake: false`), and none is
+///   tried after watchme turned the device off or while it is known to be
+///   off. A revoked credential ([ReauthRequired]) marks the pairing
+///   invalid: the driver shows as needing pairing and is not used until
+///   paired again.
 /// * **Routing.** [send] ranks the device's sessions with a
-///   [CapabilityRouter] and falls back down the list; `SetPower` goes
-///   through the [PowerOrchestrator] instead.
+///   [CapabilityRouter] and falls back down the list while nothing reached
+///   the device. After a failure that may have acted (a timeout, a partial
+///   delivery) it neither falls back nor retries, and marks the state the
+///   command changes (e.g. volume) stale until a source reports an
+///   observation made after the failure; a refresh that returns what a
+///   session cached before the command does not revive it.
+/// * **Power.** `SetPower` and the power keys go through the
+///   [PowerOrchestrator] instead: `PressKey(RemoteKey.power)` is a toggle
+///   intent, never a raw key press, and holding a power key is refused.
+/// * **LAN only.** [addManual] refuses an IP literal outside
+///   [destinationPolicy] up front, and discovery hits from such addresses
+///   are dropped. Host names are checked by the network stack, which
+///   resolves them and checks every address (see `DestinationPolicy`).
 /// * **Secrets.** Credentials go from pairing straight to the
 ///   [CredentialStore]. Nothing the engine returns contains one: views carry
 ///   no secrets and pairing flows end in [Paired.redacted].
@@ -79,6 +96,9 @@ final class Engine implements WatchmeEngine {
   /// [wakeOnLan] sends Wake-on-LAN for the power orchestrator; hosts pass
   /// `WakeOnLan(network).send` from watchme_io, which also covers subnet
   /// broadcasts. Without it the orchestrator sends the packets itself.
+  ///
+  /// [destinationPolicy] is LAN-only by default. Give the native network
+  /// stack the same policy: it is what enforces it on every connection.
   Engine({
     required Iterable<Driver> drivers,
     required Transports transports,
@@ -87,6 +107,7 @@ final class Engine implements WatchmeEngine {
     DeviceRepository? repository,
     Clock clock = const SystemClock(),
     this.config = const EngineConfig(),
+    this.destinationPolicy = DestinationPolicy.lanOnly,
     WakeOnLanSender? wakeOnLan,
   }) : _drivers = List.unmodifiable(drivers),
        _transports = transports,
@@ -121,7 +142,13 @@ final class Engine implements WatchmeEngine {
   /// Tunables.
   final EngineConfig config;
 
-  /// The power orchestrator `SetPower` goes through.
+  /// Which addresses the engine accepts for manual adds and discovery hits.
+  ///
+  /// The in-process app allows loopback for its simulators; a hub must not
+  /// (see `DestinationPolicy.allowLoopback`).
+  final DestinationPolicy destinationPolicy;
+
+  /// The power orchestrator `SetPower` and the power keys go through.
   late final PowerOrchestrator power;
 
   final Map<String, _DeviceEntry> _devices = {};
@@ -414,7 +441,12 @@ final class Engine implements WatchmeEngine {
       subscription = provider
           .scan(window, serviceTypes: serviceTypes)
           .listen(
-            into.add,
+            (hit) {
+              // Providers drop off-LAN senders themselves; this keeps a
+              // provider that does not from steering a probe, or moving a
+              // known device, to an address the policy refuses.
+              if (!_refused(hit.host)) into.add(hit);
+            },
             onError: (Object _) {
               // One provider's failure must not stop the others; the hits
               // it already yielded still count.
@@ -489,6 +521,7 @@ final class Engine implements WatchmeEngine {
     if (address.isEmpty) {
       throw const WatchmeError.unsupported('No host was given');
     }
+    _checkManualHost(address);
     final drivers = _enabledDrivers;
     if (drivers.isEmpty) {
       throw const WatchmeError.unsupported(
@@ -518,8 +551,58 @@ final class Engine implements WatchmeEngine {
     return _viewOf(entry);
   }
 
+  /// Every label decimal or `0x` hex: a numeric shorthand (`127.1`,
+  /// `0x7f.0.0.1`, `2130706433`, `010.0.0.1`) that resolvers read as an
+  /// address, though it is no IP literal [classifyHostAddress] accepts.
+  static final RegExp _numericHost = RegExp(
+    r'^(?:0x[0-9a-f]*|[0-9]+)(?:\.(?:0x[0-9a-f]*|[0-9]+))*\.?$',
+    caseSensitive: false,
+  );
+
+  /// A DNS host name: letters, digits and inner hyphens per label.
+  static final RegExp _hostName = RegExp(
+    r'^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?'
+    r'(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*\.?$',
+    caseSensitive: false,
+  );
+
+  /// Refuses a manually entered [host] before any driver runs, with a clear
+  /// error: an IP literal outside [destinationPolicy], a numeric shorthand
+  /// (resolvers turn it into an address this check never saw), or text that
+  /// is neither an IP literal nor a host name. A host name is left to the
+  /// network stack, which resolves it, checks every address it resolves to
+  /// and connects to the checked one.
+  void _checkManualHost(String host) {
+    if (classifyHostAddress(host) != HostAddressClass.invalid) {
+      destinationPolicy.check(host);
+      return;
+    }
+    if (_numericHost.hasMatch(host)) {
+      throw WatchmeError.destinationRefused(
+        'Refused to contact $host: it is not a complete IP address. Write '
+        'an IPv4 address as four decimal numbers, e.g. 192.168.1.20.',
+      );
+    }
+    if (!_hostName.hasMatch(host)) {
+      throw WatchmeError.unsupported(
+        '"$host" is not an IP address or host name',
+      );
+    }
+  }
+
+  /// Whether [host] is an IP literal [destinationPolicy] refuses. Host
+  /// names are not: the network stack checks what they resolve to.
+  bool _refused(String host) =>
+      classifyHostAddress(host) != HostAddressClass.invalid &&
+      !destinationPolicy.allows(host);
+
   WatchmeError _noMatch(String host, List<_Probe> probes) {
     final errors = [for (final p in probes) ?p.result.error];
+    // The network stack refused what a host name resolved to (off the LAN,
+    // say): no driver could have reached it, and that is the explanation.
+    for (final e in errors) {
+      if (e.code == WatchmeErrorCode.destinationRefused) return e;
+    }
     if (errors.isNotEmpty &&
         errors.every(
           (e) =>
@@ -722,6 +805,12 @@ final class Engine implements WatchmeEngine {
         return state.power;
       } on WatchmeError catch (error) {
         _noteFailure(e, slot, error);
+        if (error.code == WatchmeErrorCode.unreachable) {
+          // Nothing answered at all: whatever the session last saw (a Fire
+          // TV it believes on, say) no longer holds. Drop it as if it had
+          // reported the loss itself; recovery is passive.
+          _sessionDropped(e, slot, session, error);
+        }
       } on Object catch (error) {
         _noteFailure(
           e,
@@ -859,7 +948,8 @@ final class Engine implements WatchmeEngine {
       ..reconnectAttempts = 0;
     _resetSession(e, slot);
     try {
-      await _ensureConnected(e, slot);
+      // Pairing already woke the device, at the user's request.
+      await _ensureConnected(e, slot, allowWake: true);
     } on WatchmeError {
       // Pairing succeeded; the connect failure shows in the driver view.
     }
@@ -879,8 +969,16 @@ final class Engine implements WatchmeEngine {
       if (entry == null) {
         return Failed(WatchmeError.internal('Unknown device: $deviceId'));
       }
-      if (command case SetPower(:final on)) {
-        return await power.setPower(_EnginePowerTarget(this, entry), on);
+      if (command case SetPower(:final on, :final userConfirmed)) {
+        return await power.setPower(
+          _EnginePowerTarget(this, entry),
+          on,
+          userConfirmed: userConfirmed,
+        );
+      }
+      if (command case PressKey(:final key, :final action)
+          when _powerKeys.contains(key)) {
+        return await _pressPowerKey(entry, key, action);
       }
       final before = _clock.now();
       if (command is SetVolume && _knownVolume(entry) == null) {
@@ -893,15 +991,47 @@ final class Engine implements WatchmeEngine {
         (route, c) => _executeOn(entry, route, c),
         knownVolume: known,
       );
-      if (routed.via case final via? when routed.result.delivered) {
+      final result = routed.result;
+      if (routed.via case final via? when result.delivered) {
         _inferVolume(entry, command, via, known, before);
+      } else if (mayHaveActed(result) && routed.steps.isNotEmpty) {
+        _markUncertain(entry, command, routed.steps.last.driverId);
       }
-      return routed.result;
+      return result;
     } on Object catch (error) {
       return Failed(
         WatchmeError.internal('The engine failed: $error', cause: error),
       );
     }
+  }
+
+  static const Set<RemoteKey> _powerKeys = {
+    RemoteKey.power,
+    RemoteKey.powerOn,
+    RemoteKey.powerOff,
+  };
+
+  /// A power key goes to the power orchestrator, never to a session as a
+  /// key press: a driver may map any of them to a toggle. The power key is
+  /// a toggle intent; the discrete keys are `SetPower`. Holding one makes
+  /// no sense and is refused.
+  Future<CommandResult> _pressPowerKey(
+    _DeviceEntry e,
+    RemoteKey key,
+    KeyAction action,
+  ) async {
+    if (action != KeyAction.click) {
+      return Unsupported(
+        'The ${key.name} key can only be pressed, not held: holding a '
+        'power key would toggle the TV an unknown number of times',
+      );
+    }
+    final target = _EnginePowerTarget(this, e);
+    return switch (key) {
+      RemoteKey.powerOn => power.setPower(target, true),
+      RemoteKey.powerOff => power.setPower(target, false),
+      _ => power.pressPowerKey(target),
+    };
   }
 
   List<RouteCandidate> _candidates(
@@ -977,7 +1107,11 @@ final class Engine implements WatchmeEngine {
     }
     final DriverSession session;
     try {
-      session = await _ensureConnected(e, slot);
+      session = await _ensureConnected(
+        e,
+        slot,
+        allowWake: _mayWakeFor(route, command),
+      );
     } on WatchmeError catch (error) {
       return RouteAttempt(Failed(error), commandSent: false);
     }
@@ -1002,15 +1136,41 @@ final class Engine implements WatchmeEngine {
     return RouteAttempt(result);
   }
 
+  /// Whether connecting to run [command] on [route] may wake the device.
+  ///
+  /// Most commands reaching here were sent by the user, so most may: a key
+  /// press on a sleeping Fire TV means "wake up". The exceptions:
+  ///
+  /// * Power commands. Waking a device to turn it off would switch the TV
+  ///   on over HDMI-CEC for nothing, and waking it before a toggle would
+  ///   leave the toggle to switch it straight back off.
+  /// * The end of a hold (`PressKey(key, KeyAction.up)`). Apps send it on
+  ///   their own when they stop getting the key-up (focus loss, the app
+  ///   going to the background, the screen closing), and a sleeping device
+  ///   repeats no key, so there is nothing to wake it for.
+  static bool _mayWakeFor(RouteCandidate route, Command command) =>
+      switch (command) {
+        PressKey(action: KeyAction.up) => false,
+        _ => switch (command.capability) {
+          Capability.powerOn || Capability.powerOff =>
+            command is SetPower &&
+                command.on &&
+                !route.support.has(CapFlag.toggleOnly),
+          _ => true,
+        },
+      };
+
   /// Connects the sessions a `SetVolume` may have to step through, so a
   /// level they report is known before the steps are computed. They would
-  /// be connected to run the command anyway.
+  /// be connected to run the command anyway. These connects only read, so
+  /// they may not wake the device; the route itself connects with waking
+  /// allowed when it is tried.
   Future<void> _connectRelativeVolume(_DeviceEntry e) => Future.wait([
     for (final slot in e.slots)
       if (slot.supportFor(Capability.volume) case final s
           when s.usable && s.has(CapFlag.relativeOnly))
         if (!slot.needsPairing)
-          _ensureConnected(e, slot).then<void>(
+          _ensureConnected(e, slot, allowWake: false).then<void>(
             (_) {},
             onError: (Object _) {
               // The route reports the failure when it is tried.
@@ -1052,10 +1212,69 @@ final class Engine implements WatchmeEngine {
       _ => null,
     };
     if (level == null) return;
+    // The command just delivered sets the level, whatever came before.
+    e.volumeUncertainSince = null;
     _applyState(
       e,
       DeviceState(volume: Observed.inferred(level, via.driverId, _clock.now())),
       via.driverId,
+    );
+  }
+
+  /// [command] failed in a way that may still have changed the device (a
+  /// partial delivery, a timeout): what watchme knew about the state it
+  /// changes no longer holds. Marks it stale, whichever source reported it,
+  /// so nothing is computed from it (a `SetVolume` stepped from it, say)
+  /// until a source reports it again with an observation made after now.
+  ///
+  /// A re-report of an older observation does not count: a session's
+  /// refresh may return the state it cached before the command, at its old
+  /// time, and [DeviceState.merge] would prefer that live observation over
+  /// the stale one made at the same instant (see [_withoutOutdated]).
+  void _markUncertain(_DeviceEntry e, Command command, String driverId) {
+    final s = e.state;
+    final now = _clock.now();
+    final DeviceState next;
+    switch (command) {
+      case SetVolume() ||
+          StepVolume() ||
+          PressKey(key: RemoteKey.volumeUp || RemoteKey.volumeDown):
+        e.volumeUncertainSince = now;
+        next = s.copyWith(volume: s.volume?.asStale());
+      case SetMute() || PressKey(key: RemoteKey.mute):
+        e.mutedUncertainSince = now;
+        next = s.copyWith(muted: s.muted?.asStale());
+      default:
+        return;
+    }
+    _setState(e, next, driverId);
+  }
+
+  /// [diff] without the volume or mute observations made no later than a
+  /// command that may have changed them unseen ([_markUncertain]): they
+  /// describe the device before that command. A newer observation is kept
+  /// and ends the uncertainty.
+  static DeviceState _withoutOutdated(_DeviceEntry e, DeviceState diff) {
+    final volumeSince = e.volumeUncertainSince;
+    final mutedSince = e.mutedUncertainSince;
+    if (volumeSince == null && mutedSince == null) return diff;
+    bool outdated<T>(Observed<T>? o, DateTime? since) =>
+        o != null && since != null && !o.at.isAfter(since);
+    final volume = diff.volume;
+    final muted = diff.muted;
+    final dropVolume = outdated(volume, volumeSince);
+    final dropMuted = outdated(muted, mutedSince);
+    if (volume != null && !dropVolume) e.volumeUncertainSince = null;
+    if (muted != null && !dropMuted) e.mutedUncertainSince = null;
+    if (!dropVolume && !dropMuted) return diff;
+    return DeviceState(
+      power: diff.power,
+      volume: dropVolume ? null : volume,
+      muted: dropMuted ? null : muted,
+      input: diff.input,
+      foregroundApp: diff.foregroundApp,
+      nowPlaying: diff.nowPlaying,
+      connections: diff.connections,
     );
   }
 
@@ -1067,42 +1286,66 @@ final class Engine implements WatchmeEngine {
     'The connection was superseded',
   );
 
-  /// The slot's session, connecting first if needed. A connect superseded
-  /// by a reset (e.g. the device moved to a new address) is retried once,
-  /// so the command that asked for it is not failed for nothing.
+  /// The slot's session, connecting first if needed. [allowWake] is passed
+  /// to [Driver.connect]: only a command the user sent may wake the device.
+  ///
+  /// A connect superseded by a reset (e.g. the device moved to a new
+  /// address) is retried once, so the command that asked for it is not
+  /// failed for nothing. So is a passive connect this call joined (a
+  /// background reconnect) that found the device asleep, when this call
+  /// may wake it.
   Future<DriverSession> _ensureConnected(
     _DeviceEntry e,
-    _DriverSlot slot,
-  ) async {
+    _DriverSlot slot, {
+    required bool allowWake,
+  }) async {
+    final joinsPassive =
+        allowWake &&
+        slot.session == null &&
+        slot.connecting != null &&
+        !slot.connectingMayWake;
     try {
-      return await _ensureConnectedOnce(e, slot);
+      return await _ensureConnectedOnce(e, slot, allowWake: allowWake);
     } on WatchmeError catch (error) {
-      if (!identical(error, _superseded) ||
+      final retry =
+          identical(error, _superseded) ||
+          (joinsPassive && error.code == WatchmeErrorCode.unreachable);
+      if (!retry ||
           _closed ||
           e.forgotten ||
           slot.reauthInvalid ||
           !identical(e.slot(slot.driverId), slot)) {
         rethrow;
       }
-      return _ensureConnectedOnce(e, slot);
+      return _ensureConnectedOnce(e, slot, allowWake: allowWake);
     }
   }
 
-  Future<DriverSession> _ensureConnectedOnce(_DeviceEntry e, _DriverSlot slot) {
+  Future<DriverSession> _ensureConnectedOnce(
+    _DeviceEntry e,
+    _DriverSlot slot, {
+    required bool allowWake,
+  }) {
     if (_closed) return Future.error(_superseded);
     final session = slot.session;
     if (session != null) return Future.value(session);
     final pending = slot.connecting;
     if (pending != null) return pending;
     late final Future<DriverSession> attempt;
-    attempt = _connect(e, slot).whenComplete(() {
+    attempt = _connect(e, slot, allowWake: allowWake).whenComplete(() {
       if (identical(slot.connecting, attempt)) slot.connecting = null;
     });
-    slot.connecting = attempt;
+    slot
+      ..connecting = attempt
+      ..connectingMayWake = allowWake;
     return attempt;
   }
 
-  Future<DriverSession> _connect(_DeviceEntry e, _DriverSlot slot) async {
+  Future<DriverSession> _connect(
+    _DeviceEntry e,
+    _DriverSlot slot, {
+    required bool allowWake,
+  }) async {
     slot.cancelReconnect();
     final generation = slot.generation;
     bool current() => generation == slot.generation && !e.forgotten && !_closed;
@@ -1120,8 +1363,12 @@ final class Engine implements WatchmeEngine {
     try {
       final session = await withClockTimeout(
         Future.sync(
-          () =>
-              slot.driver.connect(e.endpointFor(slot), _transports, credential),
+          () => slot.driver.connect(
+            e.endpointFor(slot),
+            _transports,
+            credential,
+            allowWake: allowWake,
+          ),
         ),
         config.connectTimeout,
         _clock,
@@ -1257,7 +1504,10 @@ final class Engine implements WatchmeEngine {
       if (_closed || e.forgotten) return;
       if (slot.session != null || slot.connecting != null) return;
       if (_reconnectBlocked(e)) return;
-      _ensureConnected(e, slot).then<void>(
+      // Passive: nobody asked for this connect, so it must not wake the
+      // device. A device asleep fails fast as unreachable and is retried
+      // with backoff; the next user command connects with waking allowed.
+      _ensureConnected(e, slot, allowWake: false).then<void>(
         (_) {},
         onError: (Object error) {
           final retry =
@@ -1265,7 +1515,8 @@ final class Engine implements WatchmeEngine {
               error.code != WatchmeErrorCode.cancelled &&
               error.code != WatchmeErrorCode.unauthorized &&
               error.code != WatchmeErrorCode.reauthRequired &&
-              error.code != WatchmeErrorCode.unsupported;
+              error.code != WatchmeErrorCode.unsupported &&
+              error.code != WatchmeErrorCode.destinationRefused;
           if (retry) _scheduleReconnect(e, slot);
         },
       );
@@ -1466,12 +1717,44 @@ final class Engine implements WatchmeEngine {
   }
 
   void _applyState(_DeviceEntry e, DeviceState diff, String driverId) {
+    final fresh = _withoutOutdated(e, diff);
+    _setState(e, _believeStale(e.state.merge(fresh), fresh), driverId);
+  }
+
+  void _setState(_DeviceEntry e, DeviceState next, String driverId) {
     final previous = e.state;
-    e.state = previous.merge(diff);
-    final changes = e.state.changesSince(previous);
+    e.state = next;
+    final changes = next.changesSince(previous);
     if (changes.isEmpty) return;
     e.emit(StateChanged(changes, driverId: driverId));
     _emitDevices();
+  }
+
+  /// [merged] with each observation [diff] reports stale marked stale too,
+  /// when the same source made it and it is not newer than the report.
+  ///
+  /// [DeviceState.merge] keeps a live observation over a stale one made at
+  /// the same instant, but a source that says its own observation went
+  /// stale (the device stopped answering) must be believed.
+  static DeviceState _believeStale(DeviceState merged, DeviceState diff) {
+    Observed<T>? check<T>(Observed<T>? current, Observed<T>? report) =>
+        current != null &&
+            report != null &&
+            report.confidence == Confidence.stale &&
+            current.confidence != Confidence.stale &&
+            current.source == report.source &&
+            !current.at.isAfter(report.at)
+        ? current.asStale()
+        : current;
+    return DeviceState(
+      power: check(merged.power, diff.power),
+      volume: check(merged.volume, diff.volume),
+      muted: check(merged.muted, diff.muted),
+      input: check(merged.input, diff.input),
+      foregroundApp: check(merged.foregroundApp, diff.foregroundApp),
+      nowPlaying: check(merged.nowPlaying, diff.nowPlaying),
+      connections: merged.connections,
+    );
   }
 
   static bool _isTransportError(WatchmeError? error) =>

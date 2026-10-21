@@ -23,6 +23,7 @@ export 'src/discovery/ssdp_notify_listener.dart';
 export 'src/discovery/upnp_description.dart';
 export 'src/io_transports.dart';
 export 'src/local_network.dart';
+export 'src/network/destinations.dart' show HostLookup;
 export 'src/network/io_network_stack.dart'
     show IoNetworkStack, isLanAddress, isPrivateLanAddress;
 export 'src/process/io_process_runner.dart';

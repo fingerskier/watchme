@@ -5,6 +5,7 @@ import 'package:meta/meta.dart';
 
 import '../errors.dart';
 import '../util/equality.dart';
+import 'destination.dart';
 import 'tls.dart';
 
 /// IP networking as seen by drivers and discovery providers.
@@ -15,12 +16,24 @@ import 'tls.dart';
 /// Error contract: transport-level failures throw [WatchmeError] with
 /// [WatchmeErrorCode.unreachable] (refused, no route, DNS: nothing was
 /// delivered, so a caller may safely retry or fall back),
-/// [WatchmeErrorCode.timeout] (connected but no answer in time, or the
-/// connection was lost after it was made: the request may have been
+/// [WatchmeErrorCode.destinationRefused] (the host, or an address it
+/// resolved to, is outside the stack's `DestinationPolicy`: nothing was
+/// sent), [WatchmeErrorCode.timeout] (connected but no answer in time, or
+/// the connection was lost after it was made: the request may have been
 /// delivered), or [WatchmeErrorCode.protocol] (TLS failure, including a pin
 /// mismatch, or a malformed or oversized answer).
 /// HTTP error statuses are *not* exceptions: [http] returns them as an
 /// [HttpResult] and the driver decides what they mean.
+///
+/// These codes describe one call. A driver that makes several calls for one
+/// command reports [WatchmeErrorCode.partiallyDelivered] once any of them
+/// was delivered.
+///
+/// LAN-only: a native stack checks every unicast destination ([http],
+/// [webSocket], [tcp], and [sendDatagram] without `broadcast`) against its
+/// [DestinationPolicy], resolving host names itself and connecting to the
+/// checked address. Multicast queries and broadcast datagrams on LAN
+/// interfaces are allowed.
 abstract interface class NetworkStack {
   /// Performs one HTTP(S) request.
   ///

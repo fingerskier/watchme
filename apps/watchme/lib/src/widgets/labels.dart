@@ -21,7 +21,10 @@ String connectionLabel(ConnectionState state) => switch (state) {
 /// A short headline for an error code, used above the error's own message.
 String errorCodeLabel(WatchmeErrorCode code) => switch (code) {
   WatchmeErrorCode.unreachable => "Couldn't reach the TV",
+  WatchmeErrorCode.destinationRefused => 'Not a local network address',
   WatchmeErrorCode.timeout => 'The TV did not answer in time',
+  WatchmeErrorCode.partiallyDelivered =>
+    'Only part of the command reached the TV',
   WatchmeErrorCode.unauthorized => 'The TV did not accept watchme',
   WatchmeErrorCode.reauthRequired => 'Pair again',
   WatchmeErrorCode.rejected => 'The TV refused',

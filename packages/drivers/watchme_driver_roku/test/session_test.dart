@@ -47,6 +47,17 @@ void main() {
       }
     });
 
+    test('the Power toggle cannot be held', () async {
+      for (final action in [KeyAction.down, KeyAction.up]) {
+        final (result, posts) = await run(PressKey(RemoteKey.power, action));
+        expect(result, isUnsupported(contains('toggle')), reason: '$action');
+        expect(posts, isEmpty);
+      }
+      expect((await run(const PressKey(RemoteKey.power))).$2, [
+        '/keypress/Power',
+      ]);
+    });
+
     test('keydown and keyup', () async {
       final (down, downPosts) = await run(
         const PressKey(RemoteKey.right, KeyAction.down),
@@ -138,6 +149,9 @@ void main() {
       },
     );
 
+    // Was `cancelled`: with two characters typed, the core contract (Codex
+    // finding #4) makes the failure a partial delivery, with the
+    // cancellation as its cause.
     test('closing the session stops a typing run', () async {
       final gate = Completer<void>();
       var sent = 0;
@@ -151,8 +165,34 @@ void main() {
       }
       await session.close();
       gate.complete();
-      expect(await typing, isFailedWith(WatchmeErrorCode.cancelled));
+      final failed = await typing;
+      expect(failed, isFailedWith(WatchmeErrorCode.partiallyDelivered));
+      expect(
+        (failed as Failed).error.cause,
+        isWatchmeError(WatchmeErrorCode.cancelled),
+      );
       expect(sent, 2);
+    });
+
+    test('a refusal after the backspaces is a partial delivery', () async {
+      roku.net.respond(
+        'POST',
+        RegExp(r'^/keypress/Lit_'),
+        HttpResult.text(403, limitedBody),
+      );
+      final (result, posts) = await run(const TypeText('hi', replace: true));
+      expect(result, isFailedWith(WatchmeErrorCode.partiallyDelivered));
+      expect(
+        (result as Failed).error.cause,
+        isWatchmeError(WatchmeErrorCode.rejected),
+      );
+      expect(result.error.rawDeviceMessage, limitedBody);
+      expect(posts, [
+        '/keypress/Backspace',
+        '/keypress/Backspace',
+        '/keypress/Backspace',
+        '/keypress/Lit_h',
+      ]);
     });
 
     test('empty text sends nothing', () async {
@@ -293,6 +333,74 @@ void main() {
       ]);
       expect((await run(const StepVolume(0))).$2, isEmpty);
       expect((await run(const StepVolume(500))).$1, isUnsupported());
+    });
+
+    test('StepVolume closed mid-way: first answer paused, session closed, '
+        'answer released', () async {
+      final reached = Completer<void>();
+      final release = Completer<void>();
+      var presses = 0;
+      roku.net.onHttp('POST', '/keypress/VolumeUp', (_) async {
+        if (++presses == 1) {
+          reached.complete();
+          await release.future;
+        }
+        return HttpResult(200);
+      });
+      final result = session.execute(const StepVolume(3));
+      await reached.future;
+      await session.close();
+      release.complete();
+      final failed = await result;
+      expect(presses, 1, reason: 'steps 2 and 3 never sent');
+      expect(failed, isFailedWith(WatchmeErrorCode.partiallyDelivered));
+      expect(
+        (failed as Failed).error.cause,
+        isWatchmeError(WatchmeErrorCode.cancelled),
+      );
+    });
+
+    test('StepVolume failing at step 2 is a partial delivery', () async {
+      var presses = 0;
+      roku.net.onHttp(
+        'POST',
+        '/keypress/VolumeDown',
+        (_) => ++presses == 2 ? HttpResult.text(500, 'boom') : HttpResult(200),
+      );
+      final (result, posts) = await run(const StepVolume(-3));
+      expect(
+        result,
+        isFailedWith(
+          WatchmeErrorCode.partiallyDelivered,
+          rawDeviceMessage: 'boom',
+          message: contains('1 of its requests'),
+        ),
+      );
+      expect(posts, hasLength(2));
+      expect(result.partiallyDelivered, isTrue);
+    });
+
+    test('a Roku that vanishes after a step is a partial delivery, never '
+        'unreachable', () async {
+      var presses = 0;
+      roku.net.onHttp('POST', '/keypress/VolumeUp', (_) {
+        if (++presses == 1) roku.net.setUnreachable(roku.host);
+        return HttpResult(200);
+      });
+      final (result, _) = await run(const StepVolume(3));
+      expect(result, isFailedWith(WatchmeErrorCode.partiallyDelivered));
+      expect(
+        (result as Failed).error.cause,
+        isWatchmeError(WatchmeErrorCode.unreachable),
+      );
+    });
+
+    test('a first step that reaches nothing stays unreachable', () async {
+      roku.net.setUnreachable(roku.host);
+      expect(
+        (await run(const StepVolume(3))).$1,
+        isFailedWith(WatchmeErrorCode.unreachable),
+      );
     });
 
     test('SetMute toggles only', () async {

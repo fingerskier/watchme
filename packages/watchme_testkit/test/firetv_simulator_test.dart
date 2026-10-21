@@ -438,6 +438,61 @@ void main() {
     });
   });
 
+  test('holdNext handles the request at once but holds its answer', () async {
+    final gate = sim.holdNext('POST', '/apps/FireTVRemote');
+    expect(gate.isReached, isFalse);
+    var answered = false;
+    final waking = client.wake().then((reply) {
+      answered = true;
+      return reply;
+    });
+    final request = await gate.reached;
+    expect(request.server, FireTvSimServer.dial);
+    expect(sim.awake, isTrue, reason: 'the wake happened');
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    expect(answered, isFalse, reason: 'its answer is held');
+    gate.release();
+    expect((await waking).$1, 201);
+    // One request only: the next wake is answered at once.
+    expect((await client.wake()).$1, 201);
+  });
+
+  test('holdNext can wait for one action only', () async {
+    final token = await client.pair();
+    final gate = sim.holdNext('POST', '/v1/FireTV', action: 'volume_up');
+    expect(
+      (await client.api('POST', '/v1/FireTV?action=home', token: token)).$1,
+      200,
+    );
+    expect(gate.isReached, isFalse);
+    final up = client.api('POST', '/v1/FireTV?action=volume_up', token: token);
+    await gate.reached;
+    expect(sim.volumeSteps, 1);
+    gate.release();
+    expect((await up).$1, 200);
+  });
+
+  test('vanish refuses both servers until reappear', () async {
+    await client.wake();
+    await sim.vanish();
+    expect(sim.vanished, isTrue);
+    expect(sim.awake, isFalse);
+    final fresh = _Client(sim);
+    addTearDown(fresh.close);
+    await expectLater(fresh.wake(), throwsA(isA<IOException>()));
+    await expectLater(
+      fresh.api('GET', '/v1/FireTV/status'),
+      throwsA(isA<IOException>()),
+    );
+    await sim.wake();
+    expect(sim.awake, isFalse, reason: 'gone until it reappears');
+    await sim.reappear();
+    expect(sim.vanished, isFalse);
+    expect(sim.awake, isFalse, reason: 'back asleep');
+    expect((await fresh.wake()).$1, 201);
+    expect(sim.awake, isTrue);
+  });
+
   test('starts awake when asked and validates a fixed PIN', () async {
     final awake = await FireTvSimulator.start(awake: true, pin: '1234');
     addTearDown(awake.close);

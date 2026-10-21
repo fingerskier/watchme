@@ -7,11 +7,37 @@ import 'util/json.dart';
 enum WatchmeErrorCode {
   /// Nothing answered: connection refused, no route, DNS failure, port closed.
   /// Nothing reached the device, so retrying or falling back is safe.
+  ///
+  /// It strictly means nothing was delivered. A command made of several
+  /// requests reports it only when none of them reached the device; once
+  /// one did, the failure is [partiallyDelivered].
   unreachable,
+
+  /// watchme refused to contact the address because it is not on the local
+  /// network under the active `DestinationPolicy`: a public, shared
+  /// (100.64.0.0/10, carrier-grade NAT and overlay VPNs), reserved,
+  /// multicast, broadcast or unspecified address, or loopback when the
+  /// policy does not allow it. A host name is refused when any address it
+  /// resolves to is.
+  ///
+  /// Nothing was sent, so falling back to another route is safe. The
+  /// refusal is deterministic: retrying or reconnecting does not help.
+  destinationRefused,
 
   /// The peer accepted the connection but did not answer in time, or the
   /// connection was lost after it was made. The device may have acted.
   timeout,
+
+  /// A command made of several requests (volume steps, key presses, typed
+  /// characters) delivered at least one of them and then failed, whatever
+  /// the reason for the later failure.
+  ///
+  /// Some side effects happened, so the device state is uncertain. Never
+  /// retry, replay or fall back to another route: that would repeat the
+  /// part that was delivered. The engine marks the affected state (e.g.
+  /// volume) stale or refreshes it. The message says how far the command
+  /// got, and [WatchmeError.cause] holds the underlying failure.
+  partiallyDelivered,
 
   /// The device refused us for lack of credentials (no token yet, wrong PIN).
   unauthorized,
@@ -65,9 +91,24 @@ final class WatchmeError implements Exception {
     this.cause,
   }) : code = WatchmeErrorCode.unreachable;
 
+  /// Creates a [WatchmeErrorCode.destinationRefused] error.
+  const WatchmeError.destinationRefused(
+    this.message, {
+    this.rawDeviceMessage,
+    this.cause,
+  }) : code = WatchmeErrorCode.destinationRefused;
+
   /// Creates a [WatchmeErrorCode.timeout] error.
   const WatchmeError.timeout(this.message, {this.rawDeviceMessage, this.cause})
     : code = WatchmeErrorCode.timeout;
+
+  /// Creates a [WatchmeErrorCode.partiallyDelivered] error. Put the failure
+  /// that stopped the command in [cause].
+  const WatchmeError.partiallyDelivered(
+    this.message, {
+    this.rawDeviceMessage,
+    this.cause,
+  }) : code = WatchmeErrorCode.partiallyDelivered;
 
   /// Creates a [WatchmeErrorCode.unauthorized] error.
   const WatchmeError.unauthorized(

@@ -356,6 +356,23 @@ void main() {
       );
     });
 
+    test('allowWake: false reads state only, as every connect does', () async {
+      final roku = FakeRoku();
+      final session = await driver.connect(
+        roku.endpoint,
+        roku.transports,
+        null,
+        allowWake: false,
+      );
+      addTearDown(session.close);
+      expect(roku.posts, isEmpty);
+      expect(roku.log, [
+        'GET /query/device-info',
+        'GET /query/active-app',
+        'GET /query/media-player',
+      ]);
+    });
+
     test('throws unreachable when nothing answers', () async {
       final t = FakeTransports()..net.setUnreachable('192.0.2.10');
       await expectLater(

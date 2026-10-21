@@ -7,6 +7,7 @@ import 'package:watchme_core/watchme_core.dart';
 import 'package:watchme_io/watchme_io.dart';
 import 'package:watchme_testkit/watchme_testkit.dart';
 
+import '../support/policies.dart';
 import '../support/tls_fixtures.dart';
 
 void main() {
@@ -59,39 +60,44 @@ void main() {
     Uri caSignedUri() => Uri.parse('https://127.0.0.1:${caSigned.port}/');
 
     // A stack that trusts the test CA, standing in for a platform root.
-    IoNetworkStack trustingCa() =>
-        IoNetworkStack(extraTrustedRootsPem: utf8.encode(TlsFixtures.caPem));
+    IoNetworkStack trustingCa() => IoNetworkStack(
+      destinationPolicy: loopbackAllowed,
+      extraTrustedRootsPem: utf8.encode(TlsFixtures.caPem),
+    );
 
     test('the default policy rejects a self-signed certificate', () async {
       await expectLater(
-        IoNetworkStack().http(HttpCall.get(selfSignedUri())),
+        IoNetworkStack(destinationPolicy: loopbackAllowed)
+            .http(HttpCall.get(selfSignedUri())),
         throwsWatchmeError(WatchmeErrorCode.protocol),
       );
       expect(selfSignedHits, 0);
     });
 
     test('allowSelfSigned accepts it and reports the fingerprint', () async {
-      final result = await IoNetworkStack().http(
-        HttpCall.get(selfSignedUri()),
-        tls: const TlsPolicy(allowSelfSigned: true),
-      );
+      final result = await IoNetworkStack(destinationPolicy: loopbackAllowed)
+          .http(
+            HttpCall.get(selfSignedUri()),
+            tls: const TlsPolicy(allowSelfSigned: true),
+          );
       expect(result.status, 200);
       expect(result.text, 'self-signed');
       expect(result.peerCertificateSha256, selfSignedSha);
     });
 
     test('a matching pin accepts a self-signed certificate', () async {
-      final result = await IoNetworkStack().http(
-        HttpCall.get(selfSignedUri()),
-        tls: TlsPolicy.pinned([selfSignedSha.toUpperCase()]),
-      );
+      final result = await IoNetworkStack(destinationPolicy: loopbackAllowed)
+          .http(
+            HttpCall.get(selfSignedUri()),
+            tls: TlsPolicy.pinned([selfSignedSha.toUpperCase()]),
+          );
       expect(result.text, 'self-signed');
       expect(result.peerCertificateSha256, selfSignedSha);
     });
 
     test('a pin mismatch fails with protocol before any request', () async {
       await expectLater(
-        IoNetworkStack().http(
+        IoNetworkStack(destinationPolicy: loopbackAllowed).http(
           HttpCall.get(selfSignedUri()),
           tls: TlsPolicy.pinned([fakeFingerprint('another TV')]),
         ),
@@ -104,17 +110,16 @@ void main() {
     });
 
     test('trust-on-first-use accepts and reports the fingerprint', () async {
-      final result = await IoNetworkStack().http(
-        HttpCall.get(selfSignedUri()),
-        tls: const TlsPolicy.firstUse(),
-      );
+      final result = await IoNetworkStack(destinationPolicy: loopbackAllowed)
+          .http(HttpCall.get(selfSignedUri()), tls: const TlsPolicy.firstUse());
       expect(result.peerCertificateSha256, selfSignedSha);
 
       // The recorded fingerprint then pins the next connection.
-      final pinned = await IoNetworkStack().http(
-        HttpCall.get(selfSignedUri()),
-        tls: TlsPolicy.pinned([result.peerCertificateSha256!]),
-      );
+      final pinned = await IoNetworkStack(destinationPolicy: loopbackAllowed)
+          .http(
+            HttpCall.get(selfSignedUri()),
+            tls: TlsPolicy.pinned([result.peerCertificateSha256!]),
+          );
       expect(pinned.status, 200);
     });
 
@@ -142,7 +147,8 @@ void main() {
 
     test('an untrusted CA is rejected by the default policy', () async {
       await expectLater(
-        IoNetworkStack().http(HttpCall.get(caSignedUri())),
+        IoNetworkStack(destinationPolicy: loopbackAllowed)
+            .http(HttpCall.get(caSignedUri())),
         throwsWatchmeError(WatchmeErrorCode.protocol),
       );
     });
@@ -204,7 +210,7 @@ void main() {
               ..close();
           });
         });
-        final stack = IoNetworkStack();
+        final stack = IoNetworkStack(destinationPolicy: loopbackAllowed);
         final base = 'http://127.0.0.1:${server.port}';
 
         final post = await stack.http(
@@ -260,9 +266,12 @@ void main() {
           ..write('ECP command not allowed in Limited mode.')
           ..close();
       });
-      final result = await IoNetworkStack().http(
-        HttpCall.post(Uri.parse('http://127.0.0.1:${server.port}/keypress/Up')),
-      );
+      final result = await IoNetworkStack(destinationPolicy: loopbackAllowed)
+          .http(
+            HttpCall.post(
+              Uri.parse('http://127.0.0.1:${server.port}/keypress/Up'),
+            ),
+          );
       expect(result.status, 403);
       expect(result.ok, isFalse);
       expect(result.text, 'ECP command not allowed in Limited mode.');
@@ -281,9 +290,8 @@ void main() {
           ..headers.set('Location', '/elsewhere')
           ..close();
       });
-      final result = await IoNetworkStack().http(
-        HttpCall.get(Uri.parse('http://127.0.0.1:${server.port}/')),
-      );
+      final result = await IoNetworkStack(destinationPolicy: loopbackAllowed)
+          .http(HttpCall.get(Uri.parse('http://127.0.0.1:${server.port}/')));
       expect(result.status, 302);
       expect(result.header('location'), '/elsewhere');
       expect(hits, 1);
@@ -292,9 +300,8 @@ void main() {
     test('a refused connection is unreachable', () async {
       final port = await _closedPort();
       await expectLater(
-        IoNetworkStack().http(
-          HttpCall.get(Uri.parse('http://127.0.0.1:$port/')),
-        ),
+        IoNetworkStack(destinationPolicy: loopbackAllowed)
+            .http(HttpCall.get(Uri.parse('http://127.0.0.1:$port/'))),
         throwsWatchmeError(WatchmeErrorCode.unreachable),
       );
     });
@@ -311,7 +318,7 @@ void main() {
       });
       final stopwatch = Stopwatch()..start();
       await expectLater(
-        IoNetworkStack().http(
+        IoNetworkStack(destinationPolicy: loopbackAllowed).http(
           HttpCall.get(
             Uri.parse('http://127.0.0.1:${server.port}/'),
             timeout: const Duration(milliseconds: 300),
@@ -333,7 +340,7 @@ void main() {
         await server.close();
       });
       await expectLater(
-        IoNetworkStack().http(
+        IoNetworkStack(destinationPolicy: loopbackAllowed).http(
           HttpCall.get(
             Uri.parse('https://127.0.0.1:${server.port}/'),
             timeout: const Duration(milliseconds: 300),
@@ -353,8 +360,10 @@ void main() {
           ..close();
       });
       await expectLater(
-        IoNetworkStack(maxResponseBytes: 1024)
-            .http(HttpCall.get(Uri.parse('http://127.0.0.1:${server.port}/'))),
+        IoNetworkStack(
+          destinationPolicy: loopbackAllowed,
+          maxResponseBytes: 1024,
+        ).http(HttpCall.get(Uri.parse('http://127.0.0.1:${server.port}/'))),
         throwsWatchmeError(WatchmeErrorCode.protocol),
       );
     });
@@ -370,12 +379,12 @@ void main() {
       });
       final uri = Uri.parse('http://127.0.0.1:${server.port}/');
       await expectLater(
-        IoNetworkStack().http(HttpCall.get(uri, maxResponseBytes: 1024)),
+        IoNetworkStack(destinationPolicy: loopbackAllowed)
+            .http(HttpCall.get(uri, maxResponseBytes: 1024)),
         throwsWatchmeError(WatchmeErrorCode.protocol),
       );
-      final ok = await IoNetworkStack().http(
-        HttpCall.get(uri, maxResponseBytes: 8192),
-      );
+      final ok = await IoNetworkStack(destinationPolicy: loopbackAllowed)
+          .http(HttpCall.get(uri, maxResponseBytes: 8192));
       expect(ok.body, hasLength(4096));
     });
 
@@ -399,7 +408,7 @@ void main() {
       });
       final watch = Stopwatch()..start();
       await expectLater(
-        IoNetworkStack().http(
+        IoNetworkStack(destinationPolicy: loopbackAllowed).http(
           HttpCall.get(
             Uri.parse('http://127.0.0.1:${server.port}/'),
             maxResponseBytes: 512 * 1024,
@@ -422,9 +431,8 @@ void main() {
         });
       });
       await expectLater(
-        IoNetworkStack().http(
-          HttpCall.get(Uri.parse('http://127.0.0.1:${server.port}/')),
-        ),
+        IoNetworkStack(destinationPolicy: loopbackAllowed)
+            .http(HttpCall.get(Uri.parse('http://127.0.0.1:${server.port}/'))),
         throwsWatchmeError(WatchmeErrorCode.protocol),
       );
     });

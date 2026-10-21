@@ -26,7 +26,7 @@ void main() {
     ]);
     final h = Harness(drivers: [ir, cec]);
     addTearDown(h.close);
-    final id = await h.add('192.0.2.10');
+    final id = await h.add('10.0.2.10');
     cec.connectError = const WatchmeError.unreachable('adapter unplugged');
 
     expect(await h.engine.send(id, const SetMute(true)), isConfirmed);
@@ -45,7 +45,7 @@ void main() {
     final transports = FakeTransports();
     final h = Harness(drivers: [cloud, local], transports: transports);
     addTearDown(h.close);
-    final id = await h.add('192.0.2.10');
+    final id = await h.add('10.0.2.10');
 
     await h.engine.send(id, const SetMute(true));
     expect(cloud.executed, isEmpty);
@@ -69,7 +69,7 @@ void main() {
     atv.sessionState = DeviceState(
       volume: Observed.reported(20, 'androidtv.remote2', h.clock.now()),
     );
-    final id = await h.add('192.0.2.10');
+    final id = await h.add('10.0.2.10');
     await h.clock.advance(const Duration(minutes: 1));
 
     expect(await h.engine.send(id, const SetVolume(25)), isConfirmed);
@@ -83,13 +83,276 @@ void main() {
     expect(atv.executed.last, const StepVolume(-5));
   });
 
+  group('partial delivery', () {
+    const keysOnly = CapabilitySupport.yes(
+      Capability.volume,
+      flags: {CapFlag.relativeOnly},
+    );
+    const stepper = CapabilitySupport.partial(
+      Capability.volume,
+      flags: {CapFlag.relativeOnly},
+    );
+
+    test(
+      'SetVolume(13) from 10: one press lands, the route fails; the '
+      'command is not replayed elsewhere and the volume goes stale',
+      () async {
+        // Codex finding #4, reproduced through the engine.
+        var presses = 0;
+        final keys = FakeDriver(
+          'keys',
+          ceiling: const [keysOnly],
+          onProbe: (_) => matched(capabilities: const [keysOnly]),
+          onExecute: (c) => switch (c) {
+            StepVolume() => const Unsupported('no StepVolume'),
+            _ =>
+              ++presses == 1
+                  ? const Confirmed()
+                  : const Failed(WatchmeError.unreachable('refused')),
+          },
+        );
+        final steps = FakeDriver(
+          'steps',
+          ceiling: const [stepper],
+          onProbe: (_) => matched(capabilities: const [stepper]),
+        );
+        final h = Harness(drivers: [keys, steps]);
+        addTearDown(h.close);
+        keys.sessionState = DeviceState(
+          volume: Observed.reported(10, 'keys', h.clock.now()),
+        );
+        final id = await h.add('10.0.2.10');
+        final events = <DeviceEvent>[];
+        h.engine.events(id).listen(events.add);
+
+        expect(
+          await h.engine.send(id, const SetVolume(13)),
+          isFailedWith(
+            WatchmeErrorCode.partiallyDelivered,
+            message: contains('1 of 3'),
+          ),
+        );
+        expect(keys.executed, [
+          const StepVolume(3),
+          const PressKey(RemoteKey.volumeUp),
+          const PressKey(RemoteKey.volumeUp),
+        ]);
+        expect(steps.executed, isEmpty, reason: 'no replay on another route');
+        final volume = h.view(id).state.volume!;
+        expect(volume.value, 10);
+        expect(volume.confidence, Confidence.stale);
+        await pump();
+        expect(
+          events.whereType<StateChanged>().last.state.volume?.confidence,
+          Confidence.stale,
+        );
+
+        // Nothing is computed from the stale level.
+        expect(
+          await h.engine.send(id, const SetVolume(20)),
+          isUnsupported(contains('level is unknown')),
+        );
+        expect(steps.executed, isEmpty);
+      },
+    );
+
+    test('a session reporting partial delivery is not replayed, and its '
+        'volume goes stale', () async {
+      final a = FakeDriver(
+        'a',
+        ceiling: const [keysOnly],
+        onProbe: (_) => matched(capabilities: const [keysOnly]),
+        onExecute: (_) => const Failed(
+          WatchmeError.partiallyDelivered('stepped 2 of 4 times'),
+        ),
+      );
+      final b = FakeDriver(
+        'b',
+        ceiling: const [stepper],
+        onProbe: (_) => matched(capabilities: const [stepper]),
+      );
+      final h = Harness(drivers: [a, b]);
+      addTearDown(h.close);
+      a.sessionState = DeviceState(
+        volume: Observed.reported(30, 'a', h.clock.now()),
+      );
+      final id = await h.add('10.0.2.10');
+      expect(
+        await h.engine.send(id, const SetVolume(34)),
+        isFailedWith(WatchmeErrorCode.partiallyDelivered),
+      );
+      expect(b.executed, isEmpty);
+      expect(h.view(id).state.volume?.confidence, Confidence.stale);
+    });
+
+    group('the stale level is not revived by an old report', () {
+      // Verifier follow-up to Codex finding #4: a refresh that returned the
+      // level the session cached before the command made it "reported"
+      // again, and the next SetVolume replayed the steps from it.
+      const toggleOff = CapabilitySupport.yes(
+        Capability.powerOff,
+        flags: {CapFlag.toggleOnly},
+      );
+
+      /// A 'keys' route whose second press fails (the device ends at 11)
+      /// and whose session reports volume 10 from before the command, plus
+      /// a relative 'steps' route. Returns the device id after the partial
+      /// delivery.
+      Future<(Harness, String, FakeDriver)> partlyDelivered({
+        List<CapabilitySupport> extra = const [],
+      }) async {
+        var presses = 0;
+        final keys = FakeDriver(
+          'keys',
+          ceiling: [keysOnly, ...extra],
+          onProbe: (_) => matched(capabilities: [keysOnly, ...extra]),
+          onExecute: (c) => switch (c) {
+            StepVolume() => const Unsupported('no StepVolume'),
+            SetPower() => const Confirmed(),
+            _ =>
+              ++presses == 2
+                  ? const Failed(WatchmeError.unreachable('refused'))
+                  : const Confirmed(),
+          },
+        );
+        final steps = FakeDriver(
+          'steps',
+          ceiling: const [stepper],
+          onProbe: (_) => matched(capabilities: const [stepper]),
+        );
+        final h = Harness(drivers: [keys, steps]);
+        addTearDown(h.close);
+        keys.sessionState = DeviceState(
+          volume: Observed.reported(10, 'keys', h.clock.now()),
+        );
+        final id = await h.add('10.0.2.10');
+        expect(
+          await h.engine.send(id, const SetVolume(13)),
+          isFailedWith(WatchmeErrorCode.partiallyDelivered),
+        );
+        expect(h.view(id).state.volume?.confidence, Confidence.stale);
+        await h.clock.advance(const Duration(seconds: 1));
+        return (h, id, keys);
+      }
+
+      int ups(FakeDriver d) => d.executed
+          .where((c) => c == const PressKey(RemoteKey.volumeUp))
+          .length;
+
+      test('a refresh returning the cached level', () async {
+        final (h, id, keys) = await partlyDelivered();
+        await h.engine.refresh(id);
+        expect(keys.lastSession.refreshes, 1);
+        final volume = h.view(id).state.volume!;
+        expect(volume.value, 10);
+        expect(volume.confidence, Confidence.stale);
+
+        expect(
+          await h.engine.send(id, const SetVolume(13)),
+          isUnsupported(contains('level is unknown')),
+        );
+        expect(ups(keys), 2, reason: 'no more presses from the old level');
+      });
+
+      test(
+        'a power-key evidence read, which refreshes every session',
+        () async {
+          final (h, id, keys) = await partlyDelivered(extra: const [toggleOff]);
+          await h.engine.send(id, const PressKey(RemoteKey.power));
+          expect(keys.lastSession.refreshes, greaterThan(0));
+          expect(h.view(id).state.volume?.confidence, Confidence.stale);
+          expect(
+            await h.engine.send(id, const SetVolume(13)),
+            isUnsupported(contains('level is unknown')),
+          );
+          expect(ups(keys), 2);
+        },
+      );
+
+      test('a reconnect whose session starts from the cached level', () async {
+        final (h, id, keys) = await partlyDelivered();
+        keys.lastSession.emit(
+          const ConnectionChanged(
+            ConnectionState.disconnected,
+            driverId: 'keys',
+          ),
+        );
+        await h.clock.advance(const Duration(seconds: 2));
+        expect(keys.sessions, hasLength(2), reason: 'reconnected');
+        expect(h.view(id).state.volume?.confidence, Confidence.stale);
+      });
+
+      test('a report made after the failure is believed', () async {
+        final (h, id, keys) = await partlyDelivered();
+        keys.lastSession.report(
+          DeviceState(volume: Observed.reported(11, 'keys', h.clock.now())),
+        );
+        await pump();
+        final volume = h.view(id).state.volume!;
+        expect(volume.value, 11);
+        expect(volume.confidence, Confidence.reported);
+        // The old cached level does not replace it either.
+        await h.engine.refresh(id);
+        expect(h.view(id).state.volume?.value, 11);
+
+        await h.clock.advance(const Duration(seconds: 1));
+        expect(await h.engine.send(id, const SetVolume(13)), isConfirmed);
+        expect(ups(keys), 4, reason: 'two more presses, from 11');
+      });
+    });
+
+    test(
+      'a step that times out may have acted: the volume goes stale',
+      () async {
+        final roku = FakeDriver(
+          'roku.ecp',
+          ceiling: const [keysOnly],
+          onProbe: (_) => matched(capabilities: const [keysOnly]),
+          onExecute: (_) => const Failed(WatchmeError.timeout('no answer')),
+        );
+        final h = Harness(drivers: [roku]);
+        addTearDown(h.close);
+        roku.sessionState = DeviceState(
+          volume: Observed.reported(20, 'roku.ecp', h.clock.now()),
+        );
+        final id = await h.add('10.0.2.10');
+        expect(
+          await h.engine.send(id, const StepVolume(2)),
+          isFailedWith(WatchmeErrorCode.timeout),
+        );
+        expect(h.view(id).state.volume?.confidence, Confidence.stale);
+      },
+    );
+  });
+
+  test('connecting to read the level before a SetVolume never wakes the '
+      'device', () async {
+    final fire = FakeDriver(
+      'firetv.lightning',
+      ceiling: const [relativeVolume],
+      onProbe: (_) => matched(capabilities: const [relativeVolume]),
+    );
+    final h = Harness(drivers: [fire]);
+    addTearDown(h.close);
+    // Asleep: only a waking connect would get through.
+    fire.onConnect = (_, _) => fire.connects.last.allowWake
+        ? FakeSession('firetv.lightning', capabilities: const [relativeVolume])
+        : throw const WatchmeError.unreachable('API port closed');
+    final id = await h.add('10.0.2.10');
+    expect(
+      await h.engine.send(id, const SetVolume(25)),
+      isUnsupported(contains('level is unknown')),
+    );
+    expect(fire.connects.map((c) => c.allowWake), [false]);
+  });
+
   test(
     'SetVolume without a known level is Unsupported, and says why',
     () async {
       final roku = driver('roku.ecp', [relativeVolume]);
       final h = Harness(drivers: [roku]);
       addTearDown(h.close);
-      final id = await h.add('192.0.2.10');
+      final id = await h.add('10.0.2.10');
       expect(
         await h.engine.send(id, const SetVolume(30)),
         isUnsupported(contains('level is unknown')),
@@ -111,7 +374,7 @@ void main() {
     ]);
     final h = Harness(drivers: [roku, upnp]);
     addTearDown(h.close);
-    final id = await h.add('192.0.2.10');
+    final id = await h.add('10.0.2.10');
     final caps = h.engine.capabilitiesOf(id);
     expect(caps[Capability.volume], relativeVolume);
     expect(caps[Capability.screenshot]?.level, Support.no);
@@ -135,7 +398,7 @@ void main() {
       transports: FakeTransports(network: net),
     );
     addTearDown(h.close);
-    final id = await h.add('192.0.2.10');
+    final id = await h.add('10.0.2.10');
     expect(h.engine.capabilitiesOf(id)[Capability.powerOn], isNull);
   });
 
@@ -144,7 +407,7 @@ void main() {
       ..onExecute = (_) => throw StateError('driver bug');
     final h = Harness(drivers: [roku]);
     addTearDown(h.close);
-    final id = await h.add('192.0.2.10');
+    final id = await h.add('10.0.2.10');
     expect(
       await h.engine.send(id, const SetMute(null)),
       isFailedWith(WatchmeErrorCode.internal, message: contains('driver bug')),
@@ -179,7 +442,7 @@ void main() {
       ],
     );
     addTearDown(h.close);
-    final id = await h.add('192.0.2.10');
+    final id = await h.add('10.0.2.10');
     expect(await h.engine.send(id, const TakeScreenshot()), isUnsupported());
   });
 }

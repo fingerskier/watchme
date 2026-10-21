@@ -337,8 +337,15 @@ Target examples:
    - Samsung reads `/api/v2/` (`TokenAuthSupport`, `FrameTVSupport`, presence of `PowerState`).
    - Roku reads `device-info` and probes a gated endpoint for the body `ECP command not allowed in Limited mode`.
    - LG reads `hello` and `getSystemInfo`, then the registration result. With an unsigned key, `setSystemSettings` is marked unavailable.
-   - Fire TV reads `GET /v1/FireTV/status` on :8080 without a token (a 401 still proves the API). While the device sleeps :8080 does not listen, so the probe falls back to the DIAL application status, `GET /apps/FireTVRemote` on :8009, which reports state without launching anything. A discovery advertisement only identifies the device; if neither port answers, the probe fails as unreachable. The probe never wakes the device. The wake, `POST /apps/FireTVRemote` (expect 201), is sent only by pairing, by `connect()` before every session, and by a session whose command found :8080 closed (the stick fell asleep under it), which then resends the command once. `SetPower(false)` and `refresh()` never wake it.
+   - Fire TV reads `GET /v1/FireTV/status` on :8080 without a token (a 401 still proves the API). While the device sleeps :8080 does not listen, so the probe falls back to the DIAL application status, `GET /apps/FireTVRemote` on :8009, which reports state without launching anything. A discovery advertisement only identifies the device; if neither port answers, the probe fails as unreachable. The probe never wakes the device. The wake, `POST /apps/FireTVRemote` (expect 201), is sent only by pairing, by `connect(allowWake: true)` for a command the user sent, and by a session whose command found :8080 closed (the stick fell asleep under it), which then resends the command once. `connect(allowWake: false)` (background and engine-initiated reconnects) never sends it and fails fast as unreachable while :8080 is closed. `SetPower(false)`, the end of a hold (`keyUp`) and `refresh()` never wake it. A wake that fails without proving it did nothing (it timed out after connecting) may still have woken the stick, and the TV over HDMI-CEC, so it is reported with its own code (`timeout`), never as `unreachable`.
 3. The live session can emit `CapabilitiesChanged`, for example when a pointer socket returns 401.
+
+**What every session must guarantee.** The engine's safety rules depend on these:
+- **Waking.** `connect(allowWake: false)` and `refresh()` send nothing that can wake the device (§2.9). A session whose device stops answering at all marks its observations stale and emits `ConnectionChanged(disconnected)`; it never keeps reporting `connected` and the last state it saw.
+- **Cancellation.** `close()` stops a command in progress before its next request. Every request goes through one place that checks for it, including the requests a command makes after a wait (volume steps, the resend after a wake).
+- **Delivery.** `unreachable` means nothing reached the device: a request that may have reached it (a wake that timed out) is reported with its own code. A command sent as several requests counts the device-changing requests that were accepted (key, text, launch and media POSTs, a DIAL wake; reads do not count). Once one was accepted, any later failure, `close()` included, is `partiallyDelivered` with the underlying error as its `cause`. A 401 mid-command still emits `ReauthRequired`.
+- **Secrets.** No error, event or pairing step carries a bearer secret. Drivers redact token-bearing fields from device answers (an authenticated error body) and strip every known bearer value (the client token, a token the device returned, the Fire TV `X-Api-Key` value) from every error text, in any escaped form the device may have used (`\/`, `\uXXXX`, percent-encoding), before building a `WatchmeError`. An answer that carries a new token (the Fire TV PIN verify, whatever its status) keeps only plain words ("PIN expired"); every other value is redacted. The device's other words are kept.
+- **Power keys.** Drivers map `RemoteKey.power` to their toggle, but receive it only from the power orchestrator (§2.8); a hold of the power key is refused.
 
 **Composition.** One TV usually has several sessions, and the engine routes each command to the best one. Typical sets:
 - Samsung: Tizen WebSocket + REST + UPnP RenderingControl + WoL + optional SmartThings; Frame Art channel later.
@@ -425,7 +432,9 @@ abstract interface class WatchmeClient {
 2. Flags: state feedback beats write-only; local beats cloud; documented beats reverse-engineered; absolute beats relative; discrete beats toggle.
 3. Session health and latency.
 
-It then falls back down the list. Volume is the canonical example: absolute via UPnP or SSAP, then relative keys, then CEC, then HID consumer keys, then IR.
+It then falls back down the list, but only while nothing can have reached the device: after `Unsupported`, after a failure before the command was sent (connecting failed, pairing missing), and after `unreachable`, `destinationRefused`, `unauthorized` or `reauthRequired`. A timeout, a rejection, a protocol error or a `partiallyDelivered` result ends the search, because another route would repeat what may already have happened. Volume is the canonical example: absolute via UPnP or SSAP, then relative keys, then CEC, then HID consumer keys, then IR.
+- A `SetVolume` on a relative-only route becomes `StepVolume(level - known)`, or that many key presses. A press that fails after an earlier one was delivered makes the whole command `partiallyDelivered`.
+- After any result that may have acted (a timeout, a partial delivery, a protocol or internal error), the engine marks the state the command changes (volume, mute) stale, whichever source reported it. A later `SetVolume` then needs a fresh level instead of stepping from a wrong one. Only an observation made after the failure ends it: a refresh, a power-key evidence read or a reconnect that hands back what a session cached before the command does not revive the old level.
 
 **PowerOrchestrator.** Its rule: never send a toggle on a guess.
 - *Power-on chain*, discrete commands only:
@@ -438,6 +447,11 @@ It then falls back down the list. Volume is the canonical example: absolute via 
   - Samsung keeps answering for 17-20 s after off; after a KEY_POWER wake its PowerState stayed `standby`; KEY_POWERON had no visible effect (HA #187048). A stale belief can turn a TV off again.
   - LG `turnOff` within about a minute of a remote switch-off turns the TV back on (lgtv2 #15).
 - *Power-off:* prefer discrete off (CEC Standby, Roku PowerOff, Vizio 11/0, Sony `setPowerStatus(false)`, SmartThings `switch.off`, LG `turnOff` only when `getPowerState` says Active). Toggles follow the same two-source rule.
+- *The power key is an intent, not a key.* The engine hands `PressKey(RemoteKey.power)` to the orchestrator, never to the router. When at least two independent, fresh sources agree on the current state, it runs `SetPower(!current)`: a discrete route first, a toggle only under the two-source rule. Otherwise it returns `Unsupported('needs confirmation')`. Holding a power key is refused.
+- *The user's answer.* After `needs confirmation` the UI asks "Is the TV on right now?" and sends `SetPower(!isOn, userConfirmed: true)`. The answer counts as the two-source agreement. It still prefers a discrete route, still sends no toggle after Wake-on-LAN, and inside the quiet period it returns `Unsupported(PowerOrchestrator.quietPeriodReason)` rather than `needs confirmation`, so the UI does not ask again in a loop.
+- *Quiet period.* No toggle within `toggleQuietPeriod` (20 s) of the last power command watchme delivered, and none after a discrete power command that may have acted (it timed out, say): the toggle could undo it. Such a failure starts the quiet period too.
+- *One operation at a time.* Power operations on one device are serialised from evidence collection to confirmation, so two callers can never both decide to toggle on the same evidence. A request that asks for what the queued operation in front of it asks, at least as firmly, joins it and gets its result; any other request waits, then decides on fresh evidence and meets the quiet period. A wait for the device to answer after Wake-on-LAN ends early when a later request asks for something other than "on". `close()` completes the running operation and every queued one as cancelled at once, even when the one in front never finishes (a hung session).
+- *Waking.* Only a command the user sent may wake a device while connecting (`Driver.connect(allowWake: true)`). Background and engine-initiated reconnects, refreshes, polling, `SetPower(false)`, toggles and the end of a hold (`PressKey(key, KeyAction.up)`, which apps also send on their own when they lose the key-up) connect with `allowWake: false`. A session that loses its device is closed and its observations shown as stale; recovery is passive (a probe, or a connect that cannot wake). A user command that finds the device asleep may still wake it, as a physical remote would.
 
 ### 2.9 Where M0 code differs from these sketches
 
@@ -445,7 +459,8 @@ The code in `packages/watchme_core` is the contract. The deliberate differences:
 
 - **Driver.**
   - `Driver.startPairing(endpoint, transports, PairingContext)` takes a third argument, because credentials need the engine's device id.
-  - `DriverSession` adds `driverId`, `state` and `refresh()`.
+  - `Driver.connect(endpoint, transports, credential, {allowWake = true})`. With `allowWake: false` a driver sends nothing that can wake the device or change what it shows: no DIAL launch, Wake-on-LAN, CEC power-on or app launch. A device it cannot reach without waking fails fast as `unreachable`. The engine passes `false` for every connection the user did not ask for: background and engine-initiated reconnects, refreshes and polling.
+  - `DriverSession` adds `driverId`, `state` and `refresh()`. `refresh()` never wakes. When nothing answers at all, the session marks its state stale, emits `ConnectionChanged(disconnected)` with the error, and throws. The engine then closes it, shows its observations as stale, and recovers only passively (a probe, or `connect(allowWake: false)`).
   - `DriverDescriptor` adds `ports` (default per port name) and `requiresPairing`.
   - Ports are always resolved through `Endpoint.port(name, default)`. Roku uses `ecp` (8060); Fire TV uses `dial` (8009) and `api` (8080).
 - **Discovery.**
@@ -456,6 +471,22 @@ The code in `packages/watchme_core` is the contract. The deliberate differences:
   - `ProbeResult.power` carries the power state a probe saw passively (Roku device-info `power-mode`; Fire TV API closed while DIAL answers means standby). The power orchestrator's evidence is passive: it refreshes open sessions and probes the rest, and never connects, because connecting can wake a TV. After Wake-on-LAN it reports `Confirmed` only on a fresh "on", since a Roku in standby still answers device-info.
   - `HttpCall.maxResponseBytes` lets a caller cap a body it does not trust (UPnP descriptions).
   - A connection lost after it was made is `timeout`, not `unreachable`: only `unreachable` means nothing was delivered.
+  - A command sent as several requests (volume steps, key presses) that delivered at least one of them and then failed reports `partiallyDelivered`, never `unreachable`, whatever stopped it. `CommandResult.partiallyDelivered` tests for it. The router never falls back or replays after it, and the engine marks the affected state (e.g. volume) stale or refreshes it.
+- **LAN-only destinations.**
+  - `classifyHostAddress(String)` returns a `HostAddressClass`. It is pure Dart and web-safe, parses IPv4, IPv6, zone ids and IPv4-mapped forms, and treats host names and shorthand numeric forms (`127.1`, `0x7f.0.0.1`) as `invalid`. `DestinationPolicy({allowLoopback = false, allowNonPrivate = false})` builds on it, and `isAllowedDestination` is its shorthand.
+  - Allowed: RFC 1918, IPv4 and IPv6 link-local, ULA `fc00::/7`, and their IPv4-mapped forms.
+  - Refused with `WatchmeErrorCode.destinationRefused`: public, shared `100.64.0.0/10` (CGNAT, overlay VPNs), reserved and documentation ranges, unspecified, multicast and broadcast. Loopback is refused unless `allowLoopback` is set. `allowNonPrivate` is an escape hatch, off by default.
+  - `IoNetworkStack` enforces the policy on every unicast connection: HTTP, WebSocket, TCP, TLS and unicast UDP. It resolves names itself, checks every resolved address, and connects to the checked IP literal, so DNS rebinding cannot swap the address.
+  - mDNS and SSDP apply the same policy to senders and to the addresses they name. A sender naming itself gets no exception.
+  - Multicast discovery queries and Wake-on-LAN broadcasts on LAN interfaces are not governed by the policy.
+  - The engine takes `destinationPolicy` (default LAN-only) and checks a manually added IP literal up front, to give a clear error. It also refuses numeric shorthand (`127.1`, `2130706433`) as `destinationRefused` and text that is neither an IP literal nor a host name as `unsupported`. Host names are left to the network stack; when it refuses what a name resolves to, `addManual` reports that `destinationRefused` error rather than "no driver recognised". Discovery hits whose IP literal the policy refuses are dropped, and no background reconnect follows a `destinationRefused`.
+  - A host name whose answer mixes allowed and refused addresses is refused whole: a mixed answer is how DNS rebinding starts. The stack resolves on every connection, so a name that later rebinds to a public address is refused at the next request.
+  - TLS still verifies, and HTTP still sends as `Host`, the name the caller gave, not the checked address the stack connects to.
+  - Discovery providers (`SsdpDiscovery`, `MdnsDiscovery`, `SsdpNotifyListener`) take their own `destinationPolicy`, LAN-only by default and separate from the stack's. A refused sender is dropped before its datagram is parsed. An SSDP `LOCATION` naming loopback is accepted only from a loopback sender, even when the policy allows loopback.
+  - The app gives its engine and stack `allowLoopback: true` but keeps discovery strict, so only an address the user types can reach loopback. The simulators are added by IP.
+  - `CapabilityRouter.defaultFallbackCodes` include `destinationRefused`: nothing was sent, so another route is safe.
+  - Do not use `InternetAddress.isLinkLocal` for IPv6. dart:io masks the second byte with `0xB0`, so it misses `fe90::`-`febf::` and counts deprecated site-local `fec0::/12` as link-local.
+  - The in-process Flutter app sets `allowLoopback: true`: its simulators listen on 127.0.0.1, and the app runs in the user's own trust domain. **The M1 hub must not enable it**, or a LAN client could make the hub reach its own local services. Tests opt in to loopback explicitly.
 - **Results and pairing.**
   - `Failed` and `PairingFailed` take only a `WatchmeError`; `rawDeviceMessage` lives on the error.
   - `Paired.credential` is null only in `Paired.redacted()`, which is what clients receive.
@@ -464,6 +495,11 @@ The code in `packages/watchme_core` is the contract. The deliberate differences:
   - `LaunchApp` adds `params` (Roku `contentId`/`mediaType`).
   - `RemoteKey` adds `backspace`, `enter`, `instantReplay` and `inputAv1`.
   - `DeviceState.foregroundApp` is `Observed<AppInfo>`.
+  - `SetPower(on, {userConfirmed = false})`.
+    - `PressKey(RemoteKey.power)` is a power-toggle intent and goes through the power orchestrator, not the router. When the evidence agrees on the current state, the engine executes `SetPower(!current)`; otherwise it returns `Unsupported(needsConfirmation)`. Down and up actions on the power key are refused.
+    - After `needsConfirmation`, the UI asks "Is the TV on right now?" and sends `SetPower(!isOn, userConfirmed: true)`. The user's answer counts as the two-source agreement, so a toggle may be sent. Power commands are still serialised per device, and the toggle quiet period still applies. For the power key the two answers are "It's on, turn it off" and "It's off, turn it on". For `SetPower(on)` (the Power on and Power off buttons) they are "turn it on/off" and "It's already on/off", which sends nothing: a discrete button never does the opposite of what it says. The question is asked only while the remote is the page in front; otherwise the refusal is shown.
+    - The engine also sends `PressKey(RemoteKey.powerOn)` and `PressKey(RemoteKey.powerOff)` to the orchestrator, as `SetPower(true)` and `SetPower(false)`: a driver may map them to a toggle, and this gives them the same serialisation, Wake-on-LAN fallback and quiet-period bookkeeping.
+    - No M0 driver declares a toggle-only power route. Roku `PowerOn`/`PowerOff`, the Fire TV DIAL wake and `sleep` are all discrete, so in M0 the power key always resolves to a discrete command and the raw `Power` / `power` toggles are never sent. A device with a single power source (a Roku TV alone: its probe and its session are one source) gets `needs confirmation` for every power key press. The app's demo client follows the same rule: each demo TV is one source, so its power key always asks.
 - **Engine and client.**
   - `WatchmeEngine` works with `DeviceView`. It adds `start`, `currentDevices`, `forget`, `refresh`, `close` and `addManual(host, ports:)`.
   - `WatchmeClient` adds `addManual`, `forget`, `refresh` and `close`.
@@ -667,9 +703,12 @@ The DTOs are the `watchme_core` classes, so the hub, the Flutter client and the 
   - (b) A local CA installed on clients.
   - A self-signed click-through is not an option: Chrome refuses service workers on certificate-error pages.
 
+**Outbound destinations.** The engine and its network stack contact LAN addresses only: private, link-local and unique-local (§2.9). Public, CGNAT/overlay, reserved, multicast and broadcast addresses are refused before a packet is sent, host names are resolved and every address checked, and connections go to the checked address. This stops a spoofed discovery reply or a manual entry from turning watchme (and later the hub) into a proxy beyond the LAN. Loopback is allowed only in the in-process app; the hub must not allow it, or a LAN client could reach the hub's own local services through it.
+
 **TV credentials.**
 - Mobile and desktop store them in the OS keystore (Keychain, Keystore, libsecret, DPAPI) through a secure-storage plugin; verify that plugin's licence.
 - The hub stores them in a file under the XDG state dir with mode 0600, optionally encrypted with a key from libsecret or a passphrase.
+- Errors never carry them: drivers redact tokens and token-bearing fields from device answers before an error, event or pairing step is built (§2.6).
 - In hub and in-process modes, credentials never leave the engine; hub web clients see device handles, never tokens. Browser-direct mode is the exception: the engine runs in the page, so its credentials live in `BrowserCredentialStore` with the limits described in §5.8.
 
 **TLS to TVs.** Never disable verification globally. Each driver passes a `TlsPolicy`:
@@ -725,7 +764,7 @@ The DTOs are the `watchme_core` classes, so the hub, the Flutter client and the 
 
 Before M3: Vizio (HTTPS 7345 with a self-signed certificate, PIN pairing and the `AUTH` header), Sony (REST with `X-Auth-PSK`, plus IRCC), and VIDAA UPnP (SOAP on 38400 with a `Date` header).
 
-Simulators run on loopback in CI. The UI team can point the hub at them (a `--simulators` flag). brs-desktop (MIT) can serve as an independent, external Roku ECP/SSDP target in an optional CI job. It does not emulate Limited mode or the Host check, which our own simulator does.
+Simulators run on loopback in CI. The e2e suite (`packages/watchme_e2e`) runs the real engine, `IoNetworkStack` and drivers against them behind two loopback guards: a `NetworkStack` wrapper that refuses any non-loopback destination, and a `dart:io` socket override below the stack that refuses any non-loopback TCP connect, so even a stack that ignored its policy could not reach the LAN. Each safety rule (power key gating, serialised power, stop on close, no replay after partial delivery, LAN-only destinations, token redaction, passive recovery) has an e2e test there, and each was checked to fail with its fix reverted. The UI team can point the hub at them (a `--simulators` flag). brs-desktop (MIT) can serve as an independent, external Roku ECP/SSDP target in an optional CI job. It does not emulate Limited mode or the Host check, which our own simulator does.
 
 **3. Contract suites.** One test suite per driver runs against both the simulator and, opt-in, real hardware: `--tags hardware` with `WATCHME_DEVICE_<driver>=<ip>`. Rules:
 - Hardware tests never run in CI.

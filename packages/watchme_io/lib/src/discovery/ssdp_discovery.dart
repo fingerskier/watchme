@@ -3,7 +3,6 @@ import 'dart:io' hide Datagram;
 
 import 'package:watchme_core/watchme_core.dart';
 
-import '../network/io_network_stack.dart' show isPrivateLanAddress;
 import 'ssdp_message.dart';
 import 'upnp_description.dart';
 
@@ -23,12 +22,18 @@ import 'upnp_description.dart';
 /// `WAKEUP: MAC=...` header also fills [DiscoveryHit.mac].
 ///
 /// Safety:
+/// * A reply from a sender outside [destinationPolicy] (LAN-only by
+///   default: private, link-local and unique-local addresses) is dropped
+///   before it is parsed, so it yields no hit, no fetch and no address to
+///   probe.
 /// * A reply's `LOCATION` is used as the device address, and fetched, only
-///   when it names the replying host or a private or link-local address
-///   ([isPrivateLanAddress]), so a spoofed reply cannot make watchme contact
-///   a host on the internet, this host's own loopback services, or the
-///   shared (CGNAT/VPN) range. Loopback is accepted only from a loopback
-///   sender (local simulators).
+///   when its host is an IP literal [destinationPolicy] allows. Naming the
+///   replying host earns no exception. So a spoofed reply cannot make
+///   watchme contact a host on the internet or in the shared (CGNAT/VPN)
+///   range. A loopback `LOCATION` additionally needs a loopback sender
+///   (a local simulator), so that even a policy that allows loopback never
+///   lets a LAN host point watchme at this host's own services. Otherwise
+///   the hit is placed at the (already checked) sender, without a port.
 /// * A description is fetched at most once per `LOCATION`, for at most
 ///   [maxDescriptionFetches] locations per scan and
 ///   [maxDescriptionFetchesPerSender] per replying host, and a body larger
@@ -54,6 +59,7 @@ final class SsdpDiscovery implements DiscoveryProvider {
     this.group = ssdpGroup,
     this.port = ssdpPort,
     this.clock = const SystemClock(),
+    this.destinationPolicy = DestinationPolicy.lanOnly,
   });
 
   /// Searched when a scan names no service types: everything, plus Roku and
@@ -101,6 +107,11 @@ final class SsdpDiscovery implements DiscoveryProvider {
 
   /// Time source for resends.
   final Clock clock;
+
+  /// Which senders are heard and which `LOCATION`s are used; LAN-only by
+  /// default. Loopback tests and simulators opt in with
+  /// `DestinationPolicy(allowLoopback: true)`.
+  final DestinationPolicy destinationPolicy;
 
   /// Descriptions larger than this are not device descriptions.
   static const int maxDescriptionBytes = 512 * 1024;
@@ -165,38 +176,47 @@ bool isDnsSdServiceType(String type) => RegExp(
 ).hasMatch(type.trim());
 
 /// Where a discovered SSDP service lives, given the replying [sender] and
-/// the reply's [location]: the `LOCATION` host and port when it is an IP
-/// literal that is the sender itself, a private or link-local address
-/// ([isPrivateLanAddress]), or loopback named by a loopback sender; else
-/// the sender with no port. [fetchable] says the location may be fetched.
-({String host, int? port, bool fetchable}) ssdpPlacement(
+/// the reply's [location], under [policy]; `null` when [policy] refuses the
+/// sender, whose reply must then be ignored altogether.
+///
+/// The `LOCATION` host and port are used, and [fetchable] is true, when the
+/// host is an IP literal that [policy] allows (a loopback one only from a
+/// loopback sender). Being the sender itself earns no exception. Otherwise
+/// the service is placed at the sender, with no port.
+({String host, int? port, bool fetchable})? ssdpPlacement(
   String sender,
-  Uri? location,
-) {
+  Uri? location, {
+  DestinationPolicy policy = DestinationPolicy.lanOnly,
+}) {
+  final senderClass = classifyHostAddress(sender);
+  if (!policy.allowsClass(senderClass)) return null;
+  final fallback = (host: sender, port: null, fetchable: false);
   final address = location == null
       ? null
       : InternetAddress.tryParse(location.host);
-  if (address == null) return (host: sender, port: null, fetchable: false);
-  final senderIsLoopback =
-      InternetAddress.tryParse(sender)?.isLoopback ?? false;
+  if (address == null) return fallback;
+  final kind = classifyHostAddress(address.address);
   final trusted =
-      address.address == sender ||
-      isPrivateLanAddress(address) ||
-      (address.isLoopback && senderIsLoopback);
+      policy.allowsClass(kind) &&
+      (kind != HostAddressClass.loopback ||
+          senderClass == HostAddressClass.loopback);
   return trusted
       ? (host: address.address, port: location!.port, fetchable: true)
-      : (host: sender, port: null, fetchable: false);
+      : fallback;
 }
 
 /// The hit for an SSDP [message] from [sender], enriched with [description]
-/// and [applicationUrl] when they were fetched.
-DiscoveryHit ssdpHit(
+/// and [applicationUrl] when they were fetched; `null` when [policy]
+/// refuses the sender (see [ssdpPlacement]).
+DiscoveryHit? ssdpHit(
   String sender,
   SsdpMessage message, {
   UpnpDescription? description,
   String? applicationUrl,
+  DestinationPolicy policy = DestinationPolicy.lanOnly,
 }) {
-  final placement = ssdpPlacement(sender, message.locationUri);
+  final placement = ssdpPlacement(sender, message.locationUri, policy: policy);
+  if (placement == null) return null;
   return DiscoveryHit(
     host: placement.host,
     provider: DiscoveryProviderId.ssdp,
@@ -295,6 +315,9 @@ final class _Scan {
   }
 
   void _handle(Datagram datagram) {
+    // A sender outside the policy is not heard at all: not parsed, not
+    // de-duplicated, never probed.
+    if (!provider.destinationPolicy.allows(datagram.host)) return;
     final message = SsdpMessage.tryParseBytes(datagram.data);
     if (message == null ||
         message.kind == SsdpMessageKind.search ||
@@ -308,25 +331,28 @@ final class _Scan {
     late final Future<void> work;
     work = _enrich(datagram.host, message)
         .then((hit) {
-          if (!_out.isClosed && !_cancelled) _out.add(hit);
+          if (hit != null && !_out.isClosed && !_cancelled) _out.add(hit);
         })
         .whenComplete(() => _pending.remove(work));
     _pending.add(work);
   }
 
-  Future<DiscoveryHit> _enrich(String sender, SsdpMessage message) async {
+  Future<DiscoveryHit?> _enrich(String sender, SsdpMessage message) async {
+    final policy = provider.destinationPolicy;
     final location = message.locationUri;
+    final placement = ssdpPlacement(sender, location, policy: policy);
+    if (placement == null) return null;
     if (!provider.fetchDescriptions ||
         location == null ||
-        !ssdpPlacement(sender, location).fetchable) {
-      return ssdpHit(sender, message);
+        !placement.fetchable) {
+      return ssdpHit(sender, message, policy: policy);
     }
     var pending = _descriptions[location];
     if (pending == null) {
       final bySender = _fetchesBySender[sender] ?? 0;
       if (_descriptions.length >= provider.maxDescriptionFetches ||
           bySender >= provider.maxDescriptionFetchesPerSender) {
-        return ssdpHit(sender, message);
+        return ssdpHit(sender, message, policy: policy);
       }
       _fetchesBySender[sender] = bySender + 1;
       pending = _descriptions[location] = provider._fetch(location);
@@ -337,6 +363,7 @@ final class _Scan {
       message,
       description: fetched?.description,
       applicationUrl: fetched?.applicationUrl,
+      policy: policy,
     );
   }
 

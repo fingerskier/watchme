@@ -367,11 +367,15 @@ class DemoTv {
     PressKey(key: final key) when unsupportedKeys.contains(key) => Unsupported(
       '$protocol has no ${key.name} key.',
     ),
+    // As in the engine, the power key is a toggle intent, not a key press.
+    PressKey(key: RemoteKey.power, action: KeyAction.click) => _togglePower(),
     PressKey(key: RemoteKey.power) => const Unsupported(
-      Unsupported.needsConfirmation,
+      'The power key toggles; it cannot be held.',
     ),
     PressKey(:final key, action: KeyAction.click) => _click(key),
     PressKey() => const Confirmed(),
+    // A discrete route exists for both TVs, so a confirmed command needs
+    // no toggle.
     SetPower(:final on) => _setPower(on),
     SetMute(:final muted) => _setMute(muted ?? !this.muted),
     StepVolume() => const Confirmed(),
@@ -408,6 +412,14 @@ class DemoTv {
     }
     return const Confirmed();
   }
+
+  /// The engine's answer to the power key. It turns the TV the other way
+  /// only when at least two independent sources agree on the TV's state,
+  /// and each demo TV has one: its own driver (the Roku reports its power
+  /// state, the Fire TV cannot). So, as the engine would, it asks the user,
+  /// who answers with a confirmed [SetPower].
+  CommandResult _togglePower() =>
+      const Unsupported(Unsupported.needsConfirmation);
 
   CommandResult _setPower(bool on) {
     power = on ? PowerMode.on : PowerMode.standby;

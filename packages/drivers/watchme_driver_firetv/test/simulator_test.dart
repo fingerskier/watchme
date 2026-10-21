@@ -260,6 +260,85 @@ void main() {
     await session.close();
   });
 
+  test('close stops StepVolume between steps: first answer paused, session '
+      'closed, answer released', () async {
+    final session = await driver.connect(
+      sim.endpoint,
+      transports,
+      await pair(),
+    );
+    sim.clearLog();
+    final gate = sim.holdNext('POST', '/v1/FireTV', action: 'volume_up');
+    final result = session.execute(const StepVolume(3));
+    await gate.reached;
+    await session.close();
+    gate.release();
+    final failed = await result;
+    expect(failed, isFailedWith(WatchmeErrorCode.partiallyDelivered));
+    expect(
+      (failed as Failed).error.cause,
+      isWatchmeError(WatchmeErrorCode.cancelled),
+    );
+    expect(sim.effects, ['volume_up']);
+    expect(sim.volumeSteps, 1);
+  });
+
+  test('connecting without waking leaves a sleeping device asleep', () async {
+    final credential = await pair();
+    await sim.sleep();
+    sim.clearLog();
+    final wakes = sim.wakeCount;
+    await expectLater(
+      driver.connect(sim.endpoint, transports, credential, allowWake: false),
+      throwsWatchmeError(WatchmeErrorCode.unreachable),
+    );
+    expect(sim.wakeCount, wakes);
+    expect(sim.dialRequests, isEmpty);
+    expect(sim.awake, isFalse);
+    // Awake, it connects without a DIAL launch.
+    await sim.wake();
+    final session = await driver.connect(
+      sim.endpoint,
+      transports,
+      credential,
+      allowWake: false,
+    );
+    expect(sim.dialRequests, isEmpty);
+    await session.close();
+  });
+
+  test('a device that vanishes is reported disconnected by refresh, which '
+      'never wakes it', () async {
+    final session = await driver.connect(
+      sim.endpoint,
+      transports,
+      await pair(),
+    );
+    final events = <DeviceEvent>[];
+    session.events.listen(events.add);
+    final wakes = sim.wakeCount;
+    await sim.vanish();
+    await expectLater(
+      session.refresh(),
+      throwsWatchmeError(WatchmeErrorCode.unreachable),
+    );
+    expect(session.state.power?.confidence, Confidence.stale);
+    expect(
+      session.state.connections.values.single,
+      ConnectionState.disconnected,
+    );
+    await pumpEventQueue();
+    expect(
+      events.whereType<ConnectionChanged>().single.state,
+      ConnectionState.disconnected,
+    );
+    await sim.reappear();
+    expect((await session.refresh()).power?.value, PowerMode.standby);
+    expect(sim.wakeCount, wakes, reason: 'refresh is passive');
+    expect(sim.awake, isFalse);
+    await session.close();
+  });
+
   test('a revoked token emits ReauthRequired', () async {
     final session = await driver.connect(
       sim.endpoint,

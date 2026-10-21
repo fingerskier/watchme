@@ -5,7 +5,8 @@ import 'package:watchme_testkit/watchme_testkit.dart';
 import 'fakes.dart';
 
 /// An [Engine] wired to fakes: [FakeTransports], [FakeClock] and in-memory
-/// stores.
+/// stores. The engine's destination policy is LAN-only unless a test opts
+/// in to more (loopback for simulators).
 class Harness {
   Harness({
     List<Driver> drivers = const [],
@@ -15,6 +16,7 @@ class Harness {
     MemoryDeviceRepository? repository,
     FakeTransports? transports,
     WakeOnLanSender? wakeOnLan,
+    DestinationPolicy destinationPolicy = DestinationPolicy.lanOnly,
   }) : clock = FakeClock(DateTime.utc(2026, 10, 21, 12)),
        transports = transports ?? FakeTransports(),
        credentials = credentials ?? MemoryCredentialStore(),
@@ -27,6 +29,7 @@ class Harness {
       repository: this.repository,
       clock: clock,
       config: config,
+      destinationPolicy: destinationPolicy,
       wakeOnLan: wakeOnLan,
     );
   }
