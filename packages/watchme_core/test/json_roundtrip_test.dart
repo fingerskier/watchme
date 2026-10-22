@@ -472,6 +472,15 @@ void main() {
         MaterialKind.clientCertificate,
         Uri.parse('https://example.invalid/help'),
       ),
+      const EnterText('Login ID set on the TV'),
+      const EnterText('Password', secret: true, minLength: 1, maxLength: 16),
+      const ConfirmChange('Turn on network power-on?'),
+      const ConfirmChange(
+        'Turn on network power-on?',
+        detail: 'Raises standby power.',
+        yesLabel: 'Turn it on',
+        noLabel: 'Not now',
+      ),
       const PairingFailed(
         WatchmeError.rejected(
           'LG refused',
@@ -515,6 +524,39 @@ void main() {
       const hex = EnterCode('Code', 6, CodeAlphabet.hex);
       expect(hex.accepts('A1b2C3'), isTrue);
       expect(hex.accepts('A1b2Cg'), isFalse);
+    });
+
+    test('EnterText validates length and refuses control characters', () {
+      const login = EnterText('Login ID');
+      expect(login.accepts(''), isTrue);
+      expect(login.accepts('admin'), isTrue);
+      expect(login.accepts('a' * 64), isTrue);
+      expect(login.accepts('a' * 65), isFalse);
+      expect(login.accepts('admin\r'), isFalse);
+      expect(login.accepts('ad\nmin'), isFalse);
+      expect(login.accepts('ad\x00min'), isFalse);
+      expect(login.accepts('ad\x7fmin'), isFalse);
+      const password = EnterText('Password', secret: true, minLength: 1);
+      expect(password.accepts(''), isFalse);
+      expect(password.accepts('pässwörd 1'), isTrue);
+      expect(password.awaitsInput, isTrue);
+    });
+
+    test('a secret EnterText never carries a value', () {
+      const password = EnterText('Password', secret: true);
+      expect(password.toJson(), {
+        'type': 'enterText',
+        'label': 'Password',
+        'secret': true,
+      });
+    });
+
+    test('ConfirmChange awaits a yes or no', () {
+      const ask = ConfirmChange('Turn on network power-on?');
+      expect(ask.awaitsInput, isTrue);
+      expect(ask.isTerminal, isFalse);
+      expect(ConfirmChange.yes, 'yes');
+      expect(ConfirmChange.no, 'no');
     });
   });
 

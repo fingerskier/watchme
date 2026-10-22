@@ -261,6 +261,66 @@ void main() {
     expect(handle.submitted, ['', '']);
   });
 
+  testWidgets('EnterText collects a login, then hides a password', (
+    tester,
+  ) async {
+    final client = FakeWatchmeClient(devices: [fireTvDevice()]);
+    final handle = await _startPairing(tester, client);
+    await _emit(tester, handle, const EnterText('Login ID set on the TV'));
+
+    expect(find.text('Login ID set on the TV'), findsWidgets);
+    final continueButton = find.widgetWithText(FilledButton, 'Continue');
+    // An empty login is allowed: the TV may have none.
+    expect(tester.widget<FilledButton>(continueButton).onPressed, isNotNull);
+    await tester.enterText(find.byType(TextField), 'ad\nmin');
+    await tester.pump();
+    expect(find.text('admin'), findsOneWidget);
+    await tester.tap(continueButton);
+    await tester.pump();
+    expect(handle.submitted, ['admin']);
+
+    await _emit(
+      tester,
+      handle,
+      const EnterText('Password', secret: true, minLength: 1),
+    );
+    final field = find.byType(TextField);
+    expect(tester.widget<TextField>(field).obscureText, isTrue);
+    final passwordContinue = find.widgetWithText(FilledButton, 'Continue');
+    expect(tester.widget<FilledButton>(passwordContinue).onPressed, isNull);
+    await tester.enterText(field, 's3cret');
+    await tester.pump();
+    await tester.tap(find.byTooltip('Show'));
+    await tester.pump();
+    expect(tester.widget<TextField>(field).obscureText, isFalse);
+    await tester.tap(passwordContinue);
+    await tester.pump();
+    expect(handle.submitted, ['admin', 's3cret']);
+  });
+
+  testWidgets('ConfirmChange answers yes or no', (tester) async {
+    final client = FakeWatchmeClient(devices: [fireTvDevice()]);
+    final handle = await _startPairing(tester, client);
+    const ask = ConfirmChange(
+      'Turn on network power-on?',
+      detail: 'The TV uses more power in standby.',
+      yesLabel: 'Turn it on',
+      noLabel: 'Not now',
+    );
+    await _emit(tester, handle, ask);
+
+    expect(find.text('Turn on network power-on?'), findsOneWidget);
+    expect(find.text('The TV uses more power in standby.'), findsOneWidget);
+    await tester.tap(find.text('Not now'));
+    await tester.pump();
+    expect(handle.submitted, [ConfirmChange.no]);
+
+    await _emit(tester, handle, const ConfirmChange('Change it?'));
+    await tester.tap(find.text('Yes'));
+    await tester.pump();
+    expect(handle.submitted, [ConfirmChange.no, ConfirmChange.yes]);
+  });
+
   testWidgets('leaving before the end cancels the pairing', (tester) async {
     final client = FakeWatchmeClient(devices: [fireTvDevice()]);
     final handle = await _startPairing(tester, client);

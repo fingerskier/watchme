@@ -361,9 +361,11 @@ Target examples:
 ```dart
 sealed class PairingStep {}
 final class Instruct extends PairingStep { Instruct(this.text, {this.helpUrl}); final String text; final Uri? helpUrl; }
-final class AcceptOnTv extends PairingStep { AcceptOnTv(this.timeout); final Duration timeout; }   // Samsung / LG / Sharp prompt
+final class AcceptOnTv extends PairingStep { AcceptOnTv(this.timeout); final Duration timeout; }   // Samsung / LG prompt
 final class EnterCode extends PairingStep {                                                       // ATV 6 hex, Fire TV / Vizio 4 digits,
   EnterCode(this.label, this.length, this.alphabet); final String label; final int length; final CodeAlphabet alphabet; } // Apple PIN, LG keycode 8 chars
+final class EnterText extends PairingStep { EnterText(this.label, {this.secret = false}); final String label; final bool secret; } // Sharp login ID / password
+final class ConfirmChange extends PairingStep { ConfirmChange(this.question, {this.detail}); final String question; final String? detail; } // consent before a TV setting change (Sharp RSPW)
 final class OpenUrlFirst extends PairingStep { OpenUrlFirst(this.url, this.why); final Uri url; final String why; } // browser-direct cert step
 final class NeedsUserMaterial extends PairingStep { NeedsUserMaterial(this.kind, this.help); final MaterialKind kind; final Uri help; } // VIDAA cert, SmartThings app
 final class Paired extends PairingStep { Paired(this.credential); final Credential credential; }

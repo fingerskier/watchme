@@ -66,6 +66,18 @@ sealed class PairingStep {
       reqInt(json, 'length'),
       reqEnum(json, 'alphabet', CodeAlphabet.values),
     ),
+    'enterText' => EnterText(
+      req<String>(json, 'label'),
+      secret: opt<bool>(json, 'secret') ?? false,
+      minLength: optInt(json, 'minLength') ?? 0,
+      maxLength: optInt(json, 'maxLength') ?? EnterText.defaultMaxLength,
+    ),
+    'confirmChange' => ConfirmChange(
+      req<String>(json, 'question'),
+      detail: opt<String>(json, 'detail'),
+      yesLabel: opt<String>(json, 'yesLabel') ?? 'Yes',
+      noLabel: opt<String>(json, 'noLabel') ?? 'No',
+    ),
     'openUrlFirst' => OpenUrlFirst(
       reqUri(json, 'url'),
       req<String>(json, 'why'),
@@ -85,7 +97,9 @@ sealed class PairingStep {
   };
 
   /// Whether the flow waits for [PairingFlow.submit] after this step: a code
-  /// for [EnterCode], any value (usually empty) to acknowledge the others.
+  /// for [EnterCode], text for [EnterText], [ConfirmChange.yes] or
+  /// [ConfirmChange.no] for [ConfirmChange], any value (usually empty) to
+  /// acknowledge the others.
   bool get awaitsInput;
 
   /// Whether this step ends the flow.
@@ -136,7 +150,7 @@ final class Instruct extends PairingStep {
   String toString() => 'Instruct($text)';
 }
 
-/// The TV shows an allow/deny prompt (Samsung, LG, Sharp); the flow waits
+/// The TV shows an allow/deny prompt (Samsung, LG); the flow waits
 /// up to [timeout] for the device.
 final class AcceptOnTv extends PairingStep {
   /// Creates an accept-on-TV step.
@@ -213,6 +227,128 @@ final class EnterCode extends PairingStep {
 
   @override
   String toString() => 'EnterCode($label, $length ${alphabet.name})';
+}
+
+/// Ask the user for free text, such as the login name and password a
+/// Sharp AQUOS asks for on its IP-control port; answer with
+/// [PairingFlow.submit].
+final class EnterText extends PairingStep {
+  /// Creates a text prompt.
+  const EnterText(
+    this.label, {
+    this.secret = false,
+    this.minLength = 0,
+    this.maxLength = defaultMaxLength,
+  });
+
+  /// Default for [maxLength].
+  static const int defaultMaxLength = 64;
+
+  /// Prompt text, e.g. "Login ID set on the TV".
+  final String label;
+
+  /// Whether the value is a secret (a password): the UI hides it as it is
+  /// typed and nothing echoes it back.
+  final bool secret;
+
+  /// Fewest characters accepted (0 allows an empty answer).
+  final int minLength;
+
+  /// Most characters accepted.
+  final int maxLength;
+
+  /// Whether [value] fits the length bounds and has no control characters
+  /// (a CR or LF would end the field early on a line-based protocol).
+  bool accepts(String value) =>
+      value.length >= minLength &&
+      value.length <= maxLength &&
+      !value.contains(RegExp(r'[\x00-\x1f\x7f]'));
+
+  @override
+  bool get awaitsInput => true;
+
+  @override
+  JsonMap toJson({bool includeSecrets = false}) => {
+    'type': 'enterText',
+    'label': label,
+    if (secret) 'secret': true,
+    if (minLength != 0) 'minLength': minLength,
+    if (maxLength != defaultMaxLength) 'maxLength': maxLength,
+  };
+
+  @override
+  bool operator ==(Object other) =>
+      other is EnterText &&
+      other.label == label &&
+      other.secret == secret &&
+      other.minLength == minLength &&
+      other.maxLength == maxLength;
+
+  @override
+  int get hashCode =>
+      Object.hash('enterText', label, secret, minLength, maxLength);
+
+  @override
+  String toString() => 'EnterText($label${secret ? ', secret' : ''})';
+}
+
+/// Ask the user before the driver changes a setting on the TV, e.g. turning
+/// on a Sharp AQUOS's network power-on command, which raises its standby
+/// power. Answer with [PairingFlow.submit]: [yes] or [no]. A driver treats
+/// any other answer as [no].
+final class ConfirmChange extends PairingStep {
+  /// Creates a yes/no question.
+  const ConfirmChange(
+    this.question, {
+    this.detail,
+    this.yesLabel = 'Yes',
+    this.noLabel = 'No',
+  });
+
+  /// The answer that allows the change.
+  static const String yes = 'yes';
+
+  /// The answer that refuses it.
+  static const String no = 'no';
+
+  /// The question, e.g. "Let watchme turn this TV on over the network?".
+  final String question;
+
+  /// What changes and what it costs.
+  final String? detail;
+
+  /// Label for the button that answers [yes].
+  final String yesLabel;
+
+  /// Label for the button that answers [no].
+  final String noLabel;
+
+  @override
+  bool get awaitsInput => true;
+
+  @override
+  JsonMap toJson({bool includeSecrets = false}) => {
+    'type': 'confirmChange',
+    'question': question,
+    if (detail != null) 'detail': detail,
+    if (yesLabel != 'Yes') 'yesLabel': yesLabel,
+    if (noLabel != 'No') 'noLabel': noLabel,
+  };
+
+  @override
+  bool operator ==(Object other) =>
+      other is ConfirmChange &&
+      other.question == question &&
+      other.detail == detail &&
+      other.yesLabel == yesLabel &&
+      other.noLabel == noLabel;
+
+  @override
+  int get hashCode =>
+      Object.hash('confirmChange', question, detail, yesLabel, noLabel);
+
+  @override
+  String toString() => 'ConfirmChange($question)';
 }
 
 /// The user must open [url] first (browser-direct certificate
@@ -356,7 +492,9 @@ abstract interface class PairingFlow {
   Stream<PairingStep> get steps;
 
   /// Answers the latest step that [PairingStep.awaitsInput]: the code for
-  /// [EnterCode], any value to acknowledge the others.
+  /// [EnterCode], the text for [EnterText], [ConfirmChange.yes] or
+  /// [ConfirmChange.no] for [ConfirmChange], any value to acknowledge the
+  /// others.
   void submit(String value);
 
   /// Abandons the pairing. The flow emits [PairingFailed] with

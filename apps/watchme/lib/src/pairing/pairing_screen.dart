@@ -193,6 +193,16 @@ class _PairingScreenState extends State<PairingScreen> {
       busy: _waitingForDevice,
       onSubmit: _submit,
     ),
+    EnterText() => _EnterTextView(
+      step: step,
+      busy: _waitingForDevice,
+      onSubmit: _submit,
+    ),
+    ConfirmChange() => _ConfirmChangeView(
+      step: step,
+      busy: _waitingForDevice,
+      onAnswer: _submit,
+    ),
     OpenUrlFirst() => _ContinueView(
       icon: Icons.open_in_browser,
       title: 'Open this address first',
@@ -502,6 +512,147 @@ class _EnterCodeViewState extends State<_EnterCodeView> {
             onPressed: _valid ? _submit : null,
             child: const Text('Pair'),
           ),
+      ],
+    );
+  }
+}
+
+class _EnterTextView extends StatefulWidget {
+  const _EnterTextView({
+    required this.step,
+    required this.busy,
+    required this.onSubmit,
+  });
+
+  final EnterText step;
+  final bool busy;
+  final ValueChanged<String> onSubmit;
+
+  @override
+  State<_EnterTextView> createState() => _EnterTextViewState();
+}
+
+class _EnterTextViewState extends State<_EnterTextView> {
+  final _text = TextEditingController();
+  bool _shown = false;
+
+  @override
+  void dispose() {
+    _text.dispose();
+    super.dispose();
+  }
+
+  bool get _valid => widget.step.accepts(_text.text);
+
+  void _submit() {
+    if (_valid && !widget.busy) widget.onSubmit(_text.text);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final step = widget.step;
+    final hidden = step.secret && !_shown;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        _StepHeader(
+          icon: step.secret ? Icons.password : Icons.badge_outlined,
+          title: step.label,
+        ),
+        Text(
+          step.minLength == 0
+              ? 'Type it as it is set on the TV. Leave it empty if the TV '
+                    'has none.'
+              : 'Type it as it is set on the TV.',
+          style: Theme.of(context).textTheme.bodyLarge,
+          textAlign: TextAlign.center,
+        ),
+        const SizedBox(height: 24),
+        TextField(
+          controller: _text,
+          autofocus: true,
+          enabled: !widget.busy,
+          obscureText: hidden,
+          keyboardType: step.secret
+              ? TextInputType.visiblePassword
+              : TextInputType.text,
+          autocorrect: false,
+          enableSuggestions: false,
+          autofillHints: step.secret
+              ? const [AutofillHints.password]
+              : const [AutofillHints.username],
+          maxLength: step.maxLength,
+          inputFormatters: [
+            FilteringTextInputFormatter.deny(RegExp(r'[\x00-\x1f\x7f]')),
+            LengthLimitingTextInputFormatter(step.maxLength),
+          ],
+          decoration: InputDecoration(
+            labelText: step.label,
+            border: const OutlineInputBorder(),
+            suffixIcon: step.secret
+                ? IconButton(
+                    icon: Icon(
+                      hidden ? Icons.visibility : Icons.visibility_off,
+                    ),
+                    tooltip: hidden ? 'Show' : 'Hide',
+                    onPressed: () => setState(() => _shown = !_shown),
+                  )
+                : null,
+          ),
+          onChanged: (_) => setState(() {}),
+          onSubmitted: (_) => _submit(),
+        ),
+        const SizedBox(height: 16),
+        if (widget.busy)
+          const _Working(text: 'Checking with the TV…')
+        else
+          FilledButton(
+            onPressed: _valid ? _submit : null,
+            child: const Text('Continue'),
+          ),
+      ],
+    );
+  }
+}
+
+class _ConfirmChangeView extends StatelessWidget {
+  const _ConfirmChangeView({
+    required this.step,
+    required this.busy,
+    required this.onAnswer,
+  });
+
+  final ConfirmChange step;
+  final bool busy;
+  final ValueChanged<String> onAnswer;
+
+  @override
+  Widget build(BuildContext context) {
+    final detail = step.detail;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        _StepHeader(icon: Icons.tune, title: step.question),
+        if (detail != null)
+          Text(
+            detail,
+            style: Theme.of(context).textTheme.bodyLarge,
+            textAlign: TextAlign.center,
+          ),
+        const SizedBox(height: 24),
+        if (busy)
+          const Center(child: CircularProgressIndicator())
+        else ...[
+          FilledButton(
+            onPressed: () => onAnswer(ConfirmChange.yes),
+            child: Text(step.yesLabel),
+          ),
+          const SizedBox(height: 8),
+          OutlinedButton(
+            onPressed: () => onAnswer(ConfirmChange.no),
+            child: Text(step.noLabel),
+          ),
+        ],
       ],
     );
   }
