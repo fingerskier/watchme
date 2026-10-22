@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  NOT YET REFERENCED by Runner.xcodeproj (CODE_SIGN_ENTITLEMENTS), on purpose.
+
+  SSDP discovery, raw mDNS and broadcast Wake-on-LAN send and receive UDP
+  multicast/broadcast, which iOS allows only with the restricted
+  com.apple.developer.networking.multicast entitlement. Apple grants it per
+  team on request (https://developer.apple.com/contact/request/networking-multicast;
+  "N/A" is accepted for the App Store URL). A build that claims it without
+  the grant fails code signing.
+
+  Once the team has the grant:
+    1. set CODE_SIGN_ENTITLEMENTS = Runner/Runner.entitlements for the Runner
+       target in Xcode, and
+    2. construct IoNetworkStack(multicastAllowed: true) on iOS in
+       lib/src/bootstrap.dart (watchme_io defaults it to false on iOS).
+
+  Until then the app still works on iOS by manual add (unicast HTTP/HTTPS
+  needs only the Local Network permission from Info.plist).
+-->
+<plist version="1.0">
+<dict>
+	<key>com.apple.developer.networking.multicast</key>
+	<true/>
+</dict>
+</plist>

@@ -1,0 +1,108 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FLUTTER_VERSION: 3.47.7 # bundles Dart 3.13.5
+
+# Third-party actions are pinned to full commit SHAs (resolved from the
+# tags in the trailing comments through the GitHub API on 2026-10-21).
+# Checkout does not keep the token in .git/config, because `flutter pub
+# get` runs package build hooks and the tests run dependency code. The
+# flutter-action cache is off: it would pull actions/cache by a mutable tag.
+jobs:
+  dart:
+    name: Analyze, Dart tests, web safety
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: false
+
+      - name: Resolve the workspace
+        run: flutter pub get
+
+      - name: Check formatting
+        run: dart format --output=none --set-exit-if-changed packages apps/watchme/lib apps/watchme/test
+
+      - name: Analyze
+        run: dart analyze --fatal-infos
+
+      # Simulators and the e2e suite bind loopback only (127.0.0.1 and
+      # 127.0.0.2); nothing in CI talks to a real device.
+      - name: Dart tests
+        run: |
+          for package in \
+            packages/watchme_core \
+            packages/watchme_io \
+            packages/watchme_engine \
+            packages/watchme_testkit \
+            packages/drivers/watchme_driver_roku \
+            packages/drivers/watchme_driver_firetv \
+            packages/watchme_e2e
+          do
+            echo "::group::dart test $package"
+            (cd "$package" && dart test)
+            echo "::endgroup::"
+          done
+
+      # dart2js fails if watchme_core, watchme_engine or a driver reaches
+      # dart:io. The output expects a browser-like `self`; Node gets one.
+      - name: Web-safety compile
+        working-directory: packages/watchme_e2e
+        run: |
+          dart compile js -o "$RUNNER_TEMP/web_safety_check.js" tool/web_safety_check.dart
+          node -e 'globalThis.self = globalThis; require(process.argv[1]);' \
+            "$RUNNER_TEMP/web_safety_check.js" | tee "$RUNNER_TEMP/web_safety_check.txt"
+          grep -q 'manual add refused: unsupported' "$RUNNER_TEMP/web_safety_check.txt"
+          grep -q 'public host refused: destinationRefused' "$RUNNER_TEMP/web_safety_check.txt"
+
+  flutter:
+    name: Flutter tests and Linux build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: false
+
+      - name: Install Linux desktop build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev libstdc++-12-dev
+
+      - name: Resolve the workspace
+        run: flutter pub get
+
+      - name: Flutter tests
+        working-directory: apps/watchme
+        run: flutter test
+
+      - name: Build Linux (debug)
+        working-directory: apps/watchme
+        run: flutter build linux --debug

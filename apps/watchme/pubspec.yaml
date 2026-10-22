@@ -1,0 +1,28 @@
+name: watchme
+description: watchme - control smart TVs from desktop and mobile.
+publish_to: none
+version: 0.1.0+1
+
+environment:
+  sdk: ^3.13.0
+
+resolution: workspace
+
+dependencies:
+  flutter:
+    sdk: flutter
+  path_provider: ^2.1.5
+  watchme_core: ^0.1.0
+  watchme_driver_firetv: ^0.1.0
+  watchme_driver_roku: ^0.1.0
+  watchme_engine: ^0.1.0
+  watchme_io: ^0.1.0
+
+dev_dependencies:
+  flutter_lints: ^6.0.0
+  flutter_test:
+    sdk: flutter
+  watchme_testkit: ^0.1.0
+
+flutter:
+  uses-material-design: true

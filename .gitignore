@@ -1,0 +1,45 @@
+# Dart / pub
+.dart_tool/
+.packages
+.pub-cache/
+.pub/
+pubspec_overrides.yaml
+build/
+coverage/
+doc/api/
+*.js.deps
+*.js.map
+
+# Only the workspace root keeps a lockfile (pub workspaces resolve once, at the root).
+/**/pubspec.lock
+!/pubspec.lock
+
+# Flutter
+.flutter-plugins
+.flutter-plugins-dependencies
+.metadata.lock
+**/ios/Flutter/.last_build_id
+**/ios/Pods/
+**/macos/Pods/
+**/android/.gradle/
+**/android/local.properties
+**/android/app/debug
+**/android/app/profile
+**/android/app/release
+**/linux/flutter/ephemeral/
+**/windows/flutter/ephemeral/
+**/macos/Flutter/ephemeral/
+**/ios/Flutter/ephemeral/
+app.*.symbols
+app.*.map.json
+.widget_preview/
+
+# IDE / OS
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.DS_Store
+*.swp
+*.log

@@ -1,0 +1,19 @@
+name: watchme_e2e
+description: >-
+  End-to-end tests for watchme: engine, io transports and drivers against
+  loopback protocol simulators. Tests only; never published.
+publish_to: none
+
+environment:
+  sdk: ^3.13.0
+
+resolution: workspace
+
+dev_dependencies:
+  test: ^1.25.0
+  watchme_core: ^0.1.0
+  watchme_driver_firetv: ^0.1.0
+  watchme_driver_roku: ^0.1.0
+  watchme_engine: ^0.1.0
+  watchme_io: ^0.1.0
+  watchme_testkit: ^0.1.0

@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>$(DEVELOPMENT_LANGUAGE)</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIconFile</key>
+	<string></string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$(FLUTTER_BUILD_NAME)</string>
+	<key>CFBundleVersion</key>
+	<string>$(FLUTTER_BUILD_NUMBER)</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>$(MACOSX_DEPLOYMENT_TARGET)</string>
+	<key>NSHumanReadableCopyright</key>
+	<string>$(PRODUCT_COPYRIGHT)</string>
+	<key>NSMainNibFile</key>
+	<string>MainMenu</string>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+	<!-- watchme talks to TVs on the local network: Roku ECP and DIAL over
+	     HTTP, the Fire TV remote API over HTTPS, SSDP and mDNS discovery, and
+	     Wake-on-LAN. macOS 15+ asks the user once before the first LAN connection. -->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>watchme finds and controls the TVs on your local network.</string>
+	<!-- The DNS-SD service types watchme looks for. Keep in sync with
+	     MdnsDiscovery.defaultServiceTypes in packages/watchme_io. -->
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_amzn-wplay._tcp</string>
+		<string>_amzn-fireTv._tcp</string>
+		<string>_googlecast._tcp</string>
+		<string>_androidtvremote2._tcp</string>
+		<string>_airplay._tcp</string>
+		<string>_companion-link._tcp</string>
+		<string>_viziocast._tcp</string>
+		<string>_philipstv_s_rpc._tcp</string>
+	</array>
+</dict>
+</plist>

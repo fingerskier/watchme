@@ -1,0 +1,10 @@
+# Shared analysis settings. Every workspace member includes this file.
+include: package:lints/recommended.yaml
+
+analyzer:
+  language:
+    strict-casts: true
+    strict-raw-types: true
+  exclude:
+    - "**/build/**"
+    - "**/.dart_tool/**"
