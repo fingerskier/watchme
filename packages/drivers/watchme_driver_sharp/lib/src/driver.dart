@@ -20,9 +20,11 @@ import 'session.dart';
 /// * [startPairing] returns a flow for every Sharp TV, although
 ///   [DriverDescriptor.requiresPairing] is false: it collects the login ID
 ///   and password with [EnterText] when (and only when) the TV asks for
-///   them, checks them, and, for a model whose power-on over IP depends on
-///   the RSPW setting while that setting is off, asks [ConfirmChange]
-///   before writing it. Nothing else is ever written to the TV's settings.
+///   them and enforces the login ([SharpLink.checkLoginEnforced] tells,
+///   before anything typed is sent), checks them, and, for a model whose
+///   power-on over IP depends on the RSPW setting while that setting is
+///   off, asks [ConfirmChange] before writing it. Nothing else is ever
+///   written to the TV's settings.
 /// * [connect] logs in as the credential says and reads the model and
 ///   state; nothing it sends can wake the TV, so `allowWake` changes
 ///   nothing.
@@ -383,8 +385,12 @@ final class SharpDriver implements Driver {
         );
       }
       credential = _noLogin(context);
+    } else if (!await link.checkLoginEnforced()) {
+      // The prompt is shown but not enforced: there is nothing to ask the
+      // user for, and nothing typed at the prompt would be safe to send.
+      credential = _unenforcedLogin(context);
     } else {
-      await link.close();
+      // The check closed the link, with half a login on it.
       (link, credential) = await _login(
         flow,
         context,
@@ -433,6 +439,23 @@ final class SharpDriver implements Driver {
         secret: '',
       );
 
+  /// A credential for a TV that shows the login prompt without enforcing
+  /// it: an empty login ID and password, so that its sessions expect the
+  /// prompt and check it rather than answer it (see [isSharpNoLogin]).
+  SharedSecretCredential _unenforcedLogin(PairingContext context) =>
+      SharedSecretCredential(
+        driverId: sharpDriverId,
+        deviceId: context.deviceId,
+        createdAt: _clock.now(),
+        username: '',
+        secret: '',
+      );
+
+  /// Asks for the login and checks it on a new connection per attempt.
+  /// The TV was just found to enforce its login (by
+  /// [SharpLink.checkLoginEnforced] on the connection before the first
+  /// attempt, and by each refusal before the next), so the login ID and
+  /// password go out as soon as it asks for them.
   Future<(SharpLink, SharedSecretCredential)> _login(
     PairingFlowController flow,
     PairingContext context,
@@ -508,6 +531,10 @@ final class SharpDriver implements Driver {
   /// The question waits for the user, and the TV may close the idle
   /// connection meanwhile: `RSPW2` then goes out on a new one from
   /// [reopen], since nothing went out on the closed one.
+  ///
+  /// What the user must still do or know (a write the TV refused or did
+  /// not confirm, the Quick Start setting) is an [Instruct] that waits for
+  /// their acknowledgement, so that [Paired] does not replace it unread.
   Future<void> _offerNetworkPowerOn(
     PairingFlowController flow,
     SharpLink link,
@@ -575,7 +602,7 @@ final class SharpDriver implements Driver {
           if (e.code == WatchmeErrorCode.cancelled) rethrow;
         }
         if (reply != sharpOk) {
-          flow.emit(
+          await flow.prompt(
             Instruct(switch ((sent, reply)) {
               (_, sharpErr) =>
                 'The TV refused the power-on command setting (RSPW). '
@@ -587,17 +614,18 @@ final class SharpDriver implements Driver {
               _ =>
                 'The TV did not confirm the power-on command setting '
                     '(RSPW); it may or may not have changed.',
-            }),
+            }, requiresAck: true),
           );
         }
       }
     }
     if (profile.quickStart) {
-      flow.emit(
+      await flow.prompt(
         const Instruct(
           'To let watchme turn this TV on, also set Quick Start Mode to On '
           '(Menu > Setup, or Initial Setup on 4T-B sets). It uses more power '
           'in standby.',
+          requiresAck: true,
         ),
       );
     }

@@ -51,19 +51,38 @@ void main() {
     await answer(peer, 'IAVD?   \r', '1\r');
   }
 
+  /// Shows the prompt on the first connection, lets its login check
+  /// (`POWR?` where a login ID would go) find a TV that enforces the login,
+  /// and returns the connection the login goes out on, 750 ms later, once
+  /// it too has shown the prompt.
+  Future<FakeTcpPeer> passLoginCheck() async {
+    await clock.flush();
+    final check = peers.single;
+    expect(check.port, 10002);
+    expect(sent(check), isEmpty);
+    check.send(ascii.encode('Login:'));
+    await answer(check, 'POWR?   \r', '\r\nPassword:');
+    expect(sent(check), 'POWR?   \r', reason: 'no credential on the check');
+    expect(check.isClosed, isTrue, reason: 'no password follows');
+    await clock.advance(const Duration(milliseconds: 749));
+    expect(peers, hasLength(1));
+    await clock.advance(const Duration(milliseconds: 1));
+    final tv = peers.last;
+    expect(peers, hasLength(2));
+    expect(sent(tv), isEmpty);
+    tv.send(ascii.encode('Login:'));
+    await clock.flush();
+    return tv;
+  }
+
   test('login: each field goes out only after its prompt (section 12 '
-      'bytes)', () async {
+      'bytes), on the connection after the check', () async {
     final pending = driver.connect(
       _endpoint,
       transports,
       login('admin', 'secret1'),
     );
-    await clock.flush();
-    final tv = peers.single;
-    expect(tv.port, 10002);
-    expect(sent(tv), isEmpty);
-    tv.send(ascii.encode('Login:'));
-    await clock.flush();
+    final tv = await passLoginCheck();
     expect(sent(tv), 'admin\r');
     tv.send(ascii.encode('\r\nPassword:'));
     await clock.flush();
@@ -92,15 +111,35 @@ void main() {
     },
   );
 
+  test('a prompt the TV does not enforce: the check is all that is sent '
+      'before the session reads, even after an unterminated ERR', () async {
+    final pending = driver.connect(
+      _endpoint,
+      transports,
+      login('RCKY0012', 'secret1'),
+    );
+    await clock.flush();
+    final tv = peers.single;
+    tv.send(ascii.encode('Login:'));
+    await answer(tv, 'POWR?   \r', 'ERR');
+    await clock.flush();
+    expect(sent(tv), 'POWR?   \rPOWR?   \r', reason: 'the session reads');
+    tv.send(ascii.encode('\r'));
+    await answerStart(tv);
+    final session = await pending;
+    expect(peers, hasLength(1));
+    expect(sent(tv), isNot(contains('RCKY')));
+    expect(sent(tv), isNot(contains('secret1')));
+    await session.close();
+  });
+
   test('the JP variant: CRLF and OK in two chunks are both dropped', () async {
     final pending = driver.connect(
       _endpoint,
       transports,
       login('admin', 'secret1'),
     );
-    await clock.flush();
-    final tv = peers.single;
-    tv.send(ascii.encode('Login:'));
+    final tv = await passLoginCheck();
     await answer(tv, 'admin\r', '\r\nPassword:');
     await answer(tv, 'secret1\r', '\r\n');
     await clock.advance(const Duration(milliseconds: 150));
@@ -123,9 +162,7 @@ void main() {
         rawDeviceMessage: '\r\nLogin:',
       ),
     );
-    await clock.flush();
-    final tv = peers.single;
-    tv.send(ascii.encode('Login:'));
+    final tv = await passLoginCheck();
     await answer(tv, 'admin\r', '\r\nPassword:');
     await answer(tv, 'nope\r', '\r\nLogin:');
     await clock.advance(const Duration(milliseconds: 200));
@@ -139,9 +176,7 @@ void main() {
 
     /// Logs in as `admin` with [password] up to the TV's answer.
     Future<FakeTcpPeer> loginUpToAnswer() async {
-      await clock.flush();
-      final tv = peers.single;
-      tv.send(ascii.encode('Login:'));
+      final tv = await passLoginCheck();
       await answer(tv, 'admin\r', '\r\nPassword:');
       return tv;
     }

@@ -39,9 +39,10 @@ const int sharpMaxVolumeSteps = 100;
 ///   (nothing was sent), and it reports the TV lost: the session marks its
 ///   observations stale and emits [ConnectionChanged] with
 ///   [ConnectionState.disconnected].
-/// * Once a request is written, a lost connection or a missing reply is
-///   [WatchmeErrorCode.timeout]: the TV may have acted. Nothing that may
-///   have been delivered is sent again, and the power key toggle never is.
+/// * Once a request is handed to the connection, a send that fails, a
+///   lost connection or a missing reply is [WatchmeErrorCode.timeout]:
+///   the TV may have acted. Nothing that may have been delivered is sent
+///   again, and the power key toggle never is.
 ///   [sharpTimeoutsBeforeDisconnect] timeouts in a row report the TV lost.
 /// * `ERR` means the TV did not act: [WatchmeErrorCode.rejected], with
 ///   `ERR` as the raw device message. Within [SharpTimings.powerOnSettle]

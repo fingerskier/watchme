@@ -204,6 +204,31 @@ void main() {
     expect(await session.execute(const SetMute(null)), isConfirmed);
   });
 
+  test('a prompt the TV does not enforce is found out with POWR? before any '
+      'login is asked for, so a login ID shaped like a command is never '
+      'sent', () async {
+    final sim = await startSim(
+      SharpSimulator(
+        profile: SharpSimProfile.us2015Limited,
+        quickStart: true,
+        power: SharpSimPower.networkStandby,
+        loginId: 'RCKY0012',
+        password: 'secret1',
+      ),
+    );
+    final steps = await drive(start(sim), ['RCKY0012', 'secret1']);
+    expect(sim.power, SharpSimPower.networkStandby);
+    expect(writes(sim), isEmpty);
+    expect(sim.rawInput.join(), isNot(contains('RCKY')));
+    expect(steps.whereType<EnterText>(), isEmpty);
+    expect(steps.last, isPairedWith());
+    final c = credentialOf(steps);
+    expect(isSharpNoLogin(c), isFalse, reason: 'the prompt is expected');
+    final session = await open(driver, sim, transports, credential: c);
+    expect(session.state.power!.value, PowerMode.standby);
+    expect(sim.power, SharpSimPower.networkStandby);
+  });
+
   test('a TV whose only client slot is taken fails as unreachable, with '
       'nothing sent', () async {
     final sim = await startSim(SharpSimulator());
@@ -238,8 +263,11 @@ void main() {
       expect(steps.last, isPairedWith());
       expect(writes(sim), ['RSPW2   ']);
       expect(sim.rspw, 2);
-      expect(sim.commands.last.connection, 3, reason: 'a new connection');
+      // Each login is a check connection, then the login one: 1-2 while
+      // pairing, 3-4 for the write.
+      expect(sim.commands.last.connection, 4, reason: 'a new connection');
       expect(sim.successfulLogins, 2);
+      expect(sim.failedLogins, 0);
     });
 
     test('asks before writing RSPW and writes it only on yes', () async {
@@ -325,6 +353,52 @@ void main() {
         steps.whereType<Instruct>().single.text,
         contains('Quick Start Mode'),
       );
+    });
+
+    test('setup instructions and warnings wait for the user to acknowledge '
+        'them before pairing finishes', () async {
+      /// Runs [flow], answering yes to the question and acknowledging each
+      /// instruction a little later; checks that no step follows one
+      /// before it is acknowledged.
+      Future<List<PairingStep>> run(PairingFlow flow) async {
+        final steps = <PairingStep>[];
+        var instructs = 0;
+        var acked = 0;
+        await for (final step in flow.steps) {
+          expect(acked, instructs, reason: '$step before the acknowledgement');
+          steps.add(step);
+          if (step is ConfirmChange) flow.submit(ConfirmChange.yes);
+          if (step is Instruct) {
+            expect(step.requiresAck, isTrue, reason: step.text);
+            final n = ++instructs;
+            unawaited(
+              Future<void>.delayed(const Duration(milliseconds: 50), () {
+                acked = n;
+                flow.submit('');
+              }),
+            );
+          }
+        }
+        return steps;
+      }
+
+      final tb = await startSim(SharpSimulator(profile: SharpSimProfile.us4tb));
+      var steps = await run(start(tb));
+      expect(steps, [
+        isA<Instruct>().having((s) => s.text, 'text', contains('Quick Start')),
+        isPairedWith(),
+      ]);
+
+      final sim = await startSim(
+        SharpSimulator(profile: SharpSimProfile.us2014),
+      );
+      sim.failNext('RSPW2', SharpSimFault.malformed);
+      steps = await run(start(sim));
+      expect(steps.whereType<Instruct>().map((s) => s.text), [
+        contains('did not confirm'),
+        contains('Quick Start'),
+      ]);
+      expect(steps.last, isPairedWith());
     });
 
     test('an unconfirmed write is reported, not retried, and pairing still '

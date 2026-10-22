@@ -160,6 +160,15 @@ final class Engine implements WatchmeEngine {
 
   final Map<String, _DeviceEntry> _devices = {};
   final Map<(String, String), EnginePairing> _pairings = {};
+
+  /// Slots a pairing has reserved (see [pair]): nothing else connects them
+  /// until the pairing succeeds or ends.
+  final Set<_DriverSlot> _reserved = Set.identity();
+
+  /// Per slot, what may still hold a connection to the device after the
+  /// engine let go of it: closes of sessions it dropped, and connects whose
+  /// session nobody will use. A pairing waits for them.
+  final Expando<Set<Future<void>>> _letGo = Expando('letGo');
   final StreamController<List<DeviceView>> _deviceLists =
       StreamController.broadcast();
   Future<void>? _started;
@@ -907,12 +916,45 @@ final class Engine implements WatchmeEngine {
     }
     // Pairing replaces this driver's connection to the device, and some
     // devices serve one client at a time (a Sharp AQUOS's IP control
-    // does): the driver's own open session would make the pairing's
-    // connection fail. A successful pairing connects again; otherwise the
-    // next command does.
+    // does): a session of the driver's own, open or opening, would make
+    // the pairing's connection fail. So the pairing reserves the slot,
+    // and the driver's pairing starts once what held the device has let
+    // go: the session's close, and a connect in flight with the close of
+    // what it opened. Until the pairing succeeds or ends, nothing else
+    // connects the slot: a command fails on this route (and may fall
+    // back), and no reconnect runs. A successful pairing connects again;
+    // otherwise the next command does.
+    _reserved.add(slot);
+    slot.cancelReconnect();
     if (slot.session != null || slot.connecting != null) {
       _resetSession(entry, slot);
     }
+    final holds = _letGo[slot];
+    late final EnginePairing pairing;
+    pairing = EnginePairing(
+      _DeferredPairingFlow(
+        holds == null || holds.isEmpty ? null : _released(slot),
+        () => _startDriverPairing(entry, slot),
+      ),
+      onPaired: (credential) => _onPaired(entry, slot, credential),
+      onDone: () {
+        if (identical(_pairings[key], pairing)) {
+          _pairings.remove(key);
+          _reserved.remove(slot);
+        }
+      },
+    );
+    _pairings[key] = pairing;
+    return pairing;
+  }
+
+  /// The driver's own pairing flow for [slot], or one that has failed.
+  PairingFlow _startDriverPairing(_DeviceEntry entry, _DriverSlot slot) {
+    if (_closed || entry.forgotten) {
+      return failedPairing(const WatchmeError.cancelled('Pairing cancelled'));
+    }
+    final deviceId = entry.id;
+    final driverId = slot.driverId;
     final PairingFlow? inner;
     try {
       inner = slot.driver.startPairing(
@@ -943,23 +985,48 @@ final class Engine implements WatchmeEngine {
         ),
       );
     }
-    if (inner == null) {
-      return failedPairing(
-        WatchmeError.unsupported(
-          '${slot.descriptor.protocol} needs no pairing',
-        ),
-      );
+    return inner ??
+        failedPairing(
+          WatchmeError.unsupported(
+            '${slot.descriptor.protocol} needs no pairing',
+          ),
+        );
+  }
+
+  /// Completes once nothing recorded by [_holdUntil] holds [slot]'s device
+  /// any more, or after [EngineConfig.connectTimeout] at most: a close that
+  /// never returns must not keep the pairing from starting.
+  Future<void> _released(_DriverSlot slot) async {
+    Future<void> settled() async {
+      for (
+        var holds = _letGo[slot];
+        holds != null && holds.isNotEmpty;
+        holds = _letGo[slot]
+      ) {
+        await Future.wait([...holds]);
+      }
     }
-    late final EnginePairing pairing;
-    pairing = EnginePairing(
-      inner,
-      onPaired: (credential) => _onPaired(entry, slot, credential),
-      onDone: () {
-        if (identical(_pairings[key], pairing)) _pairings.remove(key);
-      },
-    );
-    _pairings[key] = pairing;
-    return pairing;
+
+    try {
+      await withClockTimeout(
+        settled(),
+        config.connectTimeout,
+        _clock,
+        () => const WatchmeError.timeout('The old connection did not close'),
+      );
+    } on WatchmeError {
+      // Start anyway; the pairing reports what it finds.
+    }
+  }
+
+  /// Records [work] as holding [slot]'s device until it completes.
+  void _holdUntil(_DriverSlot slot, Future<void> work) {
+    final holds = _letGo[slot] ??= {};
+    late final Future<void> held;
+    held = work
+        .catchError((Object _) {})
+        .whenComplete(() => holds.remove(held));
+    holds.add(held);
   }
 
   /// Stores [credential], clears any revoked flag and connects.
@@ -986,6 +1053,8 @@ final class Engine implements WatchmeEngine {
       ..lastError = null
       ..consecutiveFailures = 0
       ..reconnectAttempts = 0;
+    // The slot is free again once the new credential is in place.
+    _reserved.remove(slot);
     _resetSession(e, slot);
     try {
       // Pairing already woke the device, at the user's request.
@@ -1443,6 +1512,14 @@ final class Engine implements WatchmeEngine {
     required bool allowWake,
   }) {
     if (_closed) return Future.error(_superseded);
+    if (_reserved.contains(slot)) {
+      return Future.error(
+        WatchmeError.rejected(
+          'Pairing ${slot.descriptor.protocol} with this device is in '
+          'progress',
+        ),
+      );
+    }
     final session = slot.session;
     if (session != null) return Future.value(session);
     final pending = slot.connecting;
@@ -1476,27 +1553,44 @@ final class Engine implements WatchmeEngine {
       );
     }
     _setConnection(e, slot, ConnectionState.connecting);
+    // The device may be held until the driver's connect has settled and a
+    // session nobody will use is closed (one that came after the timeout,
+    // or after a reset): a pairing waits for that.
+    final settled = Completer<void>();
+    _holdUntil(slot, settled.future);
+    void closeUnwanted(DriverSession unwanted) =>
+        unawaited(_closeQuietly(unwanted).whenComplete(settled.complete));
+    final connecting = Future.sync(
+      () => slot.driver.connect(
+        e.endpointFor(slot),
+        _transports,
+        credential,
+        allowWake: allowWake,
+      ),
+    );
+    unawaited(
+      connecting.then<void>(
+        (_) {},
+        onError: (Object _) {
+          settled.complete();
+        },
+      ),
+    );
     try {
       final session = await withClockTimeout(
-        Future.sync(
-          () => slot.driver.connect(
-            e.endpointFor(slot),
-            _transports,
-            credential,
-            allowWake: allowWake,
-          ),
-        ),
+        connecting,
         config.connectTimeout,
         _clock,
         () => WatchmeError.timeout(
           'Connecting ${slot.driverId} to ${e.record.host} timed out',
         ),
-        onLateValue: (unwanted) => unawaited(_closeQuietly(unwanted)),
+        onLateValue: closeUnwanted,
       );
       if (!current()) {
-        unawaited(_closeQuietly(session));
+        closeUnwanted(session);
         throw _superseded;
       }
+      settled.complete();
       _attach(e, slot, session);
       return session;
     } on WatchmeError catch (error) {
@@ -1716,7 +1810,7 @@ final class Engine implements WatchmeEngine {
     slot.session = null;
     unawaited(slot.subscription?.cancel());
     slot.subscription = null;
-    if (session != null) unawaited(_closeQuietly(session));
+    if (session != null) _holdUntil(slot, _closeQuietly(session));
   }
 
   Future<void> _closeSession(_DriverSlot slot) async {
@@ -1910,6 +2004,65 @@ final class Engine implements WatchmeEngine {
       foregroundApp: stale(s.foregroundApp),
       nowPlaying: stale(s.nowPlaying),
     );
+  }
+}
+
+/// A driver's pairing flow that starts once [ready] completes (at once
+/// when it is `null`), its steps and answers passed through. Answers given
+/// before it starts are kept for it, and a cancel before then means it
+/// never starts.
+final class _DeferredPairingFlow implements PairingFlow {
+  _DeferredPairingFlow(Future<void>? ready, this._start) {
+    if (ready == null) {
+      _begin();
+    } else {
+      unawaited(ready.then((_) => _begin()));
+    }
+  }
+
+  final PairingFlow Function() _start;
+  final StreamController<PairingStep> _steps = StreamController();
+  final List<String> _answers = [];
+  PairingFlow? _inner;
+  bool _cancelled = false;
+
+  void _begin() {
+    if (_cancelled) return;
+    final inner = _inner = _start();
+    for (final answer in _answers) {
+      inner.submit(answer);
+    }
+    _answers.clear();
+    inner.steps.listen(
+      _steps.add,
+      onError: _steps.addError,
+      onDone: () => unawaited(_steps.close()),
+    );
+  }
+
+  @override
+  Stream<PairingStep> get steps => _steps.stream;
+
+  @override
+  void submit(String value) {
+    final inner = _inner;
+    if (inner != null) {
+      inner.submit(value);
+    } else if (!_cancelled) {
+      _answers.add(value);
+    }
+  }
+
+  @override
+  Future<void> cancel() async {
+    final inner = _inner;
+    if (inner != null) return inner.cancel();
+    if (_cancelled) return;
+    _cancelled = true;
+    _steps.add(
+      const PairingFailed(WatchmeError.cancelled('Pairing cancelled')),
+    );
+    unawaited(_steps.close());
   }
 }
 

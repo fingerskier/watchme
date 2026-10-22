@@ -727,6 +727,143 @@ void main() {
       expect(fire.sessions, hasLength(3));
     });
 
+    group('a device that serves one client at a time', () {
+      late Completer<void> release;
+      late List<PairingStep> steps;
+      late Completer<void> done;
+
+      setUp(() async {
+        await h.credentials.write(token(id, 'firetv.lightning'));
+        release = Completer<void>();
+        steps = [];
+        done = Completer<void>();
+      });
+
+      /// Pairs with the right PIN, recording the steps.
+      void startPairing() {
+        final flow = h.engine.pair(id, 'firetv.lightning');
+        flow.steps.listen((s) {
+          steps.add(s);
+          if (s is EnterCode) flow.submit('1234');
+        }, onDone: done.complete);
+      }
+
+      /// A session whose close lasts until [release] completes.
+      SlowCloseSession slowSession() {
+        final s = SlowCloseSession(release.future, capabilities: keys);
+        fire.sessions.add(s);
+        return s;
+      }
+
+      test('pairing starts only once the open session has finished '
+          'closing, and nothing connects the driver meanwhile', () async {
+        fire.onConnect = (_, _) => slowSession();
+        expect(await h.engine.send(id, home), isConfirmed);
+        final open = fire.lastSession as SlowCloseSession;
+        startPairing();
+        await pump();
+        expect(open.closeStarted, isTrue);
+        expect(fire.pairings, isEmpty, reason: 'the old session holds it');
+        expect(
+          await h.engine.send(id, home),
+          isFailedWith(WatchmeErrorCode.rejected, message: contains('Pairing')),
+        );
+        expect(fire.connects, hasLength(1));
+
+        release.complete();
+        await done.future;
+        expect(fire.pairings, hasLength(1));
+        expect(steps.last, isPairedWith(isNull));
+        expect(fire.connects, hasLength(2), reason: 'connected once paired');
+        expect(await h.engine.send(id, home), isConfirmed);
+      });
+
+      test('a session the device dropped holds pairing back while it closes, '
+          'and its reconnect never comes', () async {
+        fire.onConnect = (_, _) => slowSession();
+        expect(await h.engine.send(id, home), isConfirmed);
+        final open = fire.lastSession as SlowCloseSession;
+        open.emit(
+          const ConnectionChanged(
+            ConnectionState.disconnected,
+            driverId: 'firetv.lightning',
+          ),
+        );
+        await pump();
+        expect(open.closeStarted, isTrue);
+        startPairing();
+        // Past the first reconnect's delay, within the connect timeout.
+        await h.clock.advance(const Duration(seconds: 3));
+        await pump();
+        expect(fire.pairings, isEmpty, reason: 'still closing');
+        expect(fire.connects, hasLength(1), reason: 'no reconnect');
+
+        release.complete();
+        await done.future;
+        expect(fire.pairings, hasLength(1));
+        expect(steps.last, isPairedWith(isNull));
+        expect(fire.connects, hasLength(2), reason: 'connected once paired');
+      });
+
+      test('pairing waits for a connect in flight to settle and for the '
+          'session it opened, which nobody will use, to close', () async {
+        final gate = Completer<void>();
+        fire.onConnect = (_, _) async {
+          await gate.future;
+          return slowSession();
+        };
+        final command = h.engine.send(id, home);
+        await pump();
+        expect(fire.connects, hasLength(1));
+        startPairing();
+        await pump();
+        expect(fire.pairings, isEmpty, reason: 'a connect is in flight');
+
+        gate.complete();
+        await pump();
+        final opened = fire.lastSession as SlowCloseSession;
+        expect(opened.closeStarted, isTrue);
+        expect(fire.pairings, isEmpty, reason: 'it is still closing');
+        expect(await command, isA<Failed>());
+        expect(fire.connects, hasLength(1));
+
+        release.complete();
+        await done.future;
+        expect(fire.pairings, hasLength(1));
+        expect(steps.last, isPairedWith(isNull));
+        expect(opened.executed, isEmpty);
+      });
+
+      test('a close that never ends holds pairing back for the connect '
+          'timeout at most', () async {
+        fire.onConnect = (_, _) => slowSession();
+        expect(await h.engine.send(id, home), isConfirmed);
+        startPairing();
+        await pump();
+        expect(fire.pairings, isEmpty);
+        await h.clock.advance(const EngineConfig().connectTimeout);
+        await pump();
+        expect(fire.pairings, hasLength(1));
+        release.complete();
+        await done.future;
+        expect(steps.last, isPairedWith(isNull));
+      });
+
+      test('a failed pairing frees the driver for the next command', () async {
+        fire.onConnect = (_, _) => slowSession();
+        expect(await h.engine.send(id, home), isConfirmed);
+        final flow = h.engine.pair(id, 'firetv.lightning');
+        release.complete();
+        final last = flow.steps.map((s) {
+          if (s is EnterCode) flow.submit('9999');
+          return s;
+        }).last;
+        expect(await last, isPairingFailedWith(WatchmeErrorCode.unauthorized));
+        expect(await h.engine.send(id, home), isConfirmed);
+        expect(fire.connects, hasLength(2));
+      });
+    });
+
     test('a driver that offers optional pairing shows as pairable', () async {
       final sharp = FakeDriver(
         'sharp.aquos',
@@ -963,4 +1100,24 @@ final class _HeldWrites implements DeviceRepository {
 
   @override
   Future<void> remove(String id) => _records.remove(id);
+}
+
+/// A [FakeSession] whose close lasts until [release] completes, as the
+/// close of a connection that waits for the device can.
+class SlowCloseSession extends FakeSession {
+  SlowCloseSession(this.release, {super.capabilities})
+    : super('firetv.lightning');
+
+  /// Completes when the close may finish.
+  final Future<void> release;
+
+  /// Whether [close] was called.
+  bool closeStarted = false;
+
+  @override
+  Future<void> close() async {
+    closeStarted = true;
+    await release;
+    await super.close();
+  }
 }

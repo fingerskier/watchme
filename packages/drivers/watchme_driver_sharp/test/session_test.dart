@@ -2,6 +2,7 @@
 library;
 
 import 'dart:async';
+import 'dart:typed_data';
 
 import 'package:test/test.dart';
 import 'package:watchme_core/watchme_core.dart';
@@ -157,6 +158,62 @@ void main() {
         );
       },
     );
+
+    test('a prompt the TV does not enforce is found out with POWR? before '
+        'any credential: a login ID shaped like a command is never sent, '
+        'on connect or on reconnect', () async {
+      // This firmware runs what it is sent at the prompt as commands:
+      // RCKY0012 is the POWER key, which wakes a TV in network standby.
+      final sim = await startSim(
+        SharpSimulator(
+          power: SharpSimPower.networkStandby,
+          rspw: 2,
+          loginId: 'RCKY0012',
+          password: 'secret1',
+          enforceLogin: false,
+        ),
+      );
+      final session = await driver.connect(
+        sim.endpoint,
+        transports,
+        login('RCKY0012', 'secret1'),
+        allowWake: false,
+      ) as SharpSession;
+      addTearDown(session.close);
+      await sim.dropConnections();
+      await settle(const Duration(milliseconds: 30));
+      await session.refresh();
+      expect(sim.connectionsAccepted, 2);
+      expect(sim.power, SharpSimPower.networkStandby);
+      expect(writes(sim), isEmpty);
+      expect(sim.rawInput.join(), isNot(contains('RCKY')));
+      expect(sim.rawInput.join(), isNot(contains('secret1')));
+      expect(session.state.power!.value, PowerMode.standby);
+    });
+
+    test('a TV that enforces its login takes the POWR? check for a login '
+        'ID; the login then goes out on a new connection', () async {
+      final sim = await startSim(
+        SharpSimulator(
+          power: SharpSimPower.networkStandby,
+          rspw: 2,
+          loginId: 'RCKY0012',
+          password: 'secret1',
+        ),
+      );
+      final session = await open(
+        driver,
+        sim,
+        transports,
+        credential: login('RCKY0012', 'secret1'),
+      );
+      expect(sim.successfulLogins, 1);
+      expect(sim.failedLogins, 0, reason: 'no password follows the check');
+      expect(sim.rawInput.first, 'POWR?   \r');
+      expect(sim.rawInput[1], startsWith('RCKY0012\rsecret1\r'));
+      expect(sim.power, SharpSimPower.networkStandby);
+      expect(session.state.power!.value, PowerMode.standby);
+    });
 
     test('other credentials are refused', () async {
       final sim = await startSim(SharpSimulator());
@@ -994,9 +1051,40 @@ void main() {
       await Future<void>.delayed(const Duration(milliseconds: 30));
       expect(await session.execute(const SetVolume(20)), isConfirmed);
       await settle();
-      expect(sim.connectionsAccepted, 2);
+      // Each login is a check connection, then the login one.
+      expect(sim.connectionsAccepted, 4);
       expect(sim.successfulLogins, 2);
       expect(events.whereType<ConnectionChanged>(), isEmpty);
+    });
+
+    test('a send that fails after handing its bytes over is never sent '
+        'again: the TV may have acted', () async {
+      final flaky = _SendFailingTransports();
+      final sim = await startSim(SharpSimulator(rspw: 2));
+      final session = await open(driver, sim, flaky);
+      flaky.network.failAfterSending = 'RCKY33';
+      var (result, sent) = await run(
+        session,
+        sim,
+        const PressKey(RemoteKey.volumeUp),
+      );
+      expect(result, isFailedWith(WatchmeErrorCode.timeout));
+      await settle(const Duration(milliseconds: 50));
+      expect(sim.lines.where((l) => l == 'RCKY33  '), hasLength(1));
+      expect(sim.volume, 21, reason: 'one step, not two');
+
+      flaky.network.failAfterSending = 'RCKY12';
+      (result, sent) = await run(session, sim, const PressKey(RemoteKey.power));
+      expect(result, isFailedWith(WatchmeErrorCode.timeout));
+      await settle(const Duration(milliseconds: 50));
+      expect(sim.lines.where((l) => l == 'RCKY12  '), hasLength(1));
+      expect(sim.power, isNot(SharpSimPower.on), reason: 'toggled once');
+
+      flaky.network.failAfterSending = 'POWR1';
+      (result, sent) = await run(session, sim, const SetPower(true));
+      expect(result, isFailedWith(WatchmeErrorCode.timeout));
+      await settle(const Duration(milliseconds: 50));
+      expect(sim.lines.where((l) => l == 'POWR1   '), hasLength(1));
     });
 
     test('a timeout closes the connection, so a late reply is never taken '
@@ -1210,4 +1298,66 @@ void main() {
       expect(writes(sim), isEmpty);
     });
   });
+}
+
+/// [IoTcpTransports] whose sockets fail a send after handing its bytes to
+/// the connection, as a socket may when it breaks mid-write: the bytes may
+/// well have reached the TV.
+final class _SendFailingTransports extends IoTcpTransports {
+  final _SendFailingStack _network = _SendFailingStack();
+
+  @override
+  _SendFailingStack get network => _network;
+}
+
+final class _SendFailingStack extends IoTcpOnlyStack {
+  /// The next send that starts with this text goes out, then throws.
+  String? failAfterSending;
+
+  @override
+  Future<ByteSocket> tcp(
+    String host,
+    int port, {
+    TlsPolicy? tls,
+    ClientIdentity? identity,
+    Duration timeout = HttpCall.defaultTimeout,
+  }) async => _SendFailingSocket(
+    await super.tcp(host, port, tls: tls, timeout: timeout),
+    this,
+  );
+}
+
+final class _SendFailingSocket implements ByteSocket {
+  _SendFailingSocket(this._inner, this._stack);
+
+  final ByteSocket _inner;
+  final _SendFailingStack _stack;
+
+  @override
+  void send(List<int> bytes) {
+    _inner.send(bytes);
+    final fail = _stack.failAfterSending;
+    if (fail != null && String.fromCharCodes(bytes).startsWith(fail)) {
+      _stack.failAfterSending = null;
+      throw StateError('send failed after queueing');
+    }
+  }
+
+  @override
+  Stream<Uint8List> get input => _inner.input;
+
+  @override
+  Future<void> flush() => _inner.flush();
+
+  @override
+  Future<void> close() => _inner.close();
+
+  @override
+  Future<void> get done => _inner.done;
+
+  @override
+  String? get peerCertificateSha256 => _inner.peerCertificateSha256;
+
+  @override
+  Uint8List? get peerCertificateDer => _inner.peerCertificateDer;
 }

@@ -192,9 +192,72 @@ final class SharpLink {
     return false;
   }
 
+  /// After [awaitPrompt] returned `true`, and before any credential goes
+  /// out: whether the TV enforces its login.
+  ///
+  /// Some firmware (US 2015 sets) shows the prompt but runs what it is
+  /// sent as commands, so a login ID that reads as one (`RCKY0012` is the
+  /// POWER key) would act on the TV. This sends the read-only query
+  /// `POWR?` where the login ID would go:
+  ///
+  /// * Such firmware answers it (`0`, `1` or `ERR`): `false`, and the
+  ///   link carries commands with no login.
+  /// * A TV that enforces the login takes it for a login ID and asks for
+  ///   the password (or refuses it): `true`. Half a login is then on the
+  ///   connection, so the link is closed without sending a password; the
+  ///   login goes on a new connection.
+  ///
+  /// Throws [WatchmeErrorCode.unreachable] when the TV closes the
+  /// connection instead, [WatchmeErrorCode.timeout] when it does not
+  /// answer, and [WatchmeErrorCode.protocol] for an answer that fits
+  /// nothing; each closes the link.
+  Future<bool> checkLoginEnforced() async {
+    _buffer.clear();
+    _write(sharpQuery('POWR'), 'POWR?');
+    await _waitUntil(
+      () =>
+          _gone ||
+          _buffer.text.contains(sharpPasswordPrompt) ||
+          isSharpLoginRefusal(_buffer.text) ||
+          _buffer.hasReply ||
+          _buffer.pending == sharpErr,
+      _timings.loginStep,
+    );
+    final text = _buffer.text;
+    if (text.contains(sharpPasswordPrompt) || isSharpLoginRefusal(text)) {
+      await close();
+      return true;
+    }
+    final gone = _gone;
+    final reply = _buffer.takeReply() ?? _buffer.pending;
+    if (const {'0', '1', sharpErr}.contains(reply)) {
+      _discarded += reply.length + _buffer.takeAll().length;
+      return false;
+    }
+    await close();
+    if (reply.isNotEmpty) {
+      throw WatchmeError.protocol(
+        'The TV answered POWR? at its login prompt with something '
+        'unexpected',
+        rawDeviceMessage: _raw(reply),
+      );
+    }
+    if (gone) {
+      throw const WatchmeError.unreachable(
+        'The TV closed the connection after its login prompt; no login was '
+        'sent',
+      );
+    }
+    throw const WatchmeError.timeout(
+      'The TV neither answered POWR? nor asked for a password after its '
+      'login prompt',
+    );
+  }
+
   /// Answers the prompt with [username] and [password], after
-  /// [awaitPrompt] returned `true`. Each field is sent only once the TV
-  /// asked for it, ended by CR.
+  /// [awaitPrompt] returned `true`, on a connection opened after
+  /// [checkLoginEnforced] found that the TV enforces the login. Each field
+  /// is sent only once the TV asked for it, ended by CR.
   ///
   /// Success is a bare CRLF after the password, optionally followed by a
   /// single `OK` (a JP variant); both are dropped, and so is anything else
@@ -211,7 +274,7 @@ final class SharpLink {
   ) async {
     _secrets.addAll([username, password]);
     _buffer.clear();
-    _write('$username\r');
+    _write('$username\r', 'the login ID');
     await _waitUntil(
       () =>
           _gone ||
@@ -240,7 +303,7 @@ final class SharpLink {
     }
     _buffer.clear();
     final sentAt = _clock.now();
-    _write('$password\r');
+    _write('$password\r', 'the password');
     final answered = await _waitUntil(
       () => _gone || _buffer.isNotEmpty,
       _timings.loginAnswer,
@@ -293,7 +356,7 @@ final class SharpLink {
     final what = frame.trim();
     try {
       _discarded += _buffer.takeAll().length;
-      _write(frame);
+      _write(frame, what);
       final deadline = _clock.now().add(timeout);
       var skip = skipOk;
       while (true) {
@@ -381,15 +444,26 @@ final class SharpLink {
     return error;
   }
 
-  void _write(String text) {
+  /// Writes [text]; [what] names it in an error (never a login ID or
+  /// password).
+  ///
+  /// Throws [SharpLinkDown] only when the connection was closed before
+  /// anything was handed to the socket. Once [text] was handed over, a
+  /// failing send is [WatchmeErrorCode.timeout] and closes the link: some
+  /// of it may have reached the TV, so it is never sent again.
+  void _write(String text, String what) {
     if (_gone) throw const SharpLinkDown('The connection to the TV is closed');
+    _wrote = true;
     try {
       _socket.send(utf8.encode(text));
     } on Object catch (e) {
-      _onGone();
-      throw SharpLinkDown('Sending failed: $e');
+      throw _fail(
+        WatchmeError.timeout(
+          'Sending $what to the TV failed; it may have acted on it',
+          cause: e,
+        ),
+      );
     }
-    _wrote = true;
     unawaited(_socket.flush().then((_) {}, onError: (Object _) {}));
   }
 
@@ -440,10 +514,11 @@ final class SharpLink {
 /// (`null`, not an empty one) and an empty password, as pairing stores for
 /// a TV with login disabled.
 ///
-/// An empty login ID and password typed at a prompt are a login all the
-/// same: the 2015 firmware shows the prompt without enforcing it, so its
-/// users leave both empty, and its sessions must answer the prompt rather
-/// than take it for a TV that started asking for a login.
+/// An empty login ID and password are a login all the same: pairing
+/// stores them for firmware that shows the prompt without enforcing it
+/// (the 2015 sets), whose sessions must check the prompt
+/// ([SharpLink.checkLoginEnforced]) rather than take it for a TV that
+/// started asking for a login.
 bool isSharpNoLogin(SharedSecretCredential credential) =>
     credential.username == null && credential.secret.isEmpty;
 
@@ -461,6 +536,11 @@ List<String> sharpSecrets(SharedSecretCredential? credential) => [
 /// * A prompt and a "no login" credential ([isSharpNoLogin]): the TV has
 ///   asked for a login since pairing: [WatchmeErrorCode.reauthRequired],
 ///   and nothing is sent.
+/// * A prompt and a login: [SharpLink.checkLoginEnforced] first, so that
+///   no credential reaches firmware that would run it as a command. A TV
+///   that does not enforce the login is used as it is, with no credential
+///   sent; one that does gets the login on a new connection,
+///   [SharpTimings.reconnectGap] later.
 /// * A refused login: [WatchmeErrorCode.reauthRequired], with the TV's
 ///   text redacted.
 ///
@@ -477,7 +557,9 @@ Future<SharpLink> openSharpLink({
 }) async {
   final hasLogin = credential != null && !isSharpNoLogin(credential);
   final secrets = sharpSecrets(credential);
-  for (var attempt = 1; ; attempt++) {
+  var closedAtOnce = 0;
+  var enforced = false;
+  while (true) {
     final link = await SharpLink.open(
       network,
       host,
@@ -502,6 +584,13 @@ Future<SharpLink> openSharpLink({
           'The TV asks for a login ID and password now; pair with it again',
         );
       }
+      if (!enforced) {
+        if (!await link.checkLoginEnforced()) return link;
+        // The check closed this connection with half a login on it.
+        enforced = true;
+        await clock.delay(timings.reconnectGap);
+        continue;
+      }
       try {
         await link.answerLogin(credential.username ?? '', credential.secret);
       } on SharpLoginRefused catch (e) {
@@ -514,7 +603,7 @@ Future<SharpLink> openSharpLink({
       return link;
     } on SharpLinkDown {
       await link.close();
-      if (attempt >= 2) {
+      if (++closedAtOnce >= 2) {
         throw WatchmeError.unreachable(
           'The TV at $host:$port closed the connection as soon as it was '
           'opened, twice (another client may be connected)',

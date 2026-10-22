@@ -59,7 +59,9 @@ final class SharpTimings {
   /// The same wait when a login is stored.
   final Duration promptWaitWithLogin;
 
-  /// How long to wait for `Password:` after sending the login ID.
+  /// How long to wait for `Password:` after sending the login ID, and for
+  /// the answer to the `POWR?` that checks whether the TV enforces its
+  /// login.
   final Duration loginStep;
 
   /// How long to wait for the TV's answer to the password.
