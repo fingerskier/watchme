@@ -1,5 +1,6 @@
 import 'package:watchme_core/watchme_core.dart';
 import 'package:xml/xml.dart';
+import 'package:xml/xml_events.dart' show XmlNodeDecoder, parseEvents;
 
 import 'constants.dart';
 
@@ -84,13 +85,137 @@ String? xmlLeaf(String xml, String localName) {
 bool xmlHasElement(String xml, String localName) =>
     xmlLeaf(xml, localName) != null;
 
-/// Whether [xml] is an answer to [action]: it holds an `{action}Response`
-/// element, at any depth and with any (or no) prefix. That covers the
-/// TV's own envelope and the decrypted fragment of an encrypted command,
-/// whose wrapper is unknown (bare, under some root, or in
-/// `X_OriginalResult`). An HTML page or any other text is no answer.
-bool isSoapAnswer(String xml, String action) =>
-    xmlHasElement(xml, '${action}Response');
+// What proves an answer. Unlike [xmlLeaf], none of these ever guesses from
+// text the parser refused: an unterminated comment, a truncated document
+// or an HTML page that mentions an answer element proves nothing.
+
+/// [xml] as one well-formed XML document, or `null`.
+///
+/// Well-formed as XML 1.0 has it: one root element, every element closed
+/// in order, comments, CDATA sections and processing instructions
+/// terminated, and nothing but whitespace, comments and processing
+/// instructions outside the root. Namespace prefixes are not resolved, so
+/// an undeclared one is no error: answers are matched by local name, as
+/// the field clients match them, and the brief leaves the prefixes of some
+/// answers unverified (section 6.4).
+XmlDocument? _wellFormed(String xml) {
+  final XmlDocument doc;
+  try {
+    doc = XmlDocument(
+      const XmlNodeDecoder().convert(
+        parseEvents(
+          xml,
+          validateDocument: true,
+          validateNesting: true,
+        ).toList(),
+      ),
+    );
+  } on XmlException {
+    return null;
+  }
+  for (final node in doc.children) {
+    switch (node.nodeType) {
+      case XmlNodeType.CDATA:
+        return null;
+      case XmlNodeType.TEXT when node.value!.trim().isNotEmpty:
+        return null;
+      default:
+        break;
+    }
+  }
+  return doc;
+}
+
+/// The decrypted answer [fragment] of an encrypted command in an `X_Data`
+/// root, as the field clients parse it (several top-level elements, and
+/// text between them, are fine), or `null` when the fragment is not
+/// well-formed XML content. A leading XML declaration is dropped.
+XmlElement? _fragment(String fragment) => _wellFormed(
+  '<X_Data>'
+  '${fragment.replaceFirst(RegExp(r'^\s*<\?xml[^>]*\?>'), '')}'
+  '</X_Data>',
+)?.rootElement;
+
+/// The text of the first element under [scope] whose local name is
+/// [localName], with entities decoded: `null` when there is none, or when
+/// it holds elements and so is no value.
+String? _leafIn(XmlNode scope, String localName) {
+  for (final e in scope.descendantElements) {
+    if (e.name.local != localName) continue;
+    return e.childElements.isEmpty ? e.innerText : null;
+  }
+  return null;
+}
+
+/// The `{action}Response` element of the plain SOAP answer [xml]: a
+/// well-formed document whose root is an `Envelope` and whose `Body` holds
+/// that element, all matched by local name with any (or no) prefix, as in
+/// the captured answers (brief section 6.0). `null` for anything else,
+/// such as an HTML page, a truncated document, another action's answer or
+/// the element outside the `Body`.
+XmlElement? soapAnswer(String xml, String action) {
+  final root = _wellFormed(xml)?.rootElement;
+  if (root == null || root.name.local != 'Envelope') return null;
+  for (final body in root.childElements) {
+    if (body.name.local != 'Body') continue;
+    for (final e in body.childElements) {
+      if (e.name.local == '${action}Response') return e;
+    }
+  }
+  return null;
+}
+
+/// Whether [xml] is a plain SOAP answer to [action] (see [soapAnswer]).
+bool isSoapAnswer(String xml, String action) => soapAnswer(xml, action) != null;
+
+/// The text of the out-argument [localName] (`CurrentVolume`, say) of a
+/// plain answer element from [soapAnswer]; `null` when it has none.
+String? soapAnswerLeaf(XmlElement answer, String localName) =>
+    _leafIn(answer, localName);
+
+/// The `X_EncResult` of the answer [xml] to an encrypted command: the
+/// first such element anywhere in a well-formed document. Its wrapper is
+/// not checked: it is inferred only, and the field clients look for
+/// `X_EncResult` alone (brief section 5.4). `null` when there is none.
+String? encryptedResult(String xml) {
+  final doc = _wellFormed(xml);
+  return doc == null ? null : _leafIn(doc, 'X_EncResult');
+}
+
+/// Whether the decrypted answer [fragment] of an encrypted command
+/// acknowledges [action], which changed something on the TV: it is
+/// well-formed and holds an `{action}Response` element as its own answer.
+///
+/// The brief marks the wrapper unknown (section 5.4): FastyBird's parser
+/// implies the element sits bare or under some root, and the simulator's
+/// `X_OriginalResult` is an assumption. So the element may be at the top
+/// of the fragment, under one top-level element, or in a SOAP `Body`; one
+/// deeper inside other content (an HTML page) is not the answer.
+bool isEncryptedAcknowledgement(String fragment, String action) {
+  final root = _fragment(fragment);
+  if (root == null) return false;
+  for (final e in root.descendantElements) {
+    if (e.name.local != '${action}Response') continue;
+    final parent = e.parentElement;
+    if (parent == root ||
+        parent?.parentElement == root ||
+        parent?.name.local == 'Body') {
+      return true;
+    }
+  }
+  return false;
+}
+
+/// The text of the output leaf [localName] (`X_AppList`, `X_AppInfo`,
+/// `X_PortNumber`, ...) in the decrypted answer [fragment] of an encrypted
+/// read: anywhere in a well-formed fragment, as the brief advises (section
+/// 5.4), since the wrapper and whether the TV puts an `{action}Response`
+/// around the leaf are unverified. `null` when the fragment is malformed
+/// or holds no such leaf.
+String? encryptedAnswerLeaf(String fragment, String localName) {
+  final root = _fragment(fragment);
+  return root == null ? null : _leafIn(root, localName);
+}
 
 /// [text] with XML character and entity references decoded. A character
 /// reference to no Unicode character (`&#x110000;`, or too many digits)

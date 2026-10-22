@@ -872,6 +872,134 @@ void main() {
       });
     }
 
+    for (final encrypted in [false, true]) {
+      test('text that only looks like an acknowledgement (an unterminated '
+          'comment, a truncated document, an HTML page, the element outside '
+          'the SOAP Body) confirms no digit, and no further digit is sent '
+          '(${encrypted ? 'encrypted' : 'plain'})', () async {
+        const urn = panasonicSimNrcUrn;
+        await startSim(PanasonicSimulator(encrypted: encrypted));
+        final s = await connect();
+        final keys = VieraKeys.forSession(_keyword);
+        final bodies = encrypted
+            ? [
+                for (final inner in [
+                  '<!-- diagnostic example: <X_SendKeyResponse/>',
+                  '<X_OriginalResult><u:X_SendKeyResponse xmlns:u="$urn"/>',
+                  '<u:X_SendKeyResponse xmlns:u="$urn"></u:X_SendKeyResponse><',
+                  '<html><body><X_SendKeyResponse/></body></html>',
+                  '<html><body><br><X_SendKeyResponse/></body></html>',
+                ])
+                  sealed(inner),
+                // A genuine acknowledgement in a truncated outer answer.
+                '<s:Envelope><s:Body><u:X_EncryptedCommandResponse>'
+                    '<X_EncResult>'
+                    '${vieraSeal(keys, '<u:X_SendKeyResponse xmlns:u="$urn"/>')}'
+                    '</X_EncResult>',
+              ]
+            : [
+                '<!-- diagnostic example: <X_SendKeyResponse/>',
+                '<s:Envelope><s:Body><u:X_SendKeyResponse/>',
+                '<html><body><h1>Error</h1><X_SendKeyResponse/></body></html>',
+                '<html><body><br><X_SendKeyResponse/></body></html>',
+                '<s:Envelope><s:Header><u:X_SendKeyResponse/></s:Header>'
+                    '<s:Body/></s:Envelope>',
+                '<s:Envelope><s:Body><u:X_SendKeyResponse/></s:Body>'
+                    '</s:Envelope>trailing text',
+              ];
+        for (final body in bodies) {
+          sim.clearLog();
+          sim.respondOnce('X_SendKey', status: 200, body: body);
+          final r = await s.execute(const TuneChannel('123'));
+          expect(_error(r).code, WatchmeErrorCode.protocol, reason: body);
+          expect(r.partiallyDelivered, isFalse, reason: body);
+          // Digit 1 is unconfirmed, so digits 2 and 3 never go out.
+          expect(sim.actions, ['X_SendKey'], reason: body);
+          expect(sim.keyLog, isEmpty, reason: body);
+        }
+        // Never resent on a fresh session either.
+        expect(s.sessionsOpened, encrypted ? 1 : 0);
+      });
+    }
+
+    test('a read takes its value from a well-formed answer only: a '
+        'truncated GetVolume reports no level, and no step is sent', () async {
+      await startSim(PanasonicSimulator());
+      final s = await connect();
+      expect(s.state.volume!.value, 20);
+      const truncated =
+          '<s:Envelope><s:Body><u:GetVolumeResponse>'
+          '<CurrentVolume>55</CurrentVolume>';
+      sim.respondOnce('GetVolume', status: 200, body: truncated);
+      await s.refresh();
+      expect(s.state.volume!.value, 20);
+      sim.respondOnce('GetVolume', status: 200, body: truncated);
+      final r = await s.execute(const StepVolume(1));
+      expect(_error(r).code, WatchmeErrorCode.protocol);
+      expect(sim.effects, isEmpty);
+    });
+
+    test(
+      'an encrypted read needs only its output leaf, anywhere in a '
+      'well-formed fragment; an effect still needs its acknowledgement',
+      () async {
+        await startSim(PanasonicSimulator(encrypted: true));
+        final s = await connect();
+        const list =
+            'vc_app&apos;Stop&apos;product_id=0010000200000001&apos;Netflix'
+            '&apos;http://h/i&apos;Unknown';
+        for (final inner in [
+          '<X_AppList>$list</X_AppList>',
+          '<X_OriginalResult><X_AppList>$list</X_AppList></X_OriginalResult>',
+          '<X_SessionId>1</X_SessionId>\r\n<X_SequenceNumber>00000002'
+              '</X_SequenceNumber>\r\n<X_AppList>$list</X_AppList>',
+          '<v:X_Result><v:X_AppList>$list</v:X_AppList></v:X_Result>',
+        ]) {
+          sim.respondOnce('X_GetAppList', status: 200, body: sealed(inner));
+          final r = await s.execute(const ListApps());
+          expect(r, isA<Confirmed>(), reason: inner);
+          final apps = ((r as Confirmed).payload! as AppListPayload).apps;
+          expect(apps.single.id, '0010000200000001', reason: inner);
+          expect(apps.single.name, 'Netflix', reason: inner);
+        }
+        sim.respondOnce(
+          'X_GetAppInfo',
+          status: 200,
+          body: sealed(
+            '<X_AppInfo>vc_app:1:product_id=0070000200000001:YouTube'
+            '</X_AppInfo>',
+          ),
+        );
+        await s.refresh();
+        expect(s.state.foregroundApp!.value.id, '0070000200000001');
+        expect(s.state.foregroundApp!.confidence, Confidence.reported);
+        // A malformed fragment, the leaf only in a comment, no leaf, a leaf
+        // holding elements, or the answer element alone prove nothing.
+        for (final inner in [
+          '<X_AppList>$list',
+          '<!-- <X_AppList>$list</X_AppList> -->',
+          '<X_Other>$list</X_Other>',
+          '<X_AppList><b>$list</b></X_AppList>',
+          '<u:X_GetAppListResponse xmlns:u="x"></u:X_GetAppListResponse>',
+        ]) {
+          sim.respondOnce('X_GetAppList', status: 200, body: sealed(inner));
+          final r = await s.execute(const ListApps());
+          expect(_error(r).code, WatchmeErrorCode.protocol, reason: inner);
+          expect('${_error(r)}', isNot(contains('Netflix')), reason: inner);
+        }
+        // An effect's answer must still acknowledge it.
+        sim.respondOnce(
+          'X_LaunchApp',
+          status: 200,
+          body: sealed('<X_SessionId>1</X_SessionId>'),
+        );
+        final launch = await s.execute(const LaunchApp('0010000200000001'));
+        expect(_error(launch).code, WatchmeErrorCode.protocol);
+        expect(sim.effects, isEmpty);
+        expect(s.sessionsOpened, 1);
+      },
+    );
+
     test('the documented shapes are accepted: any prefix or none, '
         'self-closing, and an encrypted fragment bare, under a root or in '
         'X_OriginalResult, with or without an envelope', () async {

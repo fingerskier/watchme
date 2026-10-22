@@ -73,9 +73,11 @@ const Set<WatchmeErrorCode> _nothingDone = {
 /// fails after one of them was accepted reports
 /// [WatchmeErrorCode.partiallyDelivered]. Reads, and the session requests
 /// that encrypted commands need, never count as delivered. An HTTP 200
-/// that is not an answer to the request (an HTML page, say, or a
-/// decrypted fragment without it) is a protocol error: it confirms
-/// nothing, is never retried, and stops the command.
+/// that is not a well-formed answer to the request (an HTML page, say, a
+/// truncated document, or a decrypted fragment without the
+/// acknowledgement, or for a read without the value asked for) is a
+/// protocol error: it confirms nothing, is never retried, and stops the
+/// command.
 ///
 /// **Connection.** A request that reaches nothing, or
 /// [panasonicTimeoutsBeforeDisconnect] timeouts in a row, mark the session
@@ -503,14 +505,12 @@ final class PanasonicSession implements DriverSession {
   /// An empty list is what a TV in standby sends, not "no apps installed":
   /// it is reported as [Unsupported] with a standby observation.
   Future<CommandResult> _listApps() async {
-    final text = await _nrc('X_GetAppList', 'None', effect: false);
-    final list = xmlLeaf(text, 'X_AppList');
-    if (list == null) {
-      throw WatchmeError.protocol(
-        'The TV answered X_GetAppList without an app list',
-        rawDeviceMessage: _shown(text),
-      );
-    }
+    final list = await _nrc(
+      'X_GetAppList',
+      'None',
+      effect: false,
+      output: 'X_AppList',
+    );
     if (list.trim().isEmpty) {
       _emitState(_state.copyWith(power: _observed(PowerMode.standby)));
       return const Unsupported(
@@ -653,11 +653,11 @@ final class PanasonicSession implements DriverSession {
 
   // ------------------------------------------------------------ requests
 
-  /// Sends one NRC action and returns its answer: the plain SOAP body, or
-  /// the decrypted fragment of an encrypted one. A 200 to an [effect]
+  /// Sends one NRC action and returns the text of its [output] leaf (the
+  /// empty string when there is none to read). A 200 to an [effect]
   /// request counts towards what the command delivered once it proves to
   /// be an answer to [action]; one that is not is a protocol error (see
-  /// [_checkAnswer]).
+  /// [_plainAnswer] and [_decrypted]).
   ///
   /// On an encrypted TV, a 500 means the TV refused the command without
   /// running it, usually because the session expired: the session is
@@ -668,18 +668,19 @@ final class PanasonicSession implements DriverSession {
     String action,
     String args, {
     required bool effect,
+    String? output,
     bool retryRefused = true,
   }) async {
     if (!encrypted) {
       final r = await _send(() => _client.soap(VieraService.nrc, action, args));
       if (!r.ok) throw _httpError(r, action, plainNrc: true);
-      _checkAnswer(r, action, action);
+      final value = _plainAnswer(r, action, action, output: output);
       if (effect) _delivered++;
-      return r.text;
+      return value;
     }
     if (_sessionId == null) await _openSession();
     final r = await _sendEncrypted(action, args);
-    if (r.ok) return _decrypted(r, action, effect: effect);
+    if (r.ok) return _decrypted(r, action, effect: effect, output: output);
     if (r.status != 500) throw _httpError(r, action);
     _dropSession();
     if (!retryRefused) {
@@ -691,7 +692,9 @@ final class PanasonicSession implements DriverSession {
     }
     await _openSession();
     final again = await _sendEncrypted(action, args);
-    if (again.ok) return _decrypted(again, action, effect: effect);
+    if (again.ok) {
+      return _decrypted(again, action, effect: effect, output: output);
+    }
     if (again.status == 500) _dropSession();
     throw _httpError(again, action);
   }
@@ -715,13 +718,25 @@ final class PanasonicSession implements DriverSession {
     );
   }
 
-  /// The decrypted answer to an encrypted command the TV accepted. One
-  /// that cannot be decrypted, or whose fragment is no answer to [action],
-  /// is a protocol error: the TV may have run the command. The fragment is
-  /// what proves the answer; its outer wrapper is not checked, as the
-  /// field clients look for `X_EncResult` alone.
-  String _decrypted(HttpResult r, String action, {required bool effect}) {
-    final blob = xmlLeaf(r.text, 'X_EncResult');
+  /// The text of the [output] leaf in the decrypted answer to an encrypted
+  /// command the TV accepted, or the empty string for an [effect], whose
+  /// answer must acknowledge [action] instead
+  /// ([isEncryptedAcknowledgement]). A read needs only its leaf, anywhere
+  /// in a well-formed fragment ([encryptedAnswerLeaf]): the brief leaves
+  /// the fragment's wrapper unknown.
+  ///
+  /// An answer that is not well-formed XML, cannot be decrypted, or is no
+  /// answer to [action] is a protocol error: the TV may have run the
+  /// command. The fragment is what proves the answer; the outer wrapper of
+  /// `X_EncResult` is not checked, as the field clients look for
+  /// `X_EncResult` alone.
+  String _decrypted(
+    HttpResult r,
+    String action, {
+    required bool effect,
+    String? output,
+  }) {
+    final blob = encryptedResult(r.text);
     if (blob == null) {
       throw WatchmeError.protocol(
         '$action: the TV accepted the encrypted command but sent no '
@@ -740,8 +755,20 @@ final class PanasonicSession implements DriverSession {
       );
     }
     if (!opened.macOk) _macFailures++;
-    if (!isSoapAnswer(opened.text, action)) {
-      // Never the decrypted text: it holds the session's numbers.
+    // Never the decrypted text in an error: it holds the session's numbers.
+    if (output != null) {
+      final value = encryptedAnswerLeaf(opened.text, output);
+      if (value == null) {
+        throw WatchmeError.protocol(
+          '$action: the TV accepted the encrypted command, but its decrypted '
+          'answer holds no $output',
+          rawDeviceMessage: _rawOf(r),
+        );
+      }
+      if (effect) _delivered++;
+      return value;
+    }
+    if (!isEncryptedAcknowledgement(opened.text, action)) {
       throw WatchmeError.protocol(
         '$action: the TV accepted the encrypted command, but its decrypted '
         'answer is not an answer to it',
@@ -749,21 +776,39 @@ final class PanasonicSession implements DriverSession {
       );
     }
     if (effect) _delivered++;
-    return opened.text;
+    return '';
   }
 
-  /// Throws [WatchmeErrorCode.protocol] unless the 200 [r] is an answer to
-  /// [action] ([what] names the request). Anything else (an HTML page, an
-  /// empty body, another action's answer) says nothing about what the TV
-  /// did: it is never taken as success, never retried, and it stops the
-  /// command.
-  void _checkAnswer(HttpResult r, String action, String what) {
-    if (isSoapAnswer(r.text, action)) return;
-    throw WatchmeError.protocol(
-      '$what: the TV answered HTTP 200, but with something that is not an '
-      'answer to $action',
-      rawDeviceMessage: _rawOf(r),
-    );
+  /// The text of the [output] leaf of the plain 200 answer [r] to [action]
+  /// ([what] names the request), or the empty string without one. Throws
+  /// [WatchmeErrorCode.protocol] unless [r] is an answer to [action]
+  /// ([soapAnswer]) holding that leaf. Anything else (an HTML page, an
+  /// empty or truncated body, another action's answer) says nothing about
+  /// what the TV did: it is never taken as success, never retried, and it
+  /// stops the command.
+  String _plainAnswer(
+    HttpResult r,
+    String action,
+    String what, {
+    String? output,
+  }) {
+    final answer = soapAnswer(r.text, action);
+    if (answer == null) {
+      throw WatchmeError.protocol(
+        '$what: the TV answered HTTP 200, but with something that is not an '
+        'answer to $action',
+        rawDeviceMessage: _rawOf(r),
+      );
+    }
+    if (output == null) return '';
+    final value = soapAnswerLeaf(answer, output);
+    if (value == null) {
+      throw WatchmeError.protocol(
+        '$what: the TV answered $action without $output',
+        rawDeviceMessage: _rawOf(r),
+      );
+    }
+    return value;
   }
 
   /// Opens an encrypted session (`X_GetEncryptSessionId`) and restarts the
@@ -827,29 +872,36 @@ final class PanasonicSession implements DriverSession {
     String action,
     String args, {
     required bool effect,
+    String? output,
   }) async {
     final r = await _send(() => _client.soap(VieraService.dmr, action, args));
     if (!r.ok) throw _httpError(r, action);
-    _checkAnswer(r, action, action);
+    final value = _plainAnswer(r, action, action, output: output);
     if (effect) _delivered++;
-    return r.text;
+    return value;
   }
 
   Future<String> _pacCall(
     String action,
     String args, {
     required bool effect,
+    String? output,
   }) async {
     final r = await _send(() => _client.soap(VieraService.pac, action, args));
     if (!r.ok) throw _httpError(r, 'PAC $action');
-    _checkAnswer(r, action, 'PAC $action');
+    final value = _plainAnswer(r, action, 'PAC $action', output: output);
     if (effect) _delivered++;
-    return r.text;
+    return value;
   }
 
   Future<int> _readVolume() async {
-    final text = await _dmr('GetVolume', _instance, effect: false);
-    final level = int.tryParse(xmlLeaf(text, 'CurrentVolume')?.trim() ?? '');
+    final text = await _dmr(
+      'GetVolume',
+      _instance,
+      effect: false,
+      output: 'CurrentVolume',
+    );
+    final level = int.tryParse(text.trim());
     if (level == null || level < 0 || level > 100) {
       throw WatchmeError.protocol(
         'The TV answered GetVolume without a level',
@@ -861,8 +913,13 @@ final class PanasonicSession implements DriverSession {
   }
 
   Future<bool> _readMute() async {
-    final text = await _dmr('GetMute', _instance, effect: false);
-    final muted = switch (xmlLeaf(text, 'CurrentMute')?.trim()) {
+    final text = await _dmr(
+      'GetMute',
+      _instance,
+      effect: false,
+      output: 'CurrentMute',
+    );
+    final muted = switch (text.trim()) {
       '1' || 'true' => true,
       '0' || 'false' => false,
       _ => null,
@@ -976,8 +1033,11 @@ final class PanasonicSession implements DriverSession {
     var standby = false;
     switch (volume.status) {
       case 200:
+        final answer = soapAnswer(volume.text, 'GetVolume');
         final level = int.tryParse(
-          xmlLeaf(volume.text, 'CurrentVolume')?.trim() ?? '',
+          (answer == null ? null : soapAnswerLeaf(answer, 'CurrentVolume'))
+                  ?.trim() ??
+              '',
         );
         if (level != null && level >= 0 && level <= 100) {
           _emitState(_state.copyWith(volume: _reported(level)));
@@ -996,14 +1056,15 @@ final class PanasonicSession implements DriverSession {
     final on = await _pacAnswers();
     if (on) {
       if (!_pac) _learnPac();
-      final text = await _bestEffort(
+      final result = await _bestEffort(
         () => _pacCall(
           'X_SendInquiryCmd',
           '<X_InquiryCmdType>PAC_QMI</X_InquiryCmdType>',
           effect: false,
+          output: 'X_InquiryCmdResult',
         ),
       );
-      final current = text == null ? null : _pacValue(text, 'QMI');
+      final current = result == null ? null : _pacValue(result, 'QMI');
       if (current != null && current.isNotEmpty) {
         _emitState(
           _state.copyWith(input: _reported(vieraInputIdForPac(current))),
@@ -1022,12 +1083,14 @@ final class PanasonicSession implements DriverSession {
       _emitState(_state.copyWith(power: _state.power?.asStale()));
     }
     final info = await _bestEffort(
-      () =>
-          _nrc('X_GetAppInfo', '<u:X_InfoType></u:X_InfoType>', effect: false),
+      () => _nrc(
+        'X_GetAppInfo',
+        '<u:X_InfoType></u:X_InfoType>',
+        effect: false,
+        output: 'X_AppInfo',
+      ),
     );
-    final app = info == null
-        ? null
-        : parseVieraAppInfo(xmlLeaf(info, 'X_AppInfo') ?? '');
+    final app = info == null ? null : parseVieraAppInfo(info);
     if (app != null) {
       final named = AppInfo(id: app.id, name: _appNames[app.id] ?? app.name);
       _emitState(_state.copyWith(foregroundApp: _reported(named)));
@@ -1062,11 +1125,11 @@ final class PanasonicSession implements DriverSession {
     );
   }
 
-  /// The value of a PAC inquiry answer `QMI:H1` for [command] (`QMI`).
-  static String? _pacValue(String answer, String command) {
-    final result = xmlLeaf(answer, 'X_InquiryCmdResult')?.trim();
-    if (result == null || !result.startsWith('$command:')) return null;
-    return result.substring(command.length + 1).trim();
+  /// The value of a PAC inquiry result `QMI:H1` for [command] (`QMI`).
+  static String? _pacValue(String result, String command) {
+    final text = result.trim();
+    if (!text.startsWith('$command:')) return null;
+    return text.substring(command.length + 1).trim();
   }
 
   Observed<PowerMode> _observed(PowerMode mode) =>

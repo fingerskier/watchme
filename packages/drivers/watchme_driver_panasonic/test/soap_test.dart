@@ -156,6 +156,165 @@ void main() {
     });
   });
 
+  group('what proves an answer', () {
+    // The 301-byte X_SendKey answer of the brief, section 6.1.
+    const sendKeyAnswer =
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
+        's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">\n'
+        ' <s:Body>\n'
+        '  <u:X_SendKeyResponse '
+        'xmlns:u="urn:panasonic-com:service:p00NetworkControl:1">'
+        '</u:X_SendKeyResponse>\n'
+        ' </s:Body>\n'
+        '</s:Envelope>\n';
+
+    test('a plain answer is a well-formed envelope with the response '
+        'element in its Body, any prefix or none', () {
+      expect(utf8.encode(sendKeyAnswer), hasLength(301));
+      for (final body in [
+        sendKeyAnswer,
+        '<s:Envelope><s:Body><u:X_SendKeyResponse/></s:Body></s:Envelope>',
+        '<Envelope><Header/><Body>\r\n<X_SendKeyResponse>\r\n'
+            '</X_SendKeyResponse></Body></Envelope>\n',
+      ]) {
+        expect(isSoapAnswer(body, 'X_SendKey'), isTrue, reason: body);
+      }
+    });
+
+    test('a plain answer is nothing the parser refuses, and nothing that '
+        'merely mentions the response element', () {
+      for (final body in [
+        '<!-- diagnostic example: <X_SendKeyResponse/>',
+        '<s:Envelope><s:Body><u:X_SendKeyResponse/>',
+        '<s:Envelope><s:Body><u:X_SendKeyResponse/></s:Body></s:Envelope>'
+            'trailing text',
+        '<s:Envelope><s:Body><u:X_SendKeyResponse/></s:Body></s:Envelope>'
+            '<![CDATA[x]]>',
+        '<s:Envelope><s:Body><!-- <u:X_SendKeyResponse/> --></s:Body>'
+            '</s:Envelope>',
+        '<s:Envelope><s:Body><![CDATA[<u:X_SendKeyResponse/>]]></s:Body>'
+            '</s:Envelope>',
+        '<html><body><X_SendKeyResponse/></body></html>',
+        '<html><body><br><X_SendKeyResponse/></body></html>',
+        '<html><body>X_SendKeyResponse</body></html>',
+        '<s:Envelope><s:Header><u:X_SendKeyResponse/></s:Header><s:Body/>'
+            '</s:Envelope>',
+        '<s:Envelope><s:Body><s:Fault><u:X_SendKeyResponse/></s:Fault>'
+            '</s:Body></s:Envelope>',
+        '<s:Envelope><s:Body><u:X_LaunchAppResponse/></s:Body></s:Envelope>',
+        '<X_SendKeyResponse/>',
+        '',
+        'OK',
+      ]) {
+        expect(isSoapAnswer(body, 'X_SendKey'), isFalse, reason: body);
+      }
+    });
+
+    test('out-arguments come from the response element, entities decoded '
+        'once', () {
+      final answer = soapAnswer(
+        '<s:Envelope><s:Body><u:GetVolumeResponse><CurrentVolume>2&amp;0'
+            '</CurrentVolume></u:GetVolumeResponse><CurrentMute>1</CurrentMute>'
+            '</s:Body></s:Envelope>',
+        'GetVolume',
+      )!;
+      expect(soapAnswerLeaf(answer, 'CurrentVolume'), '2&0');
+      expect(soapAnswerLeaf(answer, 'CurrentMute'), isNull);
+    });
+
+    test('an encrypted acknowledgement: the documented wrappers, and '
+        'nothing malformed or buried in other content', () {
+      for (final fragment in [
+        '<u:X_SendKeyResponse xmlns:u="x"></u:X_SendKeyResponse>',
+        '<X_SendKeyResponse/>',
+        '<X_OriginalResult><u:X_SendKeyResponse>'
+            '</u:X_SendKeyResponse></X_OriginalResult>',
+        '<X_SessionId>1</X_SessionId>\r\n<X_SequenceNumber>00000002'
+            '</X_SequenceNumber>\r\n<X_OriginalResult><X_SendKeyResponse/>'
+            '</X_OriginalResult>',
+        '<?xml version="1.0"?><X_Data><X_SendKeyResponse/></X_Data>',
+        '<s:Envelope><s:Body><u:X_SendKeyResponse/></s:Body></s:Envelope>',
+      ]) {
+        expect(
+          isEncryptedAcknowledgement(fragment, 'X_SendKey'),
+          isTrue,
+          reason: fragment,
+        );
+      }
+      for (final fragment in [
+        '<!-- diagnostic example: <X_SendKeyResponse/>',
+        '<X_OriginalResult><u:X_SendKeyResponse xmlns:u="x"/>',
+        '<X_SendKeyResponse/><',
+        '<html><body><X_SendKeyResponse/></body></html>',
+        '<html><body><br><X_SendKeyResponse/></body></html>',
+        '<![CDATA[<X_SendKeyResponse/>]]>',
+        '</X_Data><X_SendKeyResponse/><X_Data>',
+        '<X_LaunchAppResponse/>',
+        'X_SendKeyResponse',
+        '',
+      ]) {
+        expect(
+          isEncryptedAcknowledgement(fragment, 'X_SendKey'),
+          isFalse,
+          reason: fragment,
+        );
+      }
+    });
+
+    test('an encrypted read: its leaf anywhere in a well-formed fragment, '
+        'with or without a response element', () {
+      for (final fragment in [
+        '<X_AppInfo>vc_app:1:a</X_AppInfo>',
+        '<v:X_AppInfo>vc_app:1:a</v:X_AppInfo>',
+        '<X_SessionId>1</X_SessionId><X_OriginalResult><u:X_GetAppInfoResponse>'
+            '<X_AppInfo>vc_app:1:a</X_AppInfo></u:X_GetAppInfoResponse>'
+            '</X_OriginalResult>',
+      ]) {
+        expect(
+          encryptedAnswerLeaf(fragment, 'X_AppInfo'),
+          'vc_app:1:a',
+          reason: fragment,
+        );
+      }
+      expect(encryptedAnswerLeaf('<X_AppInfo/>', 'X_AppInfo'), '');
+      for (final fragment in [
+        '<X_AppInfo>vc_app:1:a',
+        '<X_AppInfo>vc_app:1:a</X_AppInfo><',
+        '<!-- <X_AppInfo>vc_app:1:a</X_AppInfo> -->',
+        '<X_AppInfo><b>vc_app:1:a</b></X_AppInfo>',
+        '<u:X_GetAppInfoResponse/>',
+      ]) {
+        expect(
+          encryptedAnswerLeaf(fragment, 'X_AppInfo'),
+          isNull,
+          reason: fragment,
+        );
+      }
+    });
+
+    test('X_EncResult comes from a well-formed answer only, its wrapper '
+        'unchecked', () {
+      expect(encryptedResult('<X_EncResult>QUJD</X_EncResult>'), 'QUJD');
+      expect(
+        encryptedResult(
+          '<s:Envelope><s:Body><u:X_EncryptedCommandResponse>'
+          '<X_EncResult>QUJD</X_EncResult></u:X_EncryptedCommandResponse>'
+          '</s:Body></s:Envelope>',
+        ),
+        'QUJD',
+      );
+      expect(
+        encryptedResult(
+          '<s:Envelope><s:Body><u:X_EncryptedCommandResponse>'
+          '<X_EncResult>QUJD</X_EncResult>',
+        ),
+        isNull,
+      );
+      expect(encryptedResult('<root/>'), isNull);
+    });
+  });
+
   group('descriptions', () {
     // The element content of a real TX-49DX600EA description.
     const ddd = '''
