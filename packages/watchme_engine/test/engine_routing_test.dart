@@ -154,6 +154,36 @@ void main() {
     expect(atv.executed, [const StepVolume(1)]);
   });
 
+  test('volume commands sent just before close are released too', () async {
+    // Codex re-review of eae9178: send() yields before queueing, so a
+    // command sent just before close() queued itself after close() had
+    // released the queue, and waited behind the hung one for ever.
+    final never = Completer<CommandResult>();
+    final atv = FakeDriver(
+      'androidtv.remote2',
+      ceiling: const [relativeVolume],
+      onProbe: (_) => matched(capabilities: const [relativeVolume]),
+      onExecute: (_) => never.future,
+    );
+    final h = Harness(drivers: [atv]);
+    addTearDown(h.close);
+    final id = await h.add('10.0.2.10');
+    await h.clock.advance(const Duration(minutes: 1));
+
+    unawaited(h.engine.send(id, const StepVolume(1)));
+    await h.clock.flush();
+    final queued = [
+      for (var i = 0; i < 3; i++) h.engine.send(id, const StepVolume(1)),
+      h.engine.send(id, const SetMute(true)),
+    ];
+    await h.engine.close();
+    expect(
+      await Future.wait(queued),
+      everyElement(isFailedWith(WatchmeErrorCode.cancelled)),
+    );
+    expect(atv.executed, [const StepVolume(1)]);
+  });
+
   group('partial delivery', () {
     const keysOnly = CapabilitySupport.yes(
       Capability.volume,

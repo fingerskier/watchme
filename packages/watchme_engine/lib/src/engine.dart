@@ -1021,6 +1021,13 @@ final class Engine implements WatchmeEngine {
     String deviceId,
     Future<CommandResult> Function() run,
   ) {
+    // send() checked before it yielded; close() may have run since, and a
+    // waiter queued after it would never be released.
+    if (_closed) {
+      return Future.value(
+        const Failed(WatchmeError.cancelled('The engine is closed')),
+      );
+    }
     final previous = _volumeTail[deviceId];
     final done = Completer<void>();
     final tail = done.future;
