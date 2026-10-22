@@ -106,7 +106,7 @@ final class SharpLink {
   int _received = 0;
   int _discarded = 0;
   bool _gone = false;
-  bool _closing = false;
+  Future<void>? _closing;
   bool _wrote = false;
   bool _busy = false;
   DateTime? _goneAt;
@@ -117,7 +117,10 @@ final class SharpLink {
   /// Whether the connection can still carry a request.
   bool get isOpen => !_gone;
 
-  /// When the connection was found closed (by either side), if it was.
+  /// When the TV could last count the connection as open, once it is
+  /// closed: when the TV's close arrived, or, for a close this side
+  /// started, when it began and again once the socket has closed (the TV
+  /// sees it only then).
   DateTime? get closedAt => _goneAt;
 
   /// Unsolicited bytes dropped so far (late replies, stray `OK`s).
@@ -143,11 +146,17 @@ final class SharpLink {
     if (signal != null && !signal.isCompleted) signal.complete();
   }
 
-  /// Closes the connection. Safe to call more than once.
-  Future<void> close() async {
+  /// Closes the connection. Safe to call more than once: every call
+  /// returns the same future, which completes once the socket has closed
+  /// (a close started by a failed request included), so that whoever
+  /// waits for it knows the TV's client slot is free.
+  Future<void> close() {
+    final ours = !_gone;
     _onGone();
-    if (_closing) return;
-    _closing = true;
+    return _closing ??= _shutDown(ours: ours);
+  }
+
+  Future<void> _shutDown({required bool ours}) async {
     try {
       await _subscription.cancel();
     } on Object {
@@ -158,6 +167,7 @@ final class SharpLink {
     } on Object {
       // Closing a broken socket is not an error for the caller.
     }
+    if (ours) _goneAt = _clock.now();
   }
 
   // ------------------------------------------------------------------ login
@@ -207,10 +217,12 @@ final class SharpLink {
   ///   connection, so the link is closed without sending a password; the
   ///   login goes on a new connection.
   ///
-  /// Throws [WatchmeErrorCode.unreachable] when the TV closes the
-  /// connection instead, [WatchmeErrorCode.timeout] when it does not
-  /// answer, and [WatchmeErrorCode.protocol] for an answer that fits
-  /// nothing; each closes the link.
+  /// Throws [SharpLinkDown] when the connection was gone before `POWR?`
+  /// was written (nothing was delivered). Once it was written,
+  /// [WatchmeErrorCode.timeout] when the TV closes the connection instead
+  /// of answering or does not answer (it got the query), and
+  /// [WatchmeErrorCode.protocol] for an answer that fits nothing; each
+  /// closes the link.
   Future<bool> checkLoginEnforced() async {
     _buffer.clear();
     _write(sharpQuery('POWR'), 'POWR?');
@@ -243,9 +255,11 @@ final class SharpLink {
       );
     }
     if (gone) {
-      throw const WatchmeError.unreachable(
-        'The TV closed the connection after its login prompt; no login was '
-        'sent',
+      // POWR? went out: the connection was reached, so this is not
+      // "unreachable", whatever the TV made of the query.
+      throw const WatchmeError.timeout(
+        'The TV closed the connection after POWR? at its login prompt, '
+        'without answering it; no login was sent',
       );
     }
     throw const WatchmeError.timeout(

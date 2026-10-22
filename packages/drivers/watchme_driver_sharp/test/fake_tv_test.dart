@@ -133,6 +133,47 @@ void main() {
     await session.close();
   });
 
+  // Codex re-review of 7b4855f (Reqall 9535): POWR? had been delivered,
+  // yet a close in answer to it was reported as unreachable, which says
+  // nothing was.
+  group('a TV that closes the connection once POWR? reached it, at its '
+      'login prompt, is a timeout, never unreachable', () {
+    /// Shows the prompt, waits for the check and closes in answer.
+    Future<void> closeAfterCheck() async {
+      await clock.flush();
+      final tv = peers.single;
+      tv.send(ascii.encode('Login:'));
+      await clock.flush();
+      expect(sent(tv), 'POWR?   \r');
+      await tv.close();
+      await clock.flush();
+    }
+
+    test('on connect', () async {
+      Object? error;
+      final pending = driver
+          .connect(_endpoint, transports, login('admin', 'secret1'))
+          .then<void>((s) => s.close(), onError: (Object e) => error = e);
+      await closeAfterCheck();
+      await pending;
+      expect(error, isWatchmeError(WatchmeErrorCode.timeout));
+      expect(peers, hasLength(1), reason: 'nothing that was sent is retried');
+      expect(sent(peers.single), isNot(contains('admin')));
+    });
+
+    test('while pairing', () async {
+      final flow = driver.startPairing(
+        _endpoint,
+        transports,
+        const PairingContext(deviceId: 'tv-1', clientName: 'watchme test'),
+      )!;
+      final last = flow.steps.last;
+      await closeAfterCheck();
+      expect(await last, isPairingFailedWith(WatchmeErrorCode.timeout));
+      expect(peers, hasLength(1));
+    });
+  });
+
   test('the JP variant: CRLF and OK in two chunks are both dropped', () async {
     final pending = driver.connect(
       _endpoint,

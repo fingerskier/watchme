@@ -1087,6 +1087,82 @@ void main() {
       expect(sim.lines.where((l) => l == 'POWR1   '), hasLength(1));
     });
 
+    // Codex re-review of 7b4855f (Reqall 9526): the close a failed request
+    // started was dropped, so the session's close returned, and the next
+    // connection went out, while the old one still held the TV's only
+    // client slot.
+    group('a connection still closing after a send that failed holds the '
+        'TV\'s only client slot', () {
+      late _SendFailingTransports flaky;
+      late SharpSimulator sim;
+      late SharpSession session;
+      late Completer<void> release;
+
+      setUp(() async {
+        flaky = _SendFailingTransports();
+        sim = await startSim(SharpSimulator(rspw: 2));
+        session = await open(driver, sim, flaky);
+        release = Completer<void>();
+        addTearDown(() {
+          if (!release.isCompleted) release.complete();
+        });
+        flaky.network
+          ..failAfterSending = 'RCKY33'
+          ..holdCloseUntil = release.future;
+        expect(
+          await session.execute(const PressKey(RemoteKey.volumeUp)),
+          isFailedWith(WatchmeErrorCode.timeout),
+        );
+      });
+
+      test('close() returns only once it has closed, so a pairing that '
+          'follows gets the slot', () async {
+        var closed = false;
+        final closing = session.close().then((_) => closed = true);
+        await settle(const Duration(milliseconds: 100));
+        expect(closed, isFalse, reason: 'the connection is still closing');
+        expect(sim.openConnections, 1);
+
+        release.complete();
+        await closing;
+        expect(sim.overflowClosed, 0);
+        final steps = await drive(
+          driver.startPairing(sim.endpoint, flaky, testContext)!,
+          const [],
+        );
+        expect(steps.last, isA<Paired>());
+      });
+
+      test('the next request connects only once it has closed', () async {
+        unawaited(
+          Future<void>.delayed(
+            const Duration(milliseconds: 200),
+            release.complete,
+          ),
+        );
+        expect(await session.execute(const SetMute(true)), isConfirmed);
+        expect(sim.overflowClosed, 0);
+        expect(sim.muted, isTrue);
+      });
+    });
+
+    test('close() during a reconnect returns once the connection being '
+        'opened has closed again', () async {
+      final sim = await startSim(SharpSimulator());
+      final session = await open(driver, sim, transports);
+      await sim.dropConnections();
+      await settle(const Duration(milliseconds: 30));
+      final pending = session.execute(const SetMute(true));
+      // Connected again, and listening for a login prompt (150 ms).
+      await settle(const Duration(milliseconds: 60));
+      expect(sim.openConnections, 1);
+      await session.close();
+      await settle(const Duration(milliseconds: 30));
+      expect(sim.openConnections, 0);
+      expect(await pending, isFailedWith(WatchmeErrorCode.cancelled));
+      expect(sim.lines, isNot(contains('MUTE1   ')));
+    });
+
     test('a timeout closes the connection, so a late reply is never taken '
         'for the next request', () async {
       final sim = await startSim(SharpSimulator());
@@ -1314,6 +1390,11 @@ final class _SendFailingStack extends IoTcpOnlyStack {
   /// The next send that starts with this text goes out, then throws.
   String? failAfterSending;
 
+  /// When set as that send fails, its socket's close waits for it before
+  /// closing anything, as a close that waits for the TV can: until then
+  /// the connection holds the TV's client slot.
+  Future<void>? holdCloseUntil;
+
   @override
   Future<ByteSocket> tcp(
     String host,
@@ -1332,6 +1413,7 @@ final class _SendFailingSocket implements ByteSocket {
 
   final ByteSocket _inner;
   final _SendFailingStack _stack;
+  Future<void>? _holdClose;
 
   @override
   void send(List<int> bytes) {
@@ -1339,6 +1421,7 @@ final class _SendFailingSocket implements ByteSocket {
     final fail = _stack.failAfterSending;
     if (fail != null && String.fromCharCodes(bytes).startsWith(fail)) {
       _stack.failAfterSending = null;
+      _holdClose = _stack.holdCloseUntil;
       throw StateError('send failed after queueing');
     }
   }
@@ -1350,7 +1433,11 @@ final class _SendFailingSocket implements ByteSocket {
   Future<void> flush() => _inner.flush();
 
   @override
-  Future<void> close() => _inner.close();
+  Future<void> close() async {
+    final hold = _holdClose;
+    if (hold != null) await hold;
+    await _inner.close();
+  }
 
   @override
   Future<void> get done => _inner.done;

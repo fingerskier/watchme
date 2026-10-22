@@ -1,8 +1,10 @@
 @TestOn('vm')
 library;
 
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io' hide Datagram;
+import 'dart:typed_data';
 
 import 'package:test/test.dart';
 import 'package:watchme_core/watchme_core.dart';
@@ -388,4 +390,225 @@ void main() {
       expect(sim.power, isNot(SharpSimPower.on));
     });
   });
+
+  // Codex re-review of 7b4855f (Reqall 9526): the engine waited for the
+  // session's close, but that close did not wait for the connection a
+  // failed send was still closing, so pairing connected while the old
+  // connection held the TV's only client slot, and failed as unreachable.
+  test('pairing waits for the connection a failed send left closing, then '
+      'gets the TV\'s only client slot', () async {
+    final gated = _GatedSharpDriver();
+    await system.close();
+    system = await E2eSystem.start(dir, drivers: [gated]);
+    final release = Completer<void>();
+    addTearDown(() {
+      if (!release.isCompleted) release.complete();
+    });
+    final id = (await addSharp()).id;
+    expect(await send(id, const PressKey(RemoteKey.up)), isConfirmed);
+    gated
+      ..failAfterSending = 'RCKY33'
+      ..holdCloseUntil = release.future;
+    expect(
+      await send(id, const PressKey(RemoteKey.volumeUp)),
+      isFailedWith(WatchmeErrorCode.timeout),
+    );
+    expect(sim.openConnections, 1, reason: 'still closing');
+
+    final connects = gated.connects;
+    final pairing = pair(id, const []);
+    await Future<void>.delayed(const Duration(milliseconds: 500));
+    expect(gated.connects, connects, reason: 'the old connection holds it');
+    expect(sim.overflowClosed, 0);
+
+    release.complete();
+    final steps = await pairing;
+    expect(steps.last, const Paired.redacted());
+    expect(driver().connection, ConnectionState.connected);
+    expect(sim.lines.where((l) => l == 'RCKY33  '), hasLength(1));
+  });
+}
+
+/// The app's Sharp driver on sockets that fail one send after handing its
+/// bytes over ([failAfterSending]), and whose close then waits for
+/// [holdCloseUntil], as a close that waits for the TV can: until then the
+/// connection holds the TV's client slot.
+final class _GatedSharpDriver implements Driver {
+  final SharpDriver _inner = SharpDriver(
+    timings: e2eSharpTimings,
+    pollInterval: null,
+  );
+
+  /// The next send that starts with this text goes out, then throws.
+  String? failAfterSending;
+
+  /// What the close of that send's socket waits for.
+  Future<void>? holdCloseUntil;
+
+  /// TCP connections opened so far.
+  int connects = 0;
+
+  Transports _gate(Transports transports) => _GatedTransports(this, transports);
+
+  @override
+  DriverDescriptor get descriptor => _inner.descriptor;
+
+  @override
+  Future<ProbeResult> probe(Endpoint endpoint, Transports transports) =>
+      _inner.probe(endpoint, _gate(transports));
+
+  @override
+  PairingFlow? startPairing(
+    Endpoint endpoint,
+    Transports transports,
+    PairingContext context,
+  ) => _inner.startPairing(endpoint, _gate(transports), context);
+
+  @override
+  Future<DriverSession> connect(
+    Endpoint endpoint,
+    Transports transports,
+    Credential? credential, {
+    bool allowWake = true,
+  }) => _inner.connect(
+    endpoint,
+    _gate(transports),
+    credential,
+    allowWake: allowWake,
+  );
+}
+
+final class _GatedTransports implements Transports {
+  _GatedTransports(_GatedSharpDriver driver, this._inner)
+    : network = _GatedStack(driver, _inner.requireNetwork());
+
+  final Transports _inner;
+
+  @override
+  final NetworkStack network;
+
+  @override
+  Set<TransportFeature> get features => _inner.features;
+
+  @override
+  SerialPortProvider? get serial => _inner.serial;
+
+  @override
+  BleCentral? get ble => _inner.ble;
+
+  @override
+  HidPeripheral? get hid => _inner.hid;
+
+  @override
+  IrEmitter? get ir => _inner.ir;
+
+  @override
+  ProcessRunner? get process => _inner.process;
+}
+
+final class _GatedStack implements NetworkStack {
+  _GatedStack(this._driver, this._inner);
+
+  final _GatedSharpDriver _driver;
+  final NetworkStack _inner;
+
+  @override
+  Future<ByteSocket> tcp(
+    String host,
+    int port, {
+    TlsPolicy? tls,
+    ClientIdentity? identity,
+    Duration timeout = HttpCall.defaultTimeout,
+  }) async {
+    final socket = await _inner.tcp(
+      host,
+      port,
+      tls: tls,
+      identity: identity,
+      timeout: timeout,
+    );
+    _driver.connects++;
+    return _GatedSocket(_driver, socket);
+  }
+
+  @override
+  Future<HttpResult> http(
+    HttpCall call, {
+    TlsPolicy tls = TlsPolicy.platform,
+    ClientIdentity? identity,
+  }) => _inner.http(call, tls: tls, identity: identity);
+
+  @override
+  Future<MessageSocket> webSocket(
+    Uri uri, {
+    List<String> protocols = const [],
+    Map<String, String> headers = const {},
+    TlsPolicy tls = TlsPolicy.platform,
+    ClientIdentity? identity,
+    Duration timeout = HttpCall.defaultTimeout,
+  }) => _inner.webSocket(
+    uri,
+    protocols: protocols,
+    headers: headers,
+    tls: tls,
+    identity: identity,
+    timeout: timeout,
+  );
+
+  @override
+  Future<void> sendDatagram(
+    String host,
+    int port,
+    List<int> bytes, {
+    bool broadcast = false,
+  }) => _inner.sendDatagram(host, port, bytes, broadcast: broadcast);
+
+  @override
+  Stream<Datagram> multicastQuery(
+    String group,
+    int port,
+    List<int> query,
+    Duration window,
+  ) => _inner.multicastQuery(group, port, query, window);
+}
+
+final class _GatedSocket implements ByteSocket {
+  _GatedSocket(this._driver, this._inner);
+
+  final _GatedSharpDriver _driver;
+  final ByteSocket _inner;
+  Future<void>? _holdClose;
+
+  @override
+  void send(List<int> bytes) {
+    _inner.send(bytes);
+    final fail = _driver.failAfterSending;
+    if (fail != null && String.fromCharCodes(bytes).startsWith(fail)) {
+      _driver.failAfterSending = null;
+      _holdClose = _driver.holdCloseUntil;
+      throw StateError('send failed after queueing');
+    }
+  }
+
+  @override
+  Future<void> close() async {
+    final hold = _holdClose;
+    if (hold != null) await hold;
+    await _inner.close();
+  }
+
+  @override
+  Stream<Uint8List> get input => _inner.input;
+
+  @override
+  Future<void> flush() => _inner.flush();
+
+  @override
+  Future<void> get done => _inner.done;
+
+  @override
+  String? get peerCertificateSha256 => _inner.peerCertificateSha256;
+
+  @override
+  Uint8List? get peerCertificateDer => _inner.peerCertificateDer;
 }

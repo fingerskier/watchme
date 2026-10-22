@@ -834,19 +834,57 @@ void main() {
         expect(opened.executed, isEmpty);
       });
 
-      test('a close that never ends holds pairing back for the connect '
-          'timeout at most', () async {
+      // Codex re-review of 7b4855f (Reqall 9526): the wait used to end in
+      // the driver's pairing all the same, which then found the device
+      // still held and failed as unreachable.
+      test('a close that outlasts the connect timeout fails the pairing as a '
+          'timeout, without starting the driver\'s pairing', () async {
         fire.onConnect = (_, _) => slowSession();
         expect(await h.engine.send(id, home), isConfirmed);
+        final open = fire.lastSession as SlowCloseSession;
         startPairing();
         await pump();
         expect(fire.pairings, isEmpty);
+        await h.clock.advance(
+          const EngineConfig().connectTimeout - const Duration(seconds: 1),
+        );
+        await pump();
+        expect(steps, isEmpty, reason: 'still waiting for the close');
+        await h.clock.advance(const Duration(seconds: 1));
+        await done.future;
+        expect(steps.single, isPairingFailedWith(WatchmeErrorCode.timeout));
+        expect(fire.pairings, isEmpty, reason: 'the device may still be held');
+        expect(open.closed, isFalse);
+
+        // The close ending later starts nothing; the slot is free again.
+        release.complete();
+        await pump();
+        expect(fire.pairings, isEmpty);
+        expect(steps, hasLength(1));
+        expect(await h.engine.send(id, home), isConfirmed);
+      });
+
+      test('a pairing cancelled while it waits for the close never starts, '
+          'and the wait running out later changes nothing', () async {
+        fire.onConnect = (_, _) => slowSession();
+        expect(await h.engine.send(id, home), isConfirmed);
+        final flow = h.engine.pair(id, 'firetv.lightning');
+        final seen = <PairingStep>[];
+        final ended = Completer<void>();
+        flow.steps.listen(seen.add, onDone: ended.complete);
+        await pump();
+        flow.submit('1234');
+        await flow.cancel();
+        await ended.future;
+        expect(seen.single, isPairingFailedWith(WatchmeErrorCode.cancelled));
+
         await h.clock.advance(const EngineConfig().connectTimeout);
         await pump();
-        expect(fire.pairings, hasLength(1));
         release.complete();
-        await done.future;
-        expect(steps.last, isPairedWith(isNull));
+        await pump();
+        expect(fire.pairings, isEmpty);
+        expect(seen, hasLength(1));
+        expect(await h.credentials.read(id, 'firetv.lightning'), isNotNull);
       });
 
       test('a failed pairing frees the driver for the next command', () async {

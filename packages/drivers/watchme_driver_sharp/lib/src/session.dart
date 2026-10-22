@@ -134,6 +134,13 @@ final class SharpSession implements DriverSession {
   final List<String> _secrets;
 
   SharpLink? _link;
+
+  /// What may still hold the TV's only client slot after the session let
+  /// go of it: the closes of dropped connections (a request that failed
+  /// starts one of its own), and a connection opening when [close] was
+  /// called. Nothing reconnects, and [close] does not return, before they
+  /// are done.
+  final Set<Future<void>> _holding = {};
   DateTime? _lastClose;
   DateTime _lastUsed = DateTime.fromMillisecondsSinceEpoch(0);
   int _discardedBefore = 0;
@@ -950,6 +957,9 @@ final class SharpSession implements DriverSession {
       if (current.isOpen) return current;
     }
     _dropLink();
+    // The TV may serve one client at a time: a connection still closing
+    // would take the new one's place.
+    await _released();
     final last = _lastClose;
     if (last != null) {
       final wait = last.add(_timings.reconnectGap).difference(_clock.now());
@@ -957,7 +967,7 @@ final class SharpSession implements DriverSession {
     }
     _checkOpen();
     try {
-      final link = await openSharpLink(
+      final opening = openSharpLink(
         network: _network,
         host: _endpoint.host,
         port: _endpoint.port(SharpPorts.ipc, SharpPorts.ipcDefault),
@@ -965,6 +975,14 @@ final class SharpSession implements DriverSession {
         timings: _timings,
         credential: _credential,
       );
+      // A close meanwhile does not return until this connection is open
+      // and closed again (or failed to open).
+      _hold(
+        opening.then<void>((link) async {
+          if (_closed) await link.close();
+        }, onError: (Object _) {}),
+      );
+      final link = await opening;
       if (_closed) {
         await link.close();
         throw _closedError;
@@ -1001,7 +1019,29 @@ final class SharpSession implements DriverSession {
     if (link == null) return;
     _discardedBefore += link.discardedBytes;
     _lastClose = link.closedAt ?? _clock.now();
-    unawaited(link.close());
+    _hold(
+      link.close().then((_) {
+        // A close this side started reaches the TV only now: the gap
+        // before the next connection runs from then.
+        final at = link.closedAt;
+        final last = _lastClose;
+        if (at != null && (last == null || at.isAfter(last))) _lastClose = at;
+      }),
+    );
+  }
+
+  /// Keeps [work] in [_holding] until it completes.
+  void _hold(Future<void> work) {
+    late final Future<void> held;
+    held = work.whenComplete(() => _holding.remove(held));
+    _holding.add(held);
+  }
+
+  /// Waits until nothing in [_holding] holds the TV any more.
+  Future<void> _released() async {
+    while (_holding.isNotEmpty) {
+      await Future.wait([..._holding]);
+    }
   }
 
   void _touchIdle() {
@@ -1211,6 +1251,10 @@ final class SharpSession implements DriverSession {
     }
   }
 
+  /// Closes the session. It returns once every connection it opened has
+  /// closed (one closing after a failed request, or opening right now,
+  /// included), so that the TV's only client slot is free for whoever
+  /// connects next.
   @override
   Future<void> close() async {
     if (_closed) return;
@@ -1219,6 +1263,7 @@ final class SharpSession implements DriverSession {
     _idleTimer?.cancel();
     final link = _link;
     _link = null;
+    if (link != null) _hold(link.close());
     _connection = ConnectionState.disconnected;
     _state = _state.copyWith(
       connections: const {sharpDriverId: ConnectionState.disconnected},
@@ -1229,7 +1274,7 @@ final class SharpSession implements DriverSession {
         driverId: sharpDriverId,
       ),
     );
-    await link?.close();
+    await _released();
     await _events.close();
   }
 

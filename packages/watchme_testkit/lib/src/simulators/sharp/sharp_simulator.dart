@@ -901,6 +901,10 @@ final class _SharpConn {
       if (sim.enforceLogin) _state = _LoginState.user;
     }
     _touch();
+    // A client that resets the connection (one that closes with a reply
+    // unread) fails the write side too; that is the client leaving, not an
+    // error of the test.
+    unawaited(socket.done.then<void>((_) {}, onError: (Object _) {}));
     socket.listen(
       _onData,
       onError: (Object _) => destroy(),

@@ -920,10 +920,11 @@ final class Engine implements WatchmeEngine {
     // the pairing's connection fail. So the pairing reserves the slot,
     // and the driver's pairing starts once what held the device has let
     // go: the session's close, and a connect in flight with the close of
-    // what it opened. Until the pairing succeeds or ends, nothing else
-    // connects the slot: a command fails on this route (and may fall
-    // back), and no reconnect runs. A successful pairing connects again;
-    // otherwise the next command does.
+    // what it opened; if that takes longer than the connect timeout, the
+    // pairing fails as a timeout without starting. Until the pairing
+    // succeeds or ends, nothing else connects the slot: a command fails
+    // on this route (and may fall back), and no reconnect runs. A
+    // successful pairing connects again; otherwise the next command does.
     _reserved.add(slot);
     slot.cancelReconnect();
     if (slot.session != null || slot.connecting != null) {
@@ -994,9 +995,11 @@ final class Engine implements WatchmeEngine {
   }
 
   /// Completes once nothing recorded by [_holdUntil] holds [slot]'s device
-  /// any more, or after [EngineConfig.connectTimeout] at most: a close that
-  /// never returns must not keep the pairing from starting.
-  Future<void> _released(_DriverSlot slot) async {
+  /// any more. Fails with [WatchmeErrorCode.timeout] after
+  /// [EngineConfig.connectTimeout]: a close that never returns must not
+  /// keep the pairing waiting, and the driver's pairing must not start
+  /// while the old connection may still hold the device.
+  Future<void> _released(_DriverSlot slot) {
     Future<void> settled() async {
       for (
         var holds = _letGo[slot];
@@ -1007,16 +1010,16 @@ final class Engine implements WatchmeEngine {
       }
     }
 
-    try {
-      await withClockTimeout(
-        settled(),
-        config.connectTimeout,
-        _clock,
-        () => const WatchmeError.timeout('The old connection did not close'),
-      );
-    } on WatchmeError {
-      // Start anyway; the pairing reports what it finds.
-    }
+    return withClockTimeout(
+      settled(),
+      config.connectTimeout,
+      _clock,
+      () => WatchmeError.timeout(
+        'The previous connection to the device did not close within '
+        '${config.connectTimeout.inSeconds} s, so pairing did not start; '
+        'nothing was sent. Try again',
+      ),
+    );
   }
 
   /// Records [work] as holding [slot]'s device until it completes.
@@ -2010,13 +2013,14 @@ final class Engine implements WatchmeEngine {
 /// A driver's pairing flow that starts once [ready] completes (at once
 /// when it is `null`), its steps and answers passed through. Answers given
 /// before it starts are kept for it, and a cancel before then means it
-/// never starts.
+/// never starts. If [ready] fails, it never starts either: the flow ends
+/// with [PairingFailed] carrying that error.
 final class _DeferredPairingFlow implements PairingFlow {
   _DeferredPairingFlow(Future<void>? ready, this._start) {
     if (ready == null) {
       _begin();
     } else {
-      unawaited(ready.then((_) => _begin()));
+      unawaited(ready.then((_) => _begin(), onError: _fail));
     }
   }
 
@@ -2024,10 +2028,32 @@ final class _DeferredPairingFlow implements PairingFlow {
   final StreamController<PairingStep> _steps = StreamController();
   final List<String> _answers = [];
   PairingFlow? _inner;
-  bool _cancelled = false;
+
+  /// Whether the flow ended before the driver's started: cancelled, or
+  /// [ready] failed.
+  bool _ended = false;
+
+  void _fail(Object error) => _end(
+    PairingFailed(
+      error is WatchmeError
+          ? error
+          : WatchmeError.internal(
+              'Pairing could not start: $error',
+              cause: error,
+            ),
+    ),
+  );
+
+  void _end(PairingFailed step) {
+    if (_ended) return;
+    _ended = true;
+    _answers.clear();
+    _steps.add(step);
+    unawaited(_steps.close());
+  }
 
   void _begin() {
-    if (_cancelled) return;
+    if (_ended) return;
     final inner = _inner = _start();
     for (final answer in _answers) {
       inner.submit(answer);
@@ -2048,7 +2074,7 @@ final class _DeferredPairingFlow implements PairingFlow {
     final inner = _inner;
     if (inner != null) {
       inner.submit(value);
-    } else if (!_cancelled) {
+    } else if (!_ended) {
       _answers.add(value);
     }
   }
@@ -2057,12 +2083,7 @@ final class _DeferredPairingFlow implements PairingFlow {
   Future<void> cancel() async {
     final inner = _inner;
     if (inner != null) return inner.cancel();
-    if (_cancelled) return;
-    _cancelled = true;
-    _steps.add(
-      const PairingFailed(WatchmeError.cancelled('Pairing cancelled')),
-    );
-    unawaited(_steps.close());
+    _end(const PairingFailed(WatchmeError.cancelled('Pairing cancelled')));
   }
 }
 
