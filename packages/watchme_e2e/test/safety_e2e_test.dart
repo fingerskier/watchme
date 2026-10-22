@@ -535,8 +535,11 @@ void main() {
       final gate = roku.holdNext('POST', '/keypress/VolumeUp');
       final result = system.engine.send(id, const StepVolume(3));
       await gate.reached;
-      // The Roku drops off the network right after its first press.
+      // The Roku drops off the network right after its first press. Its
+      // port must refuse before the next press, or that press may connect
+      // and be reset (a protocol error, not unreachable).
       final stopped = roku.stop(force: false);
+      await roku.listenerClosed;
       gate.release();
       expect(
         await result,

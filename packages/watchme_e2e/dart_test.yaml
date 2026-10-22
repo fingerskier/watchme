@@ -1,0 +1,6 @@
+# One test file at a time. The simulators bind ports from the shared
+# ephemeral range, and some close and reopen theirs to model a device that
+# sleeps or powers off (the Fire TV API, a VIERA in standby). Run in
+# parallel, another file can take that port in between: the reopen fails,
+# or a passive reconnect reaches a different simulator.
+concurrency: 1

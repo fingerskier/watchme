@@ -484,6 +484,131 @@ void main() {
       expect(rig.h.transports.net.sentDatagrams, hasLength(packets));
     });
 
+    group('an on that an off interrupted while it was running', () {
+      // Codex review of 1a2ec5c: the interruption was checked only at a few
+      // points, so a send that started after an await (another route, the
+      // retry after Wake-on-LAN, the toggle after gathering evidence) still
+      // went out after the off was queued.
+      test('tries no other discrete route', () async {
+        final gate = Completer<void>();
+        var ons = 0;
+        Future<CommandResult> execute(Command c) async {
+          if (c == const SetPower(true) && ++ons == 1) {
+            await gate.future;
+            return const Failed(WatchmeError.unreachable('no route to host'));
+          }
+          return const Confirmed();
+        }
+
+        final roku = FakeDriver(
+          'roku.ecp',
+          ceiling: const [discreteOn, discreteOff],
+          onExecute: execute,
+        );
+        final cec = FakeDriver(
+          'cec.hub',
+          ceiling: const [discreteOn],
+          onExecute: execute,
+        );
+        final rig = await Rig([roku, cec]).add();
+        addTearDown(rig.h.close);
+
+        final on = rig.power(true);
+        await rig.h.clock.flush();
+        expect(ons, 1, reason: 'the first route is running');
+        final off = rig.power(false);
+        gate.complete();
+        expect(await on, isFailedWith(WatchmeErrorCode.cancelled));
+        expect(await off, isConfirmed);
+        expect(ons, 1, reason: 'no second route was tried');
+        expect(
+          [
+            ...roku.executed,
+            ...cec.executed,
+          ].where((c) => c == const SetPower(true)),
+          hasLength(1),
+        );
+      });
+
+      test('sends no retry once the woken device answers', () async {
+        late final Rig rig;
+        final roku = FakeDriver(
+          'roku.ecp',
+          ceiling: const [discreteOn, discreteOff],
+          onExecute: (c) => rig.online
+              ? const Confirmed()
+              : const Failed(WatchmeError.unreachable('no route to host')),
+        );
+        rig = await Rig([roku], mac: mac).add();
+        addTearDown(rig.h.close);
+        final answer = roku.onProbe!;
+        final probeGate = Completer<void>();
+        var holdNextProbe = false;
+        roku.onProbe = (endpoint) async {
+          if (holdNextProbe) {
+            holdNextProbe = false;
+            await probeGate.future;
+          }
+          return answer(endpoint);
+        };
+        rig.online = false;
+
+        CommandResult? onResult;
+        unawaited(rig.power(true).then((r) => onResult = r));
+        await rig.h.clock.flush();
+        expect(rig.h.transports.net.sentDatagrams, isNotEmpty);
+        rig.online = true;
+        holdNextProbe = true;
+        // The first poll comes after the Wake-on-LAN rounds.
+        for (var i = 0; i < 20 && holdNextProbe; i++) {
+          await rig.h.clock.advance(const Duration(seconds: 1));
+        }
+        expect(holdNextProbe, isFalse, reason: 'a wake probe is running');
+        expect(onResult, isNull, reason: 'the wake probe is held');
+
+        final off = rig.power(false);
+        await rig.h.clock.flush();
+        probeGate.complete();
+        await rig.h.clock.advance(const Duration(seconds: 2));
+        expect(onResult, isSentUnconfirmed);
+        expect(await off, isConfirmed);
+        expect(roku.executed, [const SetPower(true), const SetPower(false)]);
+      });
+
+      test('sends no toggle after gathering agreeing evidence', () async {
+        final ws = FakeDriver('samsung.ws', ceiling: const [toggleOn]);
+        final rest = FakeDriver('samsung.rest', ceiling: const [powerState]);
+        final rig = await Rig([ws, rest]).add();
+        addTearDown(rig.h.close);
+        rig
+          ..probeSays(ws, PowerMode.standby)
+          ..probeSays(rest, PowerMode.off);
+        final answer = rest.onProbe!;
+        final probeGate = Completer<void>();
+        var held = false;
+        rest.onProbe = (endpoint) async {
+          if (!held) {
+            held = true;
+            await probeGate.future;
+          }
+          return answer(endpoint);
+        };
+
+        final on = rig.power(true);
+        await rig.h.clock.flush();
+        expect(held, isTrue, reason: 'gathering evidence');
+        final off = rig.power(false);
+        await rig.h.clock.flush();
+        probeGate.complete();
+        expect(await on, isFailedWith(WatchmeErrorCode.cancelled));
+        expect(
+          await off,
+          isUnsupported('No driver for this device can turn it off'),
+        );
+        expect(ws.executed.where(isPowerCommand), isEmpty);
+      });
+    });
+
     test('no toggle after Wake-on-LAN, even with agreeing sources', () async {
       final ws = FakeDriver('samsung.ws', ceiling: const [toggleOn]);
       final rest = FakeDriver('samsung.rest', ceiling: const [powerState]);

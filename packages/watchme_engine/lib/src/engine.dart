@@ -208,6 +208,10 @@ final class Engine implements WatchmeEngine {
   Future<void> close() async {
     if (_closed) return;
     _closed = true;
+    for (final turn in _volumeWaiters) {
+      turn.complete();
+    }
+    _volumeWaiters.clear();
     power.close();
     for (final pairing in [..._pairings.values]) {
       await pairing.cancel();
@@ -220,6 +224,9 @@ final class Engine implements WatchmeEngine {
       }
       unawaited(entry.events.close());
     }
+    // A record write started before close may still be on its way to the
+    // store; the caller may delete the store's directory once this returns.
+    await Future.wait([..._pendingWrites]);
     unawaited(_deviceLists.close());
   }
 
@@ -1027,19 +1034,43 @@ final class Engine implements WatchmeEngine {
   /// Per device, the last volume or mute command queued.
   final Map<String, Future<void>> _volumeTail = {};
 
+  /// Volume and mute commands still waiting for the one in front of them.
+  /// [close] lets them all go at once. Only waiting commands are held here,
+  /// so nothing accumulates while commands come and go.
+  final Set<Completer<void>> _volumeWaiters = {};
+
   /// Runs volume and mute commands for [deviceId] one at a time, so each
   /// routes and infers from the level the previous one left: two
   /// overlapping `SetVolume(20)` from 10 on a relative-only route must not
   /// both step by +10.
+  ///
+  /// [close] releases every queued command at once, as cancelled, even
+  /// while the one in front never finishes (a hung session).
   Future<CommandResult> _serialVolume(
     String deviceId,
     Future<CommandResult> Function() run,
   ) {
-    final previous = _volumeTail[deviceId] ?? Future<void>.value();
+    // send() checked before it yielded; close() may have run since, and a
+    // waiter queued after it would never be released.
+    if (_closed) {
+      return Future.value(
+        const Failed(WatchmeError.cancelled('The engine is closed')),
+      );
+    }
+    final previous = _volumeTail[deviceId];
     final done = Completer<void>();
     final tail = done.future;
     _volumeTail[deviceId] = tail;
-    return previous
+    final turn = Completer<void>();
+    if (previous == null) {
+      turn.complete();
+    } else {
+      _volumeWaiters.add(turn);
+      previous.then((_) {
+        if (_volumeWaiters.remove(turn)) turn.complete();
+      });
+    }
+    return turn.future
         .then<CommandResult>((_) {
           if (_closed) {
             return const Failed(WatchmeError.cancelled('The engine is closed'));
@@ -1796,13 +1827,21 @@ final class Engine implements WatchmeEngine {
     e.unreachable.remove(slot.driverId);
   }
 
-  Future<void> _persistQuietly(_DeviceEntry e) async {
-    if (e.forgotten) return;
-    try {
-      await _repository.put(e.record);
-    } on Object {
-      // lastSeen is refreshed on the next successful write.
-    }
+  /// Writes of device records still in progress. [close] waits for them,
+  /// so nothing writes to the store after it returns.
+  final Set<Future<void>> _pendingWrites = {};
+
+  Future<void> _persistQuietly(_DeviceEntry e) {
+    if (e.forgotten || _closed) return Future.value();
+    final write = () async {
+      try {
+        await _repository.put(e.record);
+      } on Object {
+        // lastSeen is refreshed on the next successful write.
+      }
+    }();
+    _pendingWrites.add(write);
+    return write.whenComplete(() => _pendingWrites.remove(write));
   }
 
   void _applyState(_DeviceEntry e, DeviceState diff, String driverId) {

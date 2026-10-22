@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:test/test.dart';
 import 'package:watchme_core/watchme_core.dart';
+import 'package:watchme_engine/watchme_engine.dart';
 import 'package:watchme_testkit/watchme_testkit.dart';
 
 import 'support/fakes.dart';
@@ -410,6 +411,43 @@ void main() {
         );
       },
     );
+  });
+
+  test('close waits for a device-record write in progress and starts no '
+      'more', () async {
+    // CI flake on main: a background lastSeen write landed in the state
+    // directory after Engine.close returned, while the test deleted it.
+    final repository = _HeldWrites();
+    const keys = [CapabilitySupport.yes(Capability.systemKeys)];
+    final roku = FakeDriver(
+      'roku.ecp',
+      ceiling: keys,
+      onProbe: (_) => matched(capabilities: keys),
+    );
+    final engine = Engine(
+      drivers: [roku],
+      transports: FakeTransports(),
+      credentials: MemoryCredentialStore(),
+      repository: repository,
+      clock: FakeClock(DateTime.utc(2026, 10, 22, 12)),
+    );
+    final id = (await engine.addManual('10.0.2.10')).id;
+    await pump();
+    repository.holdNext = true;
+    expect(await engine.send(id, const PressKey(RemoteKey.home)), isConfirmed);
+    await pump();
+    final release = repository.held;
+    expect(release, isNotNull, reason: 'connecting writes lastSeen');
+
+    var closed = false;
+    final closing = engine.close().then((_) => closed = true);
+    await pump();
+    expect(closed, isFalse, reason: 'the write is still on its way');
+    release!.complete();
+    await closing;
+    final writes = repository.writes;
+    await pump();
+    expect(repository.writes, writes, reason: 'nothing is written after');
   });
 
   group('connect timeouts and races', () {
@@ -897,4 +935,32 @@ void main() {
       expect(await h.engine.send(id, home), isConfirmed);
     });
   });
+}
+
+/// A device repository whose next write, once [holdNext] is set, waits
+/// until [held] is completed.
+final class _HeldWrites implements DeviceRepository {
+  final MemoryDeviceRepository _records = MemoryDeviceRepository();
+  bool holdNext = false;
+  Completer<void>? held;
+  int writes = 0;
+
+  @override
+  Future<List<DeviceRecord>> all() => _records.all();
+
+  @override
+  Future<DeviceRecord?> get(String id) => _records.get(id);
+
+  @override
+  Future<void> put(DeviceRecord record) async {
+    if (holdNext) {
+      holdNext = false;
+      await (held = Completer<void>()).future;
+    }
+    await _records.put(record);
+    writes++;
+  }
+
+  @override
+  Future<void> remove(String id) => _records.remove(id);
 }
