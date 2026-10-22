@@ -72,7 +72,10 @@ const Set<WatchmeErrorCode> _nothingDone = {
 /// **Delivery.** A command sent as several requests (channel digits) that
 /// fails after one of them was accepted reports
 /// [WatchmeErrorCode.partiallyDelivered]. Reads, and the session requests
-/// that encrypted commands need, never count as delivered.
+/// that encrypted commands need, never count as delivered. An HTTP 200
+/// that is not an answer to the request (an HTML page, say, or a
+/// decrypted fragment without it) is a protocol error: it confirms
+/// nothing, is never retried, and stops the command.
 ///
 /// **Connection.** A request that reaches nothing, or
 /// [panasonicTimeoutsBeforeDisconnect] timeouts in a row, mark the session
@@ -652,7 +655,9 @@ final class PanasonicSession implements DriverSession {
 
   /// Sends one NRC action and returns its answer: the plain SOAP body, or
   /// the decrypted fragment of an encrypted one. A 200 to an [effect]
-  /// request counts towards what the command delivered.
+  /// request counts towards what the command delivered once it proves to
+  /// be an answer to [action]; one that is not is a protocol error (see
+  /// [_checkAnswer]).
   ///
   /// On an encrypted TV, a 500 means the TV refused the command without
   /// running it, usually because the session expired: the session is
@@ -668,6 +673,7 @@ final class PanasonicSession implements DriverSession {
     if (!encrypted) {
       final r = await _send(() => _client.soap(VieraService.nrc, action, args));
       if (!r.ok) throw _httpError(r, action, plainNrc: true);
+      _checkAnswer(r, action, action);
       if (effect) _delivered++;
       return r.text;
     }
@@ -710,7 +716,10 @@ final class PanasonicSession implements DriverSession {
   }
 
   /// The decrypted answer to an encrypted command the TV accepted. One
-  /// that cannot be decrypted is a protocol error: the TV ran the command.
+  /// that cannot be decrypted, or whose fragment is no answer to [action],
+  /// is a protocol error: the TV may have run the command. The fragment is
+  /// what proves the answer; its outer wrapper is not checked, as the
+  /// field clients look for `X_EncResult` alone.
   String _decrypted(HttpResult r, String action, {required bool effect}) {
     final blob = xmlLeaf(r.text, 'X_EncResult');
     if (blob == null) {
@@ -731,8 +740,30 @@ final class PanasonicSession implements DriverSession {
       );
     }
     if (!opened.macOk) _macFailures++;
+    if (!isSoapAnswer(opened.text, action)) {
+      // Never the decrypted text: it holds the session's numbers.
+      throw WatchmeError.protocol(
+        '$action: the TV accepted the encrypted command, but its decrypted '
+        'answer is not an answer to it',
+        rawDeviceMessage: _rawOf(r),
+      );
+    }
     if (effect) _delivered++;
     return opened.text;
+  }
+
+  /// Throws [WatchmeErrorCode.protocol] unless the 200 [r] is an answer to
+  /// [action] ([what] names the request). Anything else (an HTML page, an
+  /// empty body, another action's answer) says nothing about what the TV
+  /// did: it is never taken as success, never retried, and it stops the
+  /// command.
+  void _checkAnswer(HttpResult r, String action, String what) {
+    if (isSoapAnswer(r.text, action)) return;
+    throw WatchmeError.protocol(
+      '$what: the TV answered HTTP 200, but with something that is not an '
+      'answer to $action',
+      rawDeviceMessage: _rawOf(r),
+    );
   }
 
   /// Opens an encrypted session (`X_GetEncryptSessionId`) and restarts the
@@ -770,7 +801,7 @@ final class PanasonicSession implements DriverSession {
       return;
     }
     if (r.status == 500) {
-      if (await vieraPacAnswers(_client)) {
+      if (await _pacAnswers()) {
         throw _reauth(
           WatchmeError.reauthRequired(
             'The TV is on but refused to open an encrypted session (HTTP '
@@ -799,6 +830,7 @@ final class PanasonicSession implements DriverSession {
   }) async {
     final r = await _send(() => _client.soap(VieraService.dmr, action, args));
     if (!r.ok) throw _httpError(r, action);
+    _checkAnswer(r, action, action);
     if (effect) _delivered++;
     return r.text;
   }
@@ -810,6 +842,7 @@ final class PanasonicSession implements DriverSession {
   }) async {
     final r = await _send(() => _client.soap(VieraService.pac, action, args));
     if (!r.ok) throw _httpError(r, 'PAC $action');
+    _checkAnswer(r, action, 'PAC $action');
     if (effect) _delivered++;
     return r.text;
   }
@@ -842,6 +875,21 @@ final class PanasonicSession implements DriverSession {
     }
     _emitState(_state.copyWith(muted: _reported(muted)));
     return muted;
+  }
+
+  /// [vieraPacAnswers] as a request of this session ([_send]): not sent
+  /// once the session is closed, and a session closed while it was out
+  /// stops the caller instead of acting on its answer.
+  Future<bool> _pacAnswers() async {
+    final HttpResult r;
+    try {
+      r = await _send(() => _client.get(VieraPaths.pacDescription));
+    } on WatchmeError {
+      if (_closed) throw _closedError;
+      return false;
+    }
+    if (_closed) throw _closedError;
+    return _isPacDescription(r);
   }
 
   /// Sends one request unless the session was closed meanwhile. Every
@@ -923,6 +971,8 @@ final class PanasonicSession implements DriverSession {
       if (strict) rethrow;
       return;
     }
+    // A session closed while the read was out uses nothing more.
+    if (_closed) throw _closedError;
     var standby = false;
     switch (volume.status) {
       case 200:
@@ -943,7 +993,7 @@ final class PanasonicSession implements DriverSession {
         break;
     }
     // A Pro AV description answers only on PAC models, and only while on.
-    final on = await vieraPacAnswers(_client);
+    final on = await _pacAnswers();
     if (on) {
       if (!_pac) _learnPac();
       final text = await _bestEffort(
@@ -985,13 +1035,18 @@ final class PanasonicSession implements DriverSession {
   }
 
   /// [read]'s value, or `null` when it fails. A transport failure still
-  /// counts towards the connection state (see [_send]).
-  static Future<T?> _bestEffort<T>(Future<T> Function() read) async {
+  /// counts towards the connection state (see [_send]). A session closed
+  /// meanwhile stops the caller instead, whatever the read's outcome.
+  Future<T?> _bestEffort<T>(Future<T> Function() read) async {
+    final T value;
     try {
-      return await read();
+      value = await read();
     } on WatchmeError {
+      if (_closed) throw _closedError;
       return null;
     }
+    if (_closed) throw _closedError;
+    return value;
   }
 
   /// The TV answered its Pro AV description: PAC input codes and the
@@ -1183,9 +1238,14 @@ final class PanasonicSession implements DriverSession {
 /// also what TVs without PAC answer. Passive.
 Future<bool> vieraPacAnswers(VieraClient client, {Duration? timeout}) async {
   try {
-    final r = await client.get(VieraPaths.pacDescription, timeout: timeout);
-    return r.status == 200 && r.text.contains('p00ProAVController');
+    return _isPacDescription(
+      await client.get(VieraPaths.pacDescription, timeout: timeout),
+    );
   } on WatchmeError {
     return false;
   }
 }
+
+/// Whether [r] is a Pro AV description that answered 200.
+bool _isPacDescription(HttpResult r) =>
+    r.status == 200 && r.text.contains('p00ProAVController');

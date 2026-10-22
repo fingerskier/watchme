@@ -42,6 +42,38 @@ void main() {
       );
     });
 
+    test('redacts an unclosed secret element through the end of the text, '
+        'escaped or not', () {
+      for (final (text, clean) in [
+        ('<X_AuthResult>QUJDREVG', '<X_AuthResult><redacted>'),
+        (
+          '<s:Body>\n  <u:X_RequestAuthResponse>\n   <X_AuthResult>QUJD',
+          '<s:Body>\n  <u:X_RequestAuthResponse>\n   <X_AuthResult><redacted>',
+        ),
+        (
+          '<v:X_EncResult a="1">QUJD</v:X_EncRes',
+          '<v:X_EncResult a="1"><redacted>',
+        ),
+        ('echo &lt;X_Keyword&gt;QUJD', 'echo &lt;X_Keyword&gt;<redacted>'),
+        (
+          '&amp;lt;X_PinCode&amp;gt;4410',
+          '&amp;lt;X_PinCode&amp;gt;<redacted>',
+        ),
+        ('%3CX_EncInfo%3EQUJD%2F', '%3CX_EncInfo%3E<redacted>'),
+        (
+          '<X_EncInfo>a</X_EncInfo> ok <X_EncResult>b',
+          '<X_EncInfo><redacted></X_EncInfo> ok <X_EncResult><redacted>',
+        ),
+      ]) {
+        expect(redactViera(text), clean, reason: text);
+      }
+      // Empty and self-closing elements hide nothing: what follows them is
+      // left alone.
+      const empty = '<X_PinCode/> <X_PinCode /> <X_PinCode></X_PinCode> 600';
+      expect(redactViera(empty), empty);
+      expect(redactViera('ends <X_AuthResult>'), 'ends <X_AuthResult>');
+    });
+
     test('strips known values verbatim, percent-encoded and as character '
         'references, keeping the other words', () {
       const key = 'ICEi/yQlJic+KSorLC0uLw==';

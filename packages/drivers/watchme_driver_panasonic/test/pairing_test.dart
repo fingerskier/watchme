@@ -2,9 +2,11 @@
 library;
 
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:test/test.dart';
 import 'package:watchme_core/watchme_core.dart';
+import 'package:watchme_driver_panasonic/src/crypto.dart';
 import 'package:watchme_driver_panasonic/watchme_driver_panasonic.dart';
 import 'package:watchme_testkit/panasonic_simulator.dart';
 
@@ -306,6 +308,69 @@ void main() {
     final failed = (await pair()).last as PairingFailed;
     expect(failed.error.code, WatchmeErrorCode.protocol);
     expect(failed.error.message, contains('no pairing key'));
+  });
+
+  group('a truncated or escaped pairing answer shows no secret', () {
+    /// Fails if any 10 characters in a row of [secret] are in [text].
+    void expectNoPiece(String text, String secret) {
+      for (var i = 0; i + 10 <= secret.length; i++) {
+        expect(
+          text,
+          isNot(contains(secret.substring(i, i + 10))),
+          reason: 'leaked part of $secret',
+        );
+      }
+    }
+
+    String shown(PairingFailed failed) =>
+        '${failed.error} ${failed.error.cause} ${jsonEncode(failed.toJson())}';
+
+    test('X_ChallengeKey cut off before its closing tag', () async {
+      const challenge = 'mUQdS7/RyJTMsiojPz9i1Q==';
+      final full = panasonicSimSoapAnswer(
+        'X_DisplayPinCode',
+        panasonicSimNrcUrn,
+        [('X_ChallengeKey', challenge)],
+      );
+      await startSim(PanasonicSimulator(encrypted: true));
+      sim.respondOnce(
+        'X_DisplayPinCode',
+        status: 200,
+        body: full.substring(0, full.indexOf(challenge) + 20),
+      );
+      final failed = (await pair()).single as PairingFailed;
+      expect(failed.error.code, WatchmeErrorCode.protocol);
+      expect(failed.rawDeviceMessage, endsWith('<X_ChallengeKey><redacted>'));
+      expectNoPiece(shown(failed), challenge);
+    });
+
+    test('X_AuthResult cut off, or echoed escaped without its end', () async {
+      final blob = vieraSeal(
+        VieraKeys.forPairing('mUQdS7/RyJTMsiojPz9i1Q=='),
+        '<X_ApplicationId>AQIDBAUGBwgJCg==</X_ApplicationId>\n'
+        '<X_Keyword>ICEiIyQlJicoKSorLC0uLw==</X_Keyword>',
+        header: List.filled(12, 7),
+      );
+      final full = panasonicSimSoapAnswer('X_RequestAuth', panasonicSimNrcUrn, [
+        ('X_AuthResult', blob),
+      ]);
+      final at = full.indexOf(blob);
+      for (final body in [
+        '<X_AuthResult>$blob',
+        full.substring(0, at + blob.length ~/ 2),
+        full.substring(0, at + blob.length + '</X_AuthRes'.length),
+        'Bad request: &lt;X_AuthResult&gt;$blob',
+      ]) {
+        await startSim(PanasonicSimulator(encrypted: true));
+        sim.respondOnce('X_RequestAuth', status: 200, body: body);
+        final failed = (await pair()).last as PairingFailed;
+        expect(failed.error.code, WatchmeErrorCode.protocol, reason: body);
+        expect(failed.error.message, contains('no pairing key'));
+        expect(failed.rawDeviceMessage, endsWith('<redacted>'), reason: body);
+        expectNoPiece(shown(failed), blob);
+        expect(sim.pairings, isEmpty);
+      }
+    });
   });
 
   test('a TV that is gone fails pairing as unreachable', () async {

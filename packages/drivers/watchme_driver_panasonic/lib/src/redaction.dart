@@ -23,7 +23,8 @@ const Set<String> vieraSecretElements = {
 ///
 /// * The content of every [vieraSecretElements] element is replaced, with
 ///   any namespace prefix and also where the markup itself is escaped
-///   (`&lt;X_PinCode&gt;...`).
+///   (`&lt;X_PinCode&gt;...`). An element that is never closed (a
+///   truncated answer) is replaced through the end of [text].
 /// * Every occurrence of every [secrets] value (the app id, the keyword,
 ///   the challenge, the PIN) is replaced, verbatim, trimmed, and wherever
 ///   XML character references or percent-encoding (`%2F` for a base64 `/`)
@@ -79,9 +80,12 @@ WatchmeError redactVieraError(WatchmeError error, Iterable<String> secrets) {
 /// How many levels of escaping are decoded (`&amp;lt;` takes two).
 const int _decodeDepth = 3;
 
+/// A secret element and its content, up to its closing tag or, when that
+/// never comes (a truncated answer), to the end of the text. A
+/// self-closing element has no content.
 final RegExp _secretElement = RegExp(
   '<(?:[A-Za-z_][\\w.-]*:)?(${vieraSecretElements.join('|')})'
-  '(?:\\s[^>]*)?>(.*?)</(?:[A-Za-z_][\\w.-]*:)?\\1\\s*>',
+  '(?:\\s[^>]*)?(?<!/)>(.*?)(?:</(?:[A-Za-z_][\\w.-]*:)?\\1\\s*>|\$)',
   dotAll: true,
 );
 

@@ -5,6 +5,7 @@ import 'dart:async';
 
 import 'package:test/test.dart';
 import 'package:watchme_core/watchme_core.dart';
+import 'package:watchme_driver_panasonic/src/crypto.dart';
 import 'package:watchme_driver_panasonic/watchme_driver_panasonic.dart';
 import 'package:watchme_testkit/panasonic_simulator.dart';
 import 'package:watchme_testkit/watchme_testkit.dart';
@@ -782,6 +783,144 @@ void main() {
     );
   });
 
+  group('answers that are not an acknowledgement', () {
+    /// An encrypted answer whose sealed fragment is [inner].
+    String sealed(String inner) => panasonicSimSoapAnswer(
+      'X_EncryptedCommand',
+      panasonicSimNrcUrn,
+      [('X_EncResult', vieraSeal(VieraKeys.forSession(_keyword), inner))],
+    );
+
+    test('a plain 200 that is no answer to the action is a protocol error, '
+        'never Confirmed', () async {
+      await startSim(PanasonicSimulator(pac: true));
+      final s = await connect();
+      for (final (target, command, body) in [
+        ('X_SendKey', const PressKey(RemoteKey.up), '<html>Busy</html>'),
+        ('X_SendKey', const PressKey(RemoteKey.up), ''),
+        ('X_SendKey', const PressKey(RemoteKey.up), 'OK'),
+        (
+          'X_SendKey',
+          const PressKey(RemoteKey.up),
+          panasonicSimSoapAnswer('X_LaunchApp', panasonicSimNrcUrn),
+        ),
+        (
+          'X_LaunchApp',
+          const LaunchApp('0010000200000001'),
+          '<html>Busy</html>',
+        ),
+        ('X_SendString', const TypeText('abc'), '<html>Busy</html>'),
+        ('SetVolume', const SetVolume(30), '<html>Busy</html>'),
+        ('SetMute', const SetMute(true), '<html>Busy</html>'),
+        ('X_SendCtrlCmd', const SelectInput('H3'), '<html>Busy</html>'),
+      ]) {
+        sim.respondOnce(target, status: 200, body: body);
+        final r = await s.execute(command);
+        expect(_error(r).code, WatchmeErrorCode.protocol, reason: target);
+        expect(_error(r).message, contains('not an answer'), reason: target);
+        if (body.isNotEmpty) {
+          expect(_error(r).rawDeviceMessage, contains(body.substring(0, 2)));
+        }
+      }
+      expect(sim.keyLog, isEmpty);
+      expect(sim.effects, isEmpty);
+    });
+
+    test('an encrypted answer that decrypts to anything but the answer is a '
+        'protocol error, and the command is not resent', () async {
+      await startSim(PanasonicSimulator(encrypted: true));
+      final s = await connect();
+      final inners = [
+        'this is not a SOAP result',
+        '',
+        '<html>Busy</html>',
+        '<u:X_LaunchAppResponse xmlns:u="x"></u:X_LaunchAppResponse>',
+      ];
+      for (final inner in inners) {
+        sim.respondOnce('X_SendKey', status: 200, body: sealed(inner));
+        final r = await s.execute(const PressKey(RemoteKey.up));
+        expect(_error(r).code, WatchmeErrorCode.protocol, reason: inner);
+        expect(r.partiallyDelivered, isFalse);
+        // The decrypted text never reaches an error.
+        expect(_error(r).rawDeviceMessage, contains('<redacted>'));
+        expect('${_error(r)}', isNot(contains('not a SOAP')));
+      }
+      expect(sim.keyLog, isEmpty);
+      expect(sim.actions, List.filled(inners.length, 'X_SendKey'));
+      expect(s.sessionsOpened, 1);
+    });
+
+    for (final encrypted in [false, true]) {
+      test('one stops a multi-key command, which was partly delivered '
+          '(${encrypted ? 'encrypted' : 'plain'})', () async {
+        await startSim(PanasonicSimulator(encrypted: encrypted));
+        final s = await connect();
+        final gate = sim.holdNext('X_SendKey');
+        final result = s.execute(const TuneChannel('123'));
+        await gate.reached;
+        sim.respondOnce(
+          'X_SendKey',
+          status: 200,
+          body: encrypted ? sealed('Busy') : '<html>Busy</html>',
+        );
+        gate.release();
+        final e = _error(await result);
+        expect(e.code, WatchmeErrorCode.partiallyDelivered);
+        expect((e.cause! as WatchmeError).code, WatchmeErrorCode.protocol);
+        expect(sim.keyLog, ['NRC_D1-ONOFF']);
+        expect(sim.actions, ['X_SendKey', 'X_SendKey']);
+      });
+    }
+
+    test('the documented shapes are accepted: any prefix or none, '
+        'self-closing, and an encrypted fragment bare, under a root or in '
+        'X_OriginalResult, with or without an envelope', () async {
+      const urn = panasonicSimNrcUrn;
+      await startSim(PanasonicSimulator());
+      var s = await connect();
+      for (final body in [
+        '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">'
+            '<s:Body><m:X_SendKeyResponse xmlns:m="$urn"/></s:Body>'
+            '</s:Envelope>',
+        '<s:Envelope><s:Body><u:X_SendKeyResponse></u:X_SendKeyResponse>'
+            '</s:Body></s:Envelope>',
+        '<Envelope><Body>\r\n<X_SendKeyResponse>\r\n</X_SendKeyResponse>'
+            '</Body></Envelope>',
+      ]) {
+        sim.respondOnce('X_SendKey', status: 200, body: body);
+        expect(
+          await s.execute(const PressKey(RemoteKey.up)),
+          const Confirmed(),
+          reason: body,
+        );
+      }
+      await startSim(PanasonicSimulator(encrypted: true));
+      s = await connect();
+      final keys = VieraKeys.forSession(_keyword);
+      for (final inner in [
+        '<u:X_SendKeyResponse xmlns:u="$urn"></u:X_SendKeyResponse>',
+        '<X_OriginalResult><u:X_SendKeyResponse xmlns:u="$urn">'
+            '</u:X_SendKeyResponse></X_OriginalResult>',
+        '<X_SessionId>1</X_SessionId>\r\n<X_SequenceNumber>00000002'
+            '</X_SequenceNumber>\r\n<X_OriginalResult><u:X_SendKeyResponse>'
+            '</u:X_SendKeyResponse></X_OriginalResult>',
+        '<X_Data><X_SendKeyResponse/></X_Data>',
+      ]) {
+        for (final body in [
+          sealed(inner),
+          '<X_EncResult>${vieraSeal(keys, inner)}</X_EncResult>',
+        ]) {
+          sim.respondOnce('X_SendKey', status: 200, body: body);
+          expect(
+            await s.execute(const PressKey(RemoteKey.up)),
+            const Confirmed(),
+            reason: body,
+          );
+        }
+      }
+    });
+  });
+
   group('delivery', () {
     test('a multi-key command that fails after a delivered key is '
         'partiallyDelivered and stops', () async {
@@ -840,6 +979,97 @@ void main() {
         WatchmeErrorCode.cancelled,
       );
       await expectLater(s.refresh(), throwsA(isA<WatchmeError>()));
+    });
+  });
+
+  group('close while a request is out', () {
+    final cancelled = throwsA(
+      isA<WatchmeError>().having(
+        (e) => e.code,
+        'code',
+        WatchmeErrorCode.cancelled,
+      ),
+    );
+
+    test('during a refresh: the late answer is not used and nothing more '
+        'is sent, not even the Pro AV read', () async {
+      await startSim(PanasonicSimulator(pac: true));
+      final s = await connect();
+      sim.volume = 55;
+      final gate = sim.holdNext('GetVolume');
+      final refreshing = expectLater(s.refresh(), cancelled);
+      await gate.reached;
+      await s.close();
+      sim.clearLog();
+      gate.release();
+      await refreshing;
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      expect(sim.requests, isEmpty);
+      expect(s.state.volume!.value, 20);
+    });
+
+    for (final target in ['GetMute', 'X_SendInquiryCmd']) {
+      test('during a refresh at $target: it fails as cancelled, uses no '
+          'late answer and sends nothing more', () async {
+        await startSim(PanasonicSimulator(pac: true));
+        final s = await connect();
+        sim.input = 'H4';
+        final gate = sim.holdNext(target);
+        final refreshing = expectLater(s.refresh(), cancelled);
+        await gate.reached;
+        await s.close();
+        sim.clearLog();
+        gate.release();
+        await refreshing;
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        expect(sim.requests, isEmpty);
+        expect(s.state.input!.value, 'tv');
+      });
+    }
+
+    test('during the Pro AV read: its answer is not used', () async {
+      await startSim(
+        PanasonicSimulator(
+          pac: true,
+          power: PanasonicSimPower.networkStandby,
+          dmrAnswersInStandby: true,
+          bootDelay: Duration.zero,
+        ),
+      );
+      final s = await connect(allowWake: false);
+      final capabilities = s.capabilities;
+      expect(s.hasPac, isFalse);
+      await sim.pressPowerButton();
+      final gate = sim.holdNext('/pac/ddd.xml');
+      final refreshing = expectLater(s.refresh(), cancelled);
+      await gate.reached;
+      await s.close();
+      sim.clearLog();
+      gate.release();
+      await refreshing;
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      expect(s.hasPac, isFalse);
+      expect(s.capabilities, capabilities);
+      expect(sim.requests, isEmpty);
+    });
+
+    test('while the fresh session before a toggle is refused: no Pro AV '
+        'read and no toggle follow, and nothing was done', () async {
+      await startSim(PanasonicSimulator(encrypted: true, pac: true));
+      final s = await connect();
+      sim.respondOnce('X_GetEncryptSessionId', status: 500);
+      final gate = sim.holdNext('X_GetEncryptSessionId');
+      final result = s.execute(const PressKey(RemoteKey.power));
+      await gate.reached;
+      await s.close();
+      sim.clearLog();
+      gate.release();
+      final r = await result;
+      expect(_error(r).code, WatchmeErrorCode.cancelled);
+      expect(r.partiallyDelivered, isFalse);
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      expect(sim.requests, isEmpty);
+      expect(sim.powerToggles, 0);
     });
   });
 

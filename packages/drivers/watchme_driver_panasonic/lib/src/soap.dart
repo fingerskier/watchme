@@ -84,6 +84,14 @@ String? xmlLeaf(String xml, String localName) {
 bool xmlHasElement(String xml, String localName) =>
     xmlLeaf(xml, localName) != null;
 
+/// Whether [xml] is an answer to [action]: it holds an `{action}Response`
+/// element, at any depth and with any (or no) prefix. That covers the
+/// TV's own envelope and the decrypted fragment of an encrypted command,
+/// whose wrapper is unknown (bare, under some root, or in
+/// `X_OriginalResult`). An HTML page or any other text is no answer.
+bool isSoapAnswer(String xml, String action) =>
+    xmlHasElement(xml, '${action}Response');
+
 /// [text] with XML character and entity references decoded. A character
 /// reference to no Unicode character (`&#x110000;`, or too many digits)
 /// becomes U+FFFD: what the TV sends must never make parsing throw.
