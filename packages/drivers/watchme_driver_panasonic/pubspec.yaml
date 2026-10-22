@@ -1,0 +1,19 @@
+name: watchme_driver_panasonic
+description: >-
+  Panasonic VIERA driver for watchme: the UPnP/SOAP network remote control on port 55000, plain and encrypted (PIN-paired) sets.
+version: 0.1.0
+repository: https://github.com/fingerskier/watchme
+publish_to: none
+
+environment:
+  sdk: ^3.13.0
+
+resolution: workspace
+
+dependencies:
+  watchme_core: ^0.1.0
+  pointycastle: ^4.0.0
+  xml: ^7.1.0
+dev_dependencies:
+  test: ^1.25.0
+  watchme_testkit: ^0.1.0

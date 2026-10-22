@@ -132,11 +132,14 @@ class _PairingScreenState extends State<PairingScreen> {
   @override
   Widget build(BuildContext context) {
     final device = WatchmeScope.of(context).byId(widget.deviceId);
-    final protocol = device?.drivers
+    final driver = device?.drivers
         .where((d) => d.driverId == widget.driverId)
-        .map((d) => d.protocol)
         .firstOrNull;
+    final protocol = driver?.protocol;
     final name = device?.name ?? 'TV';
+    // A driver that only offers pairing (a Sharp AQUOS's optional login and
+    // network power-on) sets the TV up; one that needs it pairs.
+    final verb = driver == null || driver.requiresPairing ? 'Pair' : 'Set up';
     final step = _step;
 
     return Scaffold(
@@ -146,7 +149,7 @@ class _PairingScreenState extends State<PairingScreen> {
           tooltip: _finished ? 'Back' : 'Cancel pairing',
           onPressed: () => Navigator.of(context).maybePop(),
         ),
-        title: Text('Pair $name'),
+        title: Text('$verb $name'),
       ),
       body: SafeArea(
         child: SingleChildScrollView(

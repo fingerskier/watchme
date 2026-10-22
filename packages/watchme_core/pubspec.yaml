@@ -1,7 +1,8 @@
 name: watchme_core
 description: >-
   Pure-Dart, web-safe core contract for watchme: capabilities, commands,
-  state, events, transport interfaces, drivers, pairing and credentials.
+  state, events, transport interfaces, drivers, pairing, credentials and
+  secret redaction.
 version: 0.1.0
 repository: https://github.com/fingerskier/watchme
 publish_to: none

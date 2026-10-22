@@ -50,7 +50,10 @@ final class PowerConfig {
   final Duration wakePollInterval;
 
   /// No toggle is sent within this long of the last power command watchme
-  /// delivered (Samsung keeps answering for 17-20 s after off).
+  /// delivered (Samsung keeps answering for 17-20 s after off), and the
+  /// power key does not act on the evidence in that time. A device whose
+  /// driver needs longer ([PowerTarget.powerQuietPeriod]) gets the longer
+  /// period.
   final Duration toggleQuietPeriod;
 
   /// Power observations older than this do not count as evidence.
@@ -88,6 +91,12 @@ abstract interface class PowerTarget {
 
   /// Cached MAC addresses, for Wake-on-LAN.
   Set<String> get macs;
+
+  /// The quiet period this device's drivers ask for after a power command
+  /// (the longest `DriverDescriptor.powerQuietPeriod` among them), or
+  /// `null`. The orchestrator uses it when it is longer than
+  /// [PowerConfig.toggleQuietPeriod].
+  Duration? get powerQuietPeriod;
 
   /// Routes declaring usable support for [capability] (unranked).
   List<RouteCandidate> routes(Capability capability);
@@ -182,6 +191,9 @@ final class _OpTarget implements PowerTarget {
   Set<String> get macs => _target.macs;
 
   @override
+  Duration? get powerQuietPeriod => _target.powerQuietPeriod;
+
+  @override
   List<RouteCandidate> routes(Capability capability) =>
       _target.routes(capability);
 
@@ -234,8 +246,9 @@ final class _OpTarget implements PowerTarget {
 /// * The user's own answer counts as agreement: `SetPower(on,
 ///   userConfirmed: true)` means the user just saw the device in the other
 ///   state ([setPower]'s `userConfirmed`).
-/// * No toggle within [PowerConfig.toggleQuietPeriod] of the last power
-///   command watchme delivered, confirmed or not.
+/// * No toggle within [PowerConfig.toggleQuietPeriod] (or the device's
+///   longer [PowerTarget.powerQuietPeriod]) of the last power command
+///   watchme delivered, confirmed or not.
 /// * No toggle after a discrete command that may have reached the device
 ///   (it timed out, say): the device may already have acted, and the toggle
 ///   would undo it.
@@ -673,7 +686,14 @@ final class PowerOrchestrator {
       return const Unsupported(Unsupported.needsConfirmation);
     }
     if (_closed) return _closedResult;
-    final r = await _toggle(target, toggles, command);
+    // The command carries the user's answer, so the route knows the user
+    // has just seen the device in the other state (the engine then does not
+    // let a passive probe's guess turn the toggle into a no-op).
+    final r = await _toggle(
+      target,
+      toggles,
+      SetPower(command.on, userConfirmed: userConfirmed),
+    );
     if (r.delivered) return _delivered(target, command.on, r);
     _failed(target, command.on, r, failures);
     return r;
@@ -791,7 +811,16 @@ final class PowerOrchestrator {
   bool _inQuietPeriod(PowerTarget target) {
     final last = _last[target.deviceId];
     return last != null &&
-        _clock.now().difference(last.at) < config.toggleQuietPeriod;
+        _clock.now().difference(last.at) < quietPeriodFor(target);
+  }
+
+  /// The quiet period for [target]: [PowerConfig.toggleQuietPeriod], or the
+  /// device's own [PowerTarget.powerQuietPeriod] when that is longer.
+  Duration quietPeriodFor(PowerTarget target) {
+    final own = target.powerQuietPeriod;
+    return own != null && own > config.toggleQuietPeriod
+        ? own
+        : config.toggleQuietPeriod;
   }
 
   /// Whether a non-stale observation made at or after [since] reports the

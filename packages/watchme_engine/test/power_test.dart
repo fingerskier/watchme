@@ -1076,7 +1076,7 @@ void main() {
         ),
         isConfirmed,
       );
-      expect(ws.executed, [const SetPower(false)]);
+      expect(ws.executed, [const SetPower(false, userConfirmed: true)]);
       expect(rig.h.engine.power.lastCommand(rig.id)?.on, isFalse);
     });
 
@@ -1109,10 +1109,79 @@ void main() {
         await rig.h.engine.send(rig.id, confirmedOn),
         isUnsupported(PowerOrchestrator.quietPeriodReason),
       );
-      expect(ws.executed, [const SetPower(false)]);
+      expect(ws.executed, [confirmedOff]);
       await rig.h.clock.advance(const Duration(seconds: 20));
       expect(await rig.h.engine.send(rig.id, confirmedOn), isConfirmed);
-      expect(ws.executed, [const SetPower(false), const SetPower(true)]);
+      expect(ws.executed, [confirmedOff, confirmedOn]);
+    });
+
+    test('sends the toggle although a passive probe guesses standby, as '
+        'the user has just seen the TV on', () async {
+      // A toggle-only driver whose probe only infers standby (a Panasonic
+      // does, from a refused volume read, which a booting TV also gives).
+      final viera = FakeDriver(
+        'panasonic.viera',
+        ceiling: const [toggleOn, toggleOff],
+      );
+      final rig = await Rig([viera]).add();
+      addTearDown(rig.h.close);
+      rig.probePower[viera.id] = Observed.inferred(
+        PowerMode.standby,
+        viera.id,
+        rig.h.clock.now(),
+      );
+      expect(
+        await rig.h.engine.send(
+          rig.id,
+          const SetPower(false, userConfirmed: true),
+        ),
+        isConfirmed,
+      );
+      expect(viera.executed, [const SetPower(false, userConfirmed: true)]);
+      expect(viera.connects.single.allowWake, isFalse);
+    });
+
+    test('a discrete off still trusts a passive probe that sees the device '
+        'off, and wakes nothing', () async {
+      final fire = FakeDriver('firetv.lightning', ceiling: const [discreteOff]);
+      final rig = await Rig([fire]).add();
+      addTearDown(rig.h.close);
+      rig.probePower[fire.id] = Observed.inferred(
+        PowerMode.standby,
+        fire.id,
+        rig.h.clock.now(),
+      );
+      expect(
+        await rig.h.engine.send(
+          rig.id,
+          const SetPower(false, userConfirmed: true),
+        ),
+        isConfirmed,
+      );
+      expect(fire.connects, isEmpty);
+    });
+
+    test("waits out a driver's longer quiet period", () async {
+      final viera = FakeDriver(
+        'panasonic.viera',
+        ceiling: const [toggleOn, toggleOff],
+        powerQuietPeriod: const Duration(seconds: 30),
+      );
+      final rig = await Rig([viera]).add();
+      addTearDown(rig.h.close);
+      const confirmedOff = SetPower(false, userConfirmed: true);
+      const confirmedOn = SetPower(true, userConfirmed: true);
+      expect(await rig.h.engine.send(rig.id, confirmedOff), isConfirmed);
+      // Past the engine's 20 s, inside the driver's 30 s.
+      await rig.h.clock.advance(const Duration(seconds: 25));
+      expect(
+        await rig.h.engine.send(rig.id, confirmedOn),
+        isUnsupported(PowerOrchestrator.quietPeriodReason),
+      );
+      expect(viera.executed, [confirmedOff]);
+      await rig.h.clock.advance(const Duration(seconds: 6));
+      expect(await rig.h.engine.send(rig.id, confirmedOn), isConfirmed);
+      expect(viera.executed, [confirmedOff, confirmedOn]);
     });
 
     test('still sends no toggle after Wake-on-LAN', () async {
@@ -1308,7 +1377,7 @@ void main() {
             .then((r) => first = r),
       );
       await pump();
-      expect(ws.executed, [const SetPower(false)]);
+      expect(ws.executed, [const SetPower(false, userConfirmed: true)]);
       unawaited(
         rig.h.engine
             .send(rig.id, const SetPower(true, userConfirmed: true))
@@ -1324,7 +1393,7 @@ void main() {
       expect(first, isNull);
       await rig.h.clock.advance(const Duration(seconds: 1));
       expect(first, isInterruptedAfterSending);
-      expect(ws.executed, [const SetPower(false)]);
+      expect(ws.executed, [const SetPower(false, userConfirmed: true)]);
     });
 
     test('off then on: the second waits and decides on fresh evidence, '
@@ -1399,7 +1468,7 @@ void main() {
       target.release();
       expect(await asked, isUnsupported(Unsupported.needsConfirmation));
       expect(await confirmed, isConfirmed);
-      expect(target.executed, [const SetPower(false)]);
+      expect(target.executed, [const SetPower(false, userConfirmed: true)]);
     });
 
     test('close releases a running request that never finishes and the '
@@ -1545,6 +1614,9 @@ class _GatedTarget implements PowerTarget {
   Set<String> get macs => const {};
 
   @override
+  Duration? get powerQuietPeriod => null;
+
+  @override
   List<RouteCandidate> routes(Capability capability) => [
     RouteCandidate(
       driverId: 'samsung.ws',
@@ -1591,6 +1663,9 @@ class _ScriptedTarget implements PowerTarget {
   final Set<String> macs;
 
   @override
+  Duration? get powerQuietPeriod => null;
+
+  @override
   String get deviceId => 'tv';
 
   @override
@@ -1628,6 +1703,9 @@ class _ThrowingTarget implements PowerTarget {
 
   @override
   Set<String> get macs => const {};
+
+  @override
+  Duration? get powerQuietPeriod => null;
 
   @override
   List<RouteCandidate> routes(Capability capability) =>

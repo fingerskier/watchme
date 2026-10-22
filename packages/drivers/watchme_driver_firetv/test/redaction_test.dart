@@ -40,6 +40,7 @@ void main() {
           '{"description":"abc","ok":"OK","empty":"","n":1,"b":true,'
           '"z":null}',
           allValues: true,
+          keep: fireTvKeptWords,
         ),
         '{"description":"<redacted>","ok":"OK","empty":"",'
         '"n":"<redacted>","b":true,"z":null}',

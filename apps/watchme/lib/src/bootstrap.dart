@@ -4,7 +4,10 @@ import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:watchme_core/watchme_core.dart';
 import 'package:watchme_driver_firetv/watchme_driver_firetv.dart';
+import 'package:watchme_driver_panasonic/watchme_driver_panasonic.dart';
 import 'package:watchme_driver_roku/watchme_driver_roku.dart';
+import 'package:watchme_driver_sharp/watchme_driver_sharp.dart';
+import 'package:watchme_driver_vizio/watchme_driver_vizio.dart';
 import 'package:watchme_engine/watchme_engine.dart';
 import 'package:watchme_io/watchme_io.dart';
 
@@ -33,10 +36,11 @@ Future<WatchmeClient> createClient() async {
 ///   to both the engine (which refuses a manual IP literal up front) and
 ///   the network stack (which enforces it on every connection, checking
 ///   each address a host name resolves to).
-/// * Discovery: SSDP (Roku ECP, DIAL) and mDNS (Fire TV and other DNS-SD
-///   types), strictly LAN-only: they drop senders and addresses outside it,
-///   loopback included.
-/// * Drivers: Roku ECP and Fire TV.
+/// * Discovery: SSDP (Roku ECP, DIAL, Panasonic VIERA, Sharp AQUOS) and
+///   mDNS (Fire TV, VIZIO and other DNS-SD types), strictly LAN-only: they
+///   drop senders and addresses outside it, loopback included.
+/// * Drivers ([appDrivers]): Roku ECP, Fire TV, VIZIO SmartCast, Panasonic
+///   VIERA and Sharp AQUOS.
 /// * Wake-on-LAN: [WakeOnLan], which also sends to each subnet-directed
 ///   broadcast and on ports 9 and 7, so a multi-homed host still reaches
 ///   the TV. It sends one round per call (`repeats: 1`): the engine repeats
@@ -58,7 +62,7 @@ Future<WatchmeClient> createEngineClient({
   void warn(StoreWarning warning) =>
       debugPrint('watchme store: ${warning.path}: ${warning.message}');
   final engine = Engine(
-    drivers: drivers ?? [const RokuDriver(), FireTvDriver()],
+    drivers: drivers ?? appDrivers(),
     transports: IoTransports(network: network),
     destinationPolicy: appDestinationPolicy,
     // Discovery keeps the strict LAN-only default: a reply from the network
@@ -84,6 +88,16 @@ Future<WatchmeClient> createEngineClient({
   }
   return InProcessClient(engine, ownsEngine: true);
 }
+
+/// The drivers the app registers, in order: a device that two of them
+/// recognise is routed to the earlier one when they rank equal.
+List<Driver> appDrivers() => [
+  const RokuDriver(),
+  FireTvDriver(),
+  VizioDriver(),
+  PanasonicDriver(),
+  SharpDriver(),
+];
 
 String _join(String directory, String name) =>
     directory.endsWith(Platform.pathSeparator)

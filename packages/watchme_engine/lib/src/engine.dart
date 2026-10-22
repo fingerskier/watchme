@@ -277,6 +277,7 @@ final class Engine implements WatchmeEngine {
           driverId: s.driverId,
           protocol: s.descriptor.protocol,
           requiresPairing: s.requiresPairing || s.reauthInvalid,
+          offersPairing: s.descriptor.offersPairing,
           paired: s.paired,
           connection: s.connection,
           lastError: s.lastError,
@@ -626,14 +627,18 @@ final class Engine implements WatchmeEngine {
       );
     }
     final notes = [for (final p in probes) ...p.result.notes];
+    // A driver that reached the device and was refused (a Panasonic VIERA
+    // answers 403 to clients on another subnet) has the explanation the
+    // user can act on; the other drivers' "nothing there" does not.
+    final specific = errors.where((e) => !_isTransportError(e)).firstOrNull;
     return WatchmeError.unsupported(
       'No driver recognised $host'
+      '${specific == null ? '' : ': ${specific.message}'}'
       '${notes.isEmpty ? '' : ' (${notes.join('; ')})'}',
-      rawDeviceMessage: errors
-          .map((e) => e.rawDeviceMessage)
-          .nonNulls
-          .firstOrNull,
-      cause: errors.firstOrNull,
+      rawDeviceMessage:
+          specific?.rawDeviceMessage ??
+          errors.map((e) => e.rawDeviceMessage).nonNulls.firstOrNull,
+      cause: specific ?? errors.firstOrNull,
     );
   }
 
@@ -893,12 +898,33 @@ final class Engine implements WatchmeEngine {
         ),
       );
     }
+    // Pairing replaces this driver's connection to the device, and some
+    // devices serve one client at a time (a Sharp AQUOS's IP control
+    // does): the driver's own open session would make the pairing's
+    // connection fail. A successful pairing connects again; otherwise the
+    // next command does.
+    if (slot.session != null || slot.connecting != null) {
+      _resetSession(entry, slot);
+    }
     final PairingFlow? inner;
     try {
       inner = slot.driver.startPairing(
         entry.endpointFor(slot),
         _transports,
-        PairingContext(deviceId: deviceId, clientName: config.clientName),
+        PairingContext(
+          deviceId: deviceId,
+          clientName: config.clientName,
+          // Read when the driver asks for it (VIZIO reuses its controller
+          // id); a store that fails to read gives none rather than failing
+          // the pairing.
+          previousCredential: () async {
+            try {
+              return await _credentials.read(deviceId, driverId);
+            } on Object {
+              return null;
+            }
+          },
+        ),
       );
     } on WatchmeError catch (error) {
       return failedPairing(error);
@@ -1128,11 +1154,18 @@ final class Engine implements WatchmeEngine {
         commandSent: false,
       );
     }
-    if (command case SetPower(on: false)
-        when slot.session == null && slot.connecting == null) {
+    if (command case SetPower(on: false, :final userConfirmed)
+        when slot.session == null &&
+            slot.connecting == null &&
+            !(userConfirmed && route.support.has(CapFlag.toggleOnly))) {
       // Connecting can wake a sleeping device (Fire TV's DIAL wake, and the
       // TV with it over HDMI-CEC) only for it to be sent to sleep again. A
       // passive probe that sees it off or asleep already settles it.
+      //
+      // Not for a toggle the user confirmed: they have just seen the device
+      // on, and a probe's standby may be a guess (a Panasonic infers it
+      // from a refused volume read, which a booting TV gives too). Skipping
+      // the toggle would report the device off while it stays on.
       final power = _absorbProbe(
         e,
         slot,
@@ -1856,6 +1889,16 @@ final class _EnginePowerTarget implements PowerTarget {
 
   @override
   Set<String> get macs => _entry.identity.macs;
+
+  @override
+  Duration? get powerQuietPeriod {
+    Duration? longest;
+    for (final slot in _entry.slots) {
+      final own = slot.descriptor.powerQuietPeriod;
+      if (own != null && (longest == null || own > longest)) longest = own;
+    }
+    return longest;
+  }
 
   @override
   List<RouteCandidate> routes(Capability capability) =>

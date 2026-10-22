@@ -4,7 +4,10 @@ import 'dart:io' hide Datagram;
 import 'package:test/test.dart';
 import 'package:watchme_core/watchme_core.dart';
 import 'package:watchme_driver_firetv/watchme_driver_firetv.dart';
+import 'package:watchme_driver_panasonic/watchme_driver_panasonic.dart';
 import 'package:watchme_driver_roku/watchme_driver_roku.dart';
+import 'package:watchme_driver_sharp/watchme_driver_sharp.dart';
+import 'package:watchme_driver_vizio/watchme_driver_vizio.dart';
 import 'package:watchme_engine/watchme_engine.dart';
 import 'package:watchme_io/watchme_io.dart';
 
@@ -270,6 +273,87 @@ Future<int> closedPort() async {
   return port;
 }
 
+/// Every port name the registered drivers read: Roku `ecp`, Fire TV `dial`
+/// and `api`, VIZIO `api` and `legacy`, Panasonic `nrc`, Sharp `ipc`.
+const List<String> driverPortNames = [
+  'ecp',
+  'dial',
+  'api',
+  'legacy',
+  'nrc',
+  'ipc',
+];
+
+/// A port map that points every driver's port names ([driverPortNames]) at
+/// loopback ports nothing listens on, with [ports] on top: a manual add
+/// then probes only the simulator the test runs, never whatever runs on a
+/// standard port of the machine.
+Future<Map<String, int>> portsWith(Map<String, int> ports) async => {
+  for (final name in driverPortNames) name: await closedPort(),
+  ...ports,
+};
+
+/// The Sharp driver's waits, shortened for a loopback simulator that
+/// answers at once (the defaults wait a second for a login prompt that a
+/// TV without a login never sends).
+const SharpTimings e2eSharpTimings = SharpTimings(
+  connect: Duration(seconds: 2),
+  promptWait: Duration(milliseconds: 200),
+  promptWaitWithLogin: Duration(milliseconds: 400),
+  loginStep: Duration(milliseconds: 800),
+  loginAnswer: Duration(milliseconds: 800),
+  loginQuiet: Duration(milliseconds: 80),
+  unterminatedQuiet: Duration(milliseconds: 80),
+  reply: Duration(seconds: 1),
+  powerReply: Duration(milliseconds: 1500),
+  probeReply: Duration(seconds: 1),
+  probeBudget: Duration(seconds: 3),
+  reconnectGap: Duration(milliseconds: 20),
+  idleClose: Duration(seconds: 30),
+  powerOnSettle: Duration(milliseconds: 600),
+  powerOffSettle: Duration(milliseconds: 300),
+  bootRetryInterval: Duration(milliseconds: 40),
+);
+
+/// The drivers the app registers (see apps/watchme bootstrap), in its
+/// order, set up for loopback tests: no polling, short Sharp waits, Fire
+/// TV's API polled every 50 ms after a wake. [fireTv] false leaves the
+/// Fire TV driver out, for a test that names its simulator's port `api`,
+/// which Fire TV's probe would also read (VIZIO's API port has the same
+/// name; see the VIZIO tests).
+List<Driver> appDrivers({bool fireTv = true}) => [
+  const RokuDriver(),
+  if (fireTv) FireTvDriver(apiPollInterval: const Duration(milliseconds: 50)),
+  VizioDriver(pollInterval: null),
+  PanasonicDriver(pollInterval: null),
+  SharpDriver(timings: e2eSharpTimings, pollInterval: null),
+];
+
+/// A [WakeOnLanSender] that records each round and runs [onWake] for it,
+/// as a TV taking the magic packet would.
+final class RecordingWakeOnLan {
+  /// Creates a sender; [onWake] stands in for the TV.
+  RecordingWakeOnLan({this.onWake});
+
+  /// What the "TV" does with a round of magic packets.
+  Future<void> Function(String mac)? onWake;
+
+  /// Each MAC a round went to, in order.
+  final List<String> sent = [];
+
+  /// The sender to give the engine.
+  Future<bool> send(
+    String mac, {
+    String? lastKnownIp,
+    bool Function()? cancelled,
+  }) async {
+    if (cancelled?.call() ?? false) return false;
+    sent.add(mac);
+    await onWake?.call(mac);
+    return true;
+  }
+}
+
 /// A temporary state directory, deleted after the test.
 Future<Directory> tempStateDir() async {
   final dir = await Directory.systemTemp.createTemp('watchme_e2e_');
@@ -302,7 +386,9 @@ final class E2eSystem {
   /// driver's per-request deadline; [fireTvApiStartupTimeout], when given,
   /// replaces how long the Fire TV driver waits for its API after a wake.
   /// [extraDrivers] are registered after those two (see
-  /// [ToggleOnlyPowerDriver]).
+  /// [ToggleOnlyPowerDriver]). [drivers], when given, replaces the Roku and
+  /// Fire TV pair (see [appDrivers]); the Roku and Fire TV options then do
+  /// nothing. [wakeOnLan] replaces the engine's own magic packets.
   static Future<E2eSystem> start(
     Directory stateDir, {
     Iterable<DiscoveryProvider> Function(NetworkStack network)? discovery,
@@ -312,7 +398,9 @@ final class E2eSystem {
     HostLookup? lookup,
     Set<String> passThrough = const {},
     EngineConfig config = e2eConfig,
+    List<Driver>? drivers,
     List<Driver> extraDrivers = const [],
+    WakeOnLanSender? wakeOnLan,
   }) async {
     _LoopbackSockets.install();
     addTearDown(nativeBlocked.clear);
@@ -322,20 +410,23 @@ final class E2eSystem {
     final devices = FileDeviceRepository(devicesPath(stateDir));
     final engine = Engine(
       drivers: [
-        if (rokuRequestTimeout == null)
+        if (drivers != null)
+          ...drivers
+        else if (rokuRequestTimeout == null)
           RokuDriver(pollInterval: rokuPollInterval)
         else
           RokuDriver(
             pollInterval: rokuPollInterval,
             requestTimeout: rokuRequestTimeout,
           ),
-        if (fireTvApiStartupTimeout == null)
-          FireTvDriver(apiPollInterval: const Duration(milliseconds: 50))
-        else
-          FireTvDriver(
-            apiPollInterval: const Duration(milliseconds: 50),
-            apiStartupTimeout: fireTvApiStartupTimeout,
-          ),
+        if (drivers == null)
+          if (fireTvApiStartupTimeout == null)
+            FireTvDriver(apiPollInterval: const Duration(milliseconds: 50))
+          else
+            FireTvDriver(
+              apiPollInterval: const Duration(milliseconds: 50),
+              apiStartupTimeout: fireTvApiStartupTimeout,
+            ),
         ...extraDrivers,
       ],
       transports: transports,
@@ -344,6 +435,7 @@ final class E2eSystem {
       repository: devices,
       config: config,
       destinationPolicy: e2ePolicy,
+      wakeOnLan: wakeOnLan,
     );
     await engine.start();
     final system = E2eSystem._(engine, transports, credentials, devices);
@@ -413,7 +505,8 @@ Future<void> eventually(
 }
 
 /// Answers a pairing flow: submits [pin] (computed when the code step
-/// arrives) to every [EnterCode] step and returns every step seen.
+/// arrives) to every [EnterCode] step and returns every step seen. Other
+/// steps that wait for input are acknowledged with an empty answer.
 Future<List<PairingStep>> runPairing(
   Stream<PairingStep> steps,
   FutureOr<void> Function(String value) submit,
@@ -422,8 +515,39 @@ Future<List<PairingStep>> runPairing(
   final seen = <PairingStep>[];
   await for (final step in steps) {
     seen.add(step);
-    if (step is EnterCode) await submit(pin());
+    if (step is EnterCode) {
+      await submit(pin());
+    } else if (step.awaitsInput) {
+      await submit('');
+    }
     if (step.isTerminal) break;
+  }
+  return seen;
+}
+
+/// Answers a pairing flow from a script: each step that waits for input
+/// gets the next of [answers] (an [Instruct] that waits gets `''` without
+/// using one); the flow is cancelled when they run out. Returns every step
+/// seen.
+Future<List<PairingStep>> runScriptedPairing(
+  Stream<PairingStep> steps,
+  FutureOr<void> Function(String value) submit,
+  Future<void> Function() cancel,
+  List<String> answers,
+) async {
+  final queue = [...answers];
+  final seen = <PairingStep>[];
+  await for (final step in steps) {
+    seen.add(step);
+    if (step.isTerminal) break;
+    if (!step.awaitsInput) continue;
+    if (step is Instruct) {
+      await submit('');
+    } else if (queue.isEmpty) {
+      await cancel();
+    } else {
+      await submit(queue.removeAt(0));
+    }
   }
   return seen;
 }

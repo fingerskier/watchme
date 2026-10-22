@@ -1,0 +1,18 @@
+name: watchme_driver_sharp
+description: >-
+  Sharp AQUOS driver for watchme: the IP-control text protocol on TCP port 10002, with optional login.
+version: 0.1.0
+repository: https://github.com/fingerskier/watchme
+publish_to: none
+
+environment:
+  sdk: ^3.13.0
+
+resolution: workspace
+
+dependencies:
+  watchme_core: ^0.1.0
+
+dev_dependencies:
+  test: ^1.25.0
+  watchme_testkit: ^0.1.0

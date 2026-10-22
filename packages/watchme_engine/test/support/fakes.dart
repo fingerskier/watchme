@@ -20,6 +20,8 @@ class FakeDriver implements Driver {
     List<DriverBackend> backends = const [],
     Stability stability = Stability.documented,
     bool requiresPairing = false,
+    bool offersPairing = false,
+    Duration? powerQuietPeriod,
     this.onProbe,
     this.onConnect,
     this.onPair,
@@ -36,6 +38,8 @@ class FakeDriver implements Driver {
          provenance: 'test fake',
          matchers: matchers,
          requiresPairing: requiresPairing,
+         offersPairing: offersPairing,
+         powerQuietPeriod: powerQuietPeriod,
        ),
        sessionCapabilities = sessionCapabilities ?? ceiling;
 

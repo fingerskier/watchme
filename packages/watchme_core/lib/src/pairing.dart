@@ -506,7 +506,11 @@ abstract interface class PairingFlow {
 @immutable
 final class PairingContext {
   /// Creates a context.
-  const PairingContext({required this.deviceId, this.clientName = 'watchme'});
+  const PairingContext({
+    required this.deviceId,
+    this.clientName = 'watchme',
+    this.previousCredential,
+  });
 
   /// The engine's id for the device; goes into [Credential.deviceId].
   final String deviceId;
@@ -515,14 +519,26 @@ final class PairingContext {
   /// manifest, Samsung `name`).
   final String clientName;
 
+  /// Reads the credential this driver stored for the device before this
+  /// pairing, if any, including one the device has since revoked. `null`
+  /// when the caller offers none.
+  ///
+  /// For a driver that reuses part of it when pairing again: VIZIO pairs
+  /// under the same controller id, so the TV replaces its old token instead
+  /// of adding a new entry to its pairing table. A driver treats what it
+  /// returns as it treats a credential given to `Driver.connect`: never
+  /// shown, never logged, and only for this device.
+  final Future<Credential?> Function()? previousCredential;
+
   @override
   bool operator ==(Object other) =>
       other is PairingContext &&
       other.deviceId == deviceId &&
-      other.clientName == clientName;
+      other.clientName == clientName &&
+      other.previousCredential == previousCredential;
 
   @override
-  int get hashCode => Object.hash(deviceId, clientName);
+  int get hashCode => Object.hash(deviceId, clientName, previousCredential);
 }
 
 /// A ready-made [PairingFlow] for drivers.

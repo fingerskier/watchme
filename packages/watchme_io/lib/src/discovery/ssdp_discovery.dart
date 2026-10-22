@@ -7,7 +7,7 @@ import 'ssdp_message.dart';
 import 'upnp_description.dart';
 
 /// SSDP discovery (provider id `ssdp`): M-SEARCH for UPnP devices, Roku
-/// ECP and DIAL servers.
+/// ECP and DIAL servers, Panasonic VIERA and Sharp AQUOS TVs.
 ///
 /// Each scan sends an M-SEARCH per search target ([attempts] times, since
 /// multicast over Wi-Fi is lossy), collects the unicast replies through the
@@ -62,12 +62,19 @@ final class SsdpDiscovery implements DiscoveryProvider {
     this.destinationPolicy = DestinationPolicy.lanOnly,
   });
 
-  /// Searched when a scan names no service types: everything, plus Roku and
-  /// DIAL explicitly because some devices answer only their own target.
+  /// Searched when a scan names no service types: everything, plus the
+  /// targets of the TVs watchme drives, explicitly, because some devices
+  /// answer only their own target: Roku ECP, DIAL (its service type, which
+  /// Fire TV answers, and its device type, which VIZIO's DIAL server
+  /// answers), Panasonic VIERA's network remote control service and Sharp
+  /// AQUOS's IP-control device type.
   static const List<String> defaultSearchTargets = [
     'ssdp:all',
     'roku:ecp',
     'urn:dial-multiscreen-org:service:dial:1',
+    'urn:dial-multiscreen-org:device:dial:1',
+    'urn:panasonic-com:service:p00NetworkControl:1',
+    'urn:schemas-sharp-co-jp:device:AquosIPC:1',
   ];
 
   /// Where M-SEARCHes are sent from and descriptions fetched.

@@ -167,6 +167,8 @@ final class DriverDescriptor {
     this.userSetup = const [],
     this.ports = const {},
     this.requiresPairing = false,
+    this.offersPairing = false,
+    this.powerQuietPeriod,
   });
 
   /// Decodes the form written by [toJson].
@@ -182,6 +184,8 @@ final class DriverDescriptor {
     userSetup: objList(json, 'userSetup', SetupStep.fromJson),
     ports: intMap(json, 'ports'),
     requiresPairing: opt<bool>(json, 'requiresPairing') ?? false,
+    offersPairing: opt<bool>(json, 'offersPairing') ?? false,
+    powerQuietPeriod: optMs(json, 'powerQuietPeriodMs'),
   );
 
   /// Driver id, e.g. `roku.ecp`, `firetv.lightning`. Also the
@@ -221,6 +225,23 @@ final class DriverDescriptor {
   /// Whether the protocol normally needs pairing before [Driver.connect].
   final bool requiresPairing;
 
+  /// Whether [Driver.startPairing] returns a flow even for a device that
+  /// does not require pairing, for optional set-up: a Sharp AQUOS's login
+  /// (which the TV may not enforce) and its network power-on setting. The
+  /// engine shows such a driver as pairable ([DriverView.offersPairing]),
+  /// so the user can start that flow. A driver whose flow exists only for
+  /// devices that require pairing (the probe says so) leaves it false.
+  final bool offersPairing;
+
+  /// How long after a power command watchme delivered the device's power
+  /// state may lag, or a power toggle may be swallowed or act twice, when
+  /// that is longer than the engine's own quiet period
+  /// (`PowerConfig.toggleQuietPeriod`, 20 s). The power orchestrator waits
+  /// the longer of the two before it trusts the evidence or sends a toggle
+  /// again. `null` keeps the engine's. A Panasonic VIERA ignores
+  /// Wake-on-LAN and may drop a toggle for about 30 s after a power change.
+  final Duration? powerQuietPeriod;
+
   /// The ceiling entry for [capability] ([Support.unknown] when absent).
   CapabilitySupport ceilingFor(Capability capability) =>
       ceiling.supportFor(capability);
@@ -239,6 +260,9 @@ final class DriverDescriptor {
       'userSetup': [for (final s in userSetup) s.toJson()],
     if (ports.isNotEmpty) 'ports': ports,
     if (requiresPairing) 'requiresPairing': true,
+    if (offersPairing) 'offersPairing': true,
+    if (powerQuietPeriod != null)
+      'powerQuietPeriodMs': powerQuietPeriod!.inMilliseconds,
   };
 
   @override
@@ -254,7 +278,9 @@ final class DriverDescriptor {
       listEquals(other.userSetup, userSetup) &&
       other.provenance == provenance &&
       mapEquals(other.ports, ports) &&
-      other.requiresPairing == requiresPairing;
+      other.requiresPairing == requiresPairing &&
+      other.offersPairing == offersPairing &&
+      other.powerQuietPeriod == powerQuietPeriod;
 
   @override
   int get hashCode => Object.hash(
@@ -269,6 +295,8 @@ final class DriverDescriptor {
     provenance,
     mapHash(ports),
     requiresPairing,
+    offersPairing,
+    powerQuietPeriod,
   );
 
   @override

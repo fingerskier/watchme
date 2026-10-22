@@ -646,6 +646,12 @@ void main() {
           requiresPairing: true,
           lastError: WatchmeError.reauthRequired('Token revoked'),
         ),
+        const DriverView(
+          driverId: 'sharp.aquos',
+          protocol: 'Sharp AQUOS IP control',
+          offersPairing: true,
+          paired: true,
+        ),
       ],
       capabilities: const [
         CapabilitySupport.yes(Capability.dpadNavigation),
@@ -664,6 +670,9 @@ void main() {
     expect(view.connected, isTrue);
     expect(view.supportOf(Capability.volume).has(CapFlag.relativeOnly), isTrue);
     expect(view.supportOf(Capability.pointer).level, Support.unknown);
+    expect([for (final d in view.drivers) d.canPair], [false, true, true]);
+    expect(view.drivers.last.needsPairing, isFalse);
+    expect(view.drivers.first.toJson(), isNot(contains('offersPairing')));
   });
 
   test('DeviceRecord round-trips', () {
@@ -722,6 +731,21 @@ void main() {
       ports: {'ecp': 8060},
     );
     expect(DriverDescriptor.fromJson(wire(descriptor.toJson())), descriptor);
+    const optional = DriverDescriptor(
+      id: 'sharp.aquos',
+      vendor: 'Sharp',
+      protocol: 'Sharp AQUOS IP control',
+      ceiling: [],
+      backends: [],
+      stability: Stability.documented,
+      provenance: 'test',
+      offersPairing: true,
+      powerQuietPeriod: Duration(seconds: 30),
+    );
+    expect(DriverDescriptor.fromJson(wire(optional.toJson())), optional);
+    expect(optional.toJson(), containsPair('powerQuietPeriodMs', 30000));
+    expect(optional, isNot(descriptor));
+    expect(descriptor.toJson(), isNot(contains('offersPairing')));
     expect(
       descriptor
           .ceilingFor(Capability.powerOn)

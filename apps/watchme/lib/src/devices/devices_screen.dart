@@ -345,6 +345,33 @@ class _EmptyState extends StatelessWidget {
               'Fire TV pairs with a PIN shown on the TV. Keep the TV on while '
               'you pair.',
         ),
+        const SizedBox(height: 12),
+        const _Tip(
+          icon: Icons.pin_outlined,
+          title: 'VIZIO',
+          text:
+              'VIZIO SmartCast TVs pair with a PIN shown on the TV. To turn '
+              'the TV on from watchme, set System > Power Mode to Quick '
+              'Start.',
+        ),
+        const SizedBox(height: 12),
+        const _Tip(
+          icon: Icons.settings_remote,
+          title: 'Panasonic VIERA',
+          text:
+              'Turn on TV Remote in Menu > Network > TV Remote App Settings. '
+              'Sets from 2018 on pair with a PIN shown on the TV. The TV '
+              'answers only devices on its own subnet.',
+        ),
+        const SizedBox(height: 12),
+        const _Tip(
+          icon: Icons.lan_outlined,
+          title: 'Sharp AQUOS',
+          text:
+              'Turn on AQUOS Remote Control (IP Control on some models) in '
+              "the TV's network settings. If you set a login there, watchme "
+              'asks for it when you pair.',
+        ),
       ],
     );
   }

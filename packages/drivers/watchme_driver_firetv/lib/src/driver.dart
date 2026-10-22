@@ -343,8 +343,12 @@ final class FireTvDriver implements Driver {
       // status, and an unexpected one may carry it anywhere: an error shows
       // it with every value redacted, whatever it looks like, since a
       // token may be any printable text, words and spaces included.
-      String shown() =>
-          redactSecrets(verified.text, secrets: secrets, allValues: true);
+      String shown() => redactSecrets(
+        verified.text,
+        secrets: secrets,
+        allValues: true,
+        keep: fireTvKeptWords,
+      );
       if (!verified.ok) throw _pinVerifyError(verified, shown());
       final token = description(verified);
       if (token == null) {

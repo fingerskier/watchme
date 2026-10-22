@@ -111,3 +111,29 @@ NTS: ssdp:byebye
 USN: uuid:roku:ecp:YN00AB123456
 
 ''');
+
+/// A Panasonic VIERA reply to its network remote control target, in the
+/// shape the VIERA research brief gives (made-up UDN).
+String vieraNrcResponse() => crlf('''
+HTTP/1.1 200 OK
+CACHE-CONTROL: max-age=1800
+EXT:
+LOCATION: http://10.0.0.40:55000/nrc/ddd.xml
+SERVER: Linux/4.0 UPnP/1.0 Panasonic-UPnP-MW/1.0
+ST: urn:panasonic-com:service:p00NetworkControl:1
+USN: uuid:4d454931-0200-1090-8001-80c755b86c63::urn:panasonic-com:service:p00NetworkControl:1
+
+''');
+
+/// A Sharp AQUOS reply to its IP-control device type; its description
+/// port (12346) is not the control port.
+String aquosIpcResponse() => crlf('''
+HTTP/1.1 200 OK
+CACHE-CONTROL: max-age=1800
+EXT:
+LOCATION: http://10.0.0.50:12346/ipc/
+SERVER: Linux UPnP/1.0 Sharp
+ST: urn:schemas-sharp-co-jp:device:AquosIPC:1
+USN: uuid:34f62d00-0001-11e0-8000-34f62d000001::urn:schemas-sharp-co-jp:device:AquosIPC:1
+
+''');
