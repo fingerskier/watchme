@@ -132,6 +132,12 @@ final class _PowerOp {
   /// after that one never clears it, whatever it asks for.
   bool interrupted = false;
 
+  /// Whether it is turning the device on: a `SetPower(true)`, or the power
+  /// key once it decided on "on". Once such an operation is [interrupted],
+  /// its target refuses every further command (see [_OpTarget.execute]), so
+  /// no route, retry or toggle it reaches later turns the device on.
+  bool turningOn = false;
+
   /// Whether something this operation sent may have reached the device: a
   /// magic packet went out, or a command was delivered or may have been.
   bool sent = false;
@@ -162,9 +168,11 @@ final class _PowerOp {
 
 /// [_target] as one operation sees it: once the orchestrator is closed it
 /// sends and reads nothing (a command comes back cancelled and not sent,
-/// evidence is empty, the device does not answer), and every command it
-/// sends is counted in [_op], so [PowerOrchestrator.close] knows whether
-/// the operation may have reached the device.
+/// evidence is empty, the device does not answer); once a later request
+/// interrupts an "on" ([_PowerOp.turningOn]) it sends no more commands;
+/// and every command it sends is counted in [_op], so
+/// [PowerOrchestrator.close] knows whether the operation may have reached
+/// the device.
 final class _OpTarget implements PowerTarget {
   _OpTarget(this._power, this._target, this._op);
 
@@ -190,6 +198,17 @@ final class _OpTarget implements PowerTarget {
     if (_power._closed) {
       return Future.value(
         const RouteAttempt(PowerOrchestrator._closedResult, commandSent: false),
+      );
+    }
+    // Checked at the moment of sending, after whatever the operation was
+    // awaiting (a route that failed, a probe, evidence): a later request
+    // asked for something else, and turning the device on would undo it.
+    if (_op.turningOn && _op.interrupted) {
+      return Future.value(
+        const RouteAttempt(
+          PowerOrchestrator._replacedResult,
+          commandSent: false,
+        ),
       );
     }
     return _power._effect(
@@ -363,6 +382,23 @@ final class PowerOrchestrator {
       'A later power request (off, or the power key) replaced this one',
     ),
   );
+
+  /// What an "on" ends with when a later request interrupted it: the
+  /// [_replacedResult] when nothing it sent can have reached the device,
+  /// otherwise a failure that keeps that uncertainty (one from [failures]
+  /// that may have acted, or [WatchmeErrorCode.partiallyDelivered]).
+  static CommandResult _replaced(_PowerOp op, List<CommandResult> failures) {
+    for (final f in failures) {
+      if (mayHaveActed(f)) return f;
+    }
+    if (!op.mayHaveSent) return _replacedResult;
+    return const Failed(
+      WatchmeError.partiallyDelivered(
+        'A later power request replaced this one after a power command '
+        'went out; the device may still act on it',
+      ),
+    );
+  }
 
   /// What the callers of [op] learn when [close] cut it short.
   static CommandResult _interrupted(_PowerOp op) => op.mayHaveSent
@@ -544,9 +580,12 @@ final class PowerOrchestrator {
         if (r.support.has(CapFlag.toggleOnly)) r,
     ];
     final failures = <CommandResult>[];
+    op.turningOn = true;
 
     // A later request asked for something else while this one was queued:
-    // turning the device on now would undo it.
+    // turning the device on now would undo it. From here on [op]'s target
+    // refuses every command once that happens (see [_OpTarget.execute]);
+    // the checks below only choose the result.
     if (op.interrupted) return _replacedResult;
 
     // 1. Discrete, local.
@@ -560,12 +599,15 @@ final class PowerOrchestrator {
     if (_closed) return _bestFailure(failures) ?? _closedResult;
     // A later request asked for something else: magic packets now could
     // wake the device after that request turned it off.
-    if (op.interrupted) return _bestFailure(failures) ?? _replacedResult;
+    if (op.interrupted) return _replaced(op, failures);
     final wokeAt = _clock.now();
     if (await _sendWakeOnLan(target, op)) {
       _record(target, true);
       if (await _waitForDevice(target, op)) {
         if (_closed) return _closedResult;
+        // Interrupted while the device was answering the probe: the packets
+        // went out, and nothing more is sent to turn the device on.
+        if (op.interrupted) return const SentUnconfirmed();
         if (local.isNotEmpty) {
           final retry = await router.route(command, local, target.execute);
           if (retry.result.delivered) {
@@ -591,7 +633,7 @@ final class PowerOrchestrator {
       return const SentUnconfirmed();
     }
     if (_closed) return _bestFailure(failures) ?? _closedResult;
-    if (op.interrupted) return _bestFailure(failures) ?? _replacedResult;
+    if (op.interrupted) return _replaced(op, failures);
 
     // 3. Discrete, write-only or cloud.
     if (remote.isNotEmpty) {
@@ -601,6 +643,7 @@ final class PowerOrchestrator {
     }
 
     // 4. A toggle, only on agreed state.
+    if (op.interrupted) return _replaced(op, failures);
     if (toggles.isNotEmpty) {
       return _guardedToggle(
         target,

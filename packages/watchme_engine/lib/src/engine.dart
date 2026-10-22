@@ -165,6 +165,7 @@ final class Engine implements WatchmeEngine {
   Future<void>? _started;
   Future<void>? _discovery;
   bool _closed = false;
+  final Completer<void> _closing = Completer();
   bool _emitScheduled = false;
 
   /// Descriptors of the drivers enabled on these transports.
@@ -208,6 +209,7 @@ final class Engine implements WatchmeEngine {
   Future<void> close() async {
     if (_closed) return;
     _closed = true;
+    _closing.complete();
     power.close();
     for (final pairing in [..._pairings.values]) {
       await pairing.cancel();
@@ -1005,6 +1007,9 @@ final class Engine implements WatchmeEngine {
   /// routes and infers from the level the previous one left: two
   /// overlapping `SetVolume(20)` from 10 on a relative-only route must not
   /// both step by +10.
+  ///
+  /// [close] releases every queued command at once, as cancelled, even
+  /// while the one in front never finishes (a hung session).
   Future<CommandResult> _serialVolume(
     String deviceId,
     Future<CommandResult> Function() run,
@@ -1013,7 +1018,7 @@ final class Engine implements WatchmeEngine {
     final done = Completer<void>();
     final tail = done.future;
     _volumeTail[deviceId] = tail;
-    return previous
+    return Future.any([previous, _closing.future])
         .then<CommandResult>((_) {
           if (_closed) {
             return const Failed(WatchmeError.cancelled('The engine is closed'));

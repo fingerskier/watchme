@@ -121,6 +121,39 @@ void main() {
     expect(h.view(id).state.volume!.value, 20);
   });
 
+  test('closing the engine releases queued volume commands while the one '
+      'in front never finishes', () async {
+    // Codex review of 1a2ec5c: queued callers waited for the hung command
+    // even after close, holding an ever longer chain.
+    final never = Completer<CommandResult>();
+    final atv = FakeDriver(
+      'androidtv.remote2',
+      ceiling: const [relativeVolume],
+      onProbe: (_) => matched(capabilities: const [relativeVolume]),
+      onExecute: (_) => never.future,
+    );
+    final h = Harness(drivers: [atv]);
+    addTearDown(h.close);
+    final id = await h.add('10.0.2.10');
+    await h.clock.advance(const Duration(minutes: 1));
+
+    unawaited(h.engine.send(id, const StepVolume(1)));
+    await h.clock.flush();
+    expect(atv.executed, [const StepVolume(1)]);
+    final queued = [
+      for (var i = 0; i < 3; i++) h.engine.send(id, const StepVolume(1)),
+      h.engine.send(id, const SetMute(true)),
+    ];
+    await h.clock.flush();
+
+    await h.engine.close();
+    expect(
+      await Future.wait(queued),
+      everyElement(isFailedWith(WatchmeErrorCode.cancelled)),
+    );
+    expect(atv.executed, [const StepVolume(1)]);
+  });
+
   group('partial delivery', () {
     const keysOnly = CapabilitySupport.yes(
       Capability.volume,
