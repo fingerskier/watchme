@@ -224,6 +224,9 @@ final class Engine implements WatchmeEngine {
       }
       unawaited(entry.events.close());
     }
+    // A record write started before close may still be on its way to the
+    // store; the caller may delete the store's directory once this returns.
+    await Future.wait([..._pendingWrites]);
     unawaited(_deviceLists.close());
   }
 
@@ -1791,13 +1794,21 @@ final class Engine implements WatchmeEngine {
     e.unreachable.remove(slot.driverId);
   }
 
-  Future<void> _persistQuietly(_DeviceEntry e) async {
-    if (e.forgotten) return;
-    try {
-      await _repository.put(e.record);
-    } on Object {
-      // lastSeen is refreshed on the next successful write.
-    }
+  /// Writes of device records still in progress. [close] waits for them,
+  /// so nothing writes to the store after it returns.
+  final Set<Future<void>> _pendingWrites = {};
+
+  Future<void> _persistQuietly(_DeviceEntry e) {
+    if (e.forgotten || _closed) return Future.value();
+    final write = () async {
+      try {
+        await _repository.put(e.record);
+      } on Object {
+        // lastSeen is refreshed on the next successful write.
+      }
+    }();
+    _pendingWrites.add(write);
+    return write.whenComplete(() => _pendingWrites.remove(write));
   }
 
   void _applyState(_DeviceEntry e, DeviceState diff, String driverId) {
