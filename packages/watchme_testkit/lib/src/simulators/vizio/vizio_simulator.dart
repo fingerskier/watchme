@@ -21,18 +21,20 @@ import 'vizio_sim_models.dart';
 // port 7346, the SCPL WebSocket bus, and the NAME_SPACE 4 / APP_ID "3001"
 // raw-URL launcher. The simulator implements none of them.
 
-/// The `Endpoint` port name of the SmartCast API (default 7345).
-const String vizioSimApiPortName = 'api';
+/// The `Endpoint` port name of the SmartCast API (default 7345), the
+/// driver's `VizioPorts.smartcast`.
+const String vizioSimApiPortName = 'smartcast';
 
-/// The `Endpoint` port name of the pre-4.0 firmware API port (default 9000).
-const String vizioSimLegacyPortName = 'legacy';
+/// The `Endpoint` port name of the pre-4.0 firmware API port (default 9000),
+/// the driver's `VizioPorts.smartcastLegacy`.
+const String vizioSimLegacyPortName = 'smartcastLegacy';
 
 /// A VIZIO SmartCast TV simulator on loopback: the HTTPS REST API on a
 /// random port, with a second reserved port that stands in for 9000.
 ///
 /// ```dart
 /// final sim = await VizioSimulator.start(pin: '1234');
-/// final endpoint = sim.endpoint; // 127.0.0.1, ports 'api' and 'legacy'
+/// final endpoint = sim.endpoint; // ports 'smartcast', 'smartcastLegacy'
 /// // ... PUT /pairing/start, read sim.displayedPin, PUT /pairing/pair ...
 /// await sim.close();
 /// ```
@@ -391,7 +393,8 @@ class VizioSimulator {
 
   // --------------------------------------------------------------- getters
 
-  /// The endpoint a driver uses: [host] with port names `api` and `legacy`.
+  /// The endpoint a driver uses: [host] with port names `smartcast` and
+  /// `smartcastLegacy`.
   Endpoint get endpoint => Endpoint(
     host,
     ports: {vizioSimApiPortName: apiPort, vizioSimLegacyPortName: legacyPort},

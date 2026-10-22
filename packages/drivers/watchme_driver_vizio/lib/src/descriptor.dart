@@ -28,8 +28,8 @@ const DriverDescriptor vizioDescriptor = DriverDescriptor(
       'the raw-URL app launcher are deliberately not implemented.',
   requiresPairing: true,
   ports: {
-    VizioPorts.api: VizioPorts.apiDefault,
-    VizioPorts.legacy: VizioPorts.legacyDefault,
+    VizioPorts.smartcast: VizioPorts.smartcastDefault,
+    VizioPorts.smartcastLegacy: VizioPorts.smartcastLegacyDefault,
   },
   backends: [
     DriverBackend(
@@ -94,8 +94,9 @@ const DriverDescriptor vizioDescriptor = DriverDescriptor(
       Capability.volume,
       flags: _undocumented,
       note:
-          'Absolute 0-100 with readback through the settings tree '
-          '(read-modify-write with HASHVAL); steps with the volume keys.',
+          'Absolute 0-100, clamped to a lower maximum the TV reports, with '
+          'readback through the settings tree (read-modify-write with '
+          'HASHVAL); steps with the volume keys.',
     ),
     CapabilitySupport.yes(
       Capability.mute,

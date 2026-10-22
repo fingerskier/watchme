@@ -13,7 +13,7 @@ void main() {
       expect(d.vendor, 'VIZIO');
       expect(d.stability, Stability.communityStandard);
       expect(d.requiresPairing, isTrue);
-      expect(d.ports, {'api': 7345, 'legacy': 9000});
+      expect(d.ports, {'smartcast': 7345, 'smartcastLegacy': 9000});
       expect(d.backends.single.targets, {DriverTarget.native});
       expect(
         d.backends.single.requires,
@@ -279,10 +279,24 @@ void main() {
     test('explicit ports win over hints', () {
       expect(
         vizioPortCandidates(
-          const Endpoint('127.0.0.1', ports: {'api': 40001, 'legacy': 40002}),
+          const Endpoint(
+            '127.0.0.1',
+            ports: {'smartcast': 40001, 'smartcastLegacy': 40002},
+          ),
           first: 9000,
         ),
         [40001, 40002],
+      );
+    });
+
+    test("another driver's port names are not SmartCast ports", () {
+      // Fire TV's `api` and the like: a device record keeps one flat port
+      // map, so a shared name would point two drivers at one port.
+      expect(
+        vizioPortCandidates(
+          const Endpoint('127.0.0.1', ports: {'api': 40001, 'legacy': 40002}),
+        ),
+        [7345, 9000],
       );
     });
   });

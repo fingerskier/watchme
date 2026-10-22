@@ -274,12 +274,14 @@ Future<int> closedPort() async {
 }
 
 /// Every port name the registered drivers read: Roku `ecp`, Fire TV `dial`
-/// and `api`, VIZIO `api` and `legacy`, Panasonic `nrc`, Sharp `ipc`.
+/// and `api`, VIZIO `smartcast` and `smartcastLegacy`, Panasonic `nrc`,
+/// Sharp `ipc`.
 const List<String> driverPortNames = [
   'ecp',
   'dial',
   'api',
-  'legacy',
+  'smartcast',
+  'smartcastLegacy',
   'nrc',
   'ipc',
 ];
@@ -319,8 +321,7 @@ const SharpTimings e2eSharpTimings = SharpTimings(
 /// order, set up for loopback tests: no polling, short Sharp waits, Fire
 /// TV's API polled every 50 ms after a wake. [fireTv] false leaves the
 /// Fire TV driver out, for a test that names its simulator's port `api`,
-/// which Fire TV's probe would also read (VIZIO's API port has the same
-/// name; see the VIZIO tests).
+/// which Fire TV's probe would also read.
 List<Driver> appDrivers({bool fireTv = true}) => [
   const RokuDriver(),
   if (fireTv) FireTvDriver(apiPollInterval: const Duration(milliseconds: 50)),

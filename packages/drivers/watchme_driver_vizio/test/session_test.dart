@@ -14,6 +14,7 @@ import 'support/harness.dart';
 import 'support/io_http_stack.dart';
 
 const _volume = '/menu_native/dynamic/tv_settings/audio/volume';
+const _volumeRange = '/menu_native/static/tv_settings/audio/volume';
 const _mute = '/menu_native/dynamic/tv_settings/audio/mute';
 const _currentInput = '/menu_native/dynamic/tv_settings/devices/current_input';
 const _nameInput = '/menu_native/dynamic/tv_settings/devices/name_input';
@@ -187,7 +188,7 @@ void main() {
       // the closed primary port stands in for 9000 here so the test never
       // touches a real port on this machine.
       final session = await driver.connect(
-        Endpoint('127.0.0.1', ports: {'legacy': legacy.apiPort}),
+        Endpoint('127.0.0.1', ports: {'smartcastLegacy': legacy.apiPort}),
         transports,
         credential,
       );
@@ -378,8 +379,12 @@ void main() {
       test('SetVolume reads the HASHVAL, then MODIFYs once', () async {
         expect(await session.execute(const SetVolume(42)), isConfirmed);
         expect(sim.volume, 42);
-        expect(lines(sim.requests), ['GET $_volume', 'PUT $_volume']);
-        final body = jsonDecode(sim.requests[1].body) as Map<String, Object?>;
+        expect(lines(sim.requests), [
+          'GET $_volumeRange',
+          'GET $_volume',
+          'PUT $_volume',
+        ]);
+        final body = jsonDecode(sim.requests[2].body) as Map<String, Object?>;
         expect(body['REQUEST'], 'MODIFY');
         expect(body['VALUE'], 42);
         expect(body['HASHVAL'], isA<int>());
@@ -389,8 +394,95 @@ void main() {
 
       test('a volume already at the target is not written', () async {
         await session.execute(SetVolume(sim.volume));
-        expect(lines(sim.requests), ['GET $_volume']);
+        expect(lines(sim.requests), ['GET $_volumeRange', 'GET $_volume']);
         expect(session.state.volume?.confidence, Confidence.reported);
+      });
+
+      /// A session with a simulator whose volume tops out at [maxVolume].
+      Future<(VizioSimulator, VizioSession)> openWithMax(int maxVolume) async {
+        final tv = await VizioSimulator.start(seed: 6, maxVolume: maxVolume);
+        addTearDown(tv.close);
+        final paired = await pair(driver, tv, transports);
+        final s = await driver.connect(
+          tv.endpoint,
+          transports,
+          paired,
+        ) as VizioSession;
+        addTearDown(s.close);
+        tv.clearLog();
+        return (tv, s);
+      }
+
+      test('a TV whose maximum is below 100 is set to at most that; the '
+          'range is read once per session', () async {
+        final (tv, s) = await openWithMax(40);
+        expect(s.maxVolume, isNull);
+        expect(await s.execute(const SetVolume(80)), isConfirmed);
+        expect(tv.volume, 40);
+        expect(lines(tv.requests), [
+          'GET $_volumeRange',
+          'GET $_volume',
+          'PUT $_volume',
+        ]);
+        final body = jsonDecode(tv.requests[2].body) as Map<String, Object?>;
+        expect(body['VALUE'], 40);
+        expect(s.maxVolume, 40);
+        expect(s.state.volume?.value, 40);
+        // At the maximum already: read, nothing written, and the range is
+        // not read again.
+        tv.clearLog();
+        expect(await s.execute(const SetVolume(100)), isConfirmed);
+        expect(lines(tv.requests), ['GET $_volume']);
+        expect(s.state.volume?.value, 40);
+        expect(s.state.volume?.confidence, Confidence.reported);
+        expect(await s.execute(const SetVolume(25)), isConfirmed);
+        expect(tv.volume, 25);
+        expect(s.state.volume?.value, 25);
+      });
+
+      test('a maximum above 100 is bounded by the TV scale', () async {
+        final (tv, s) = await openWithMax(150);
+        expect(await s.execute(const SetVolume(100)), isConfirmed);
+        expect(tv.volume, 100);
+        expect(s.maxVolume, 100);
+      });
+
+      test('a TV that gives no range has the TV scale, and is not asked '
+          'again', () async {
+        sim.respondOnce(
+          'GET',
+          _volumeRange,
+          200,
+          json: {
+            'STATUS': {'RESULT': 'URI_NOT_FOUND'},
+          },
+        );
+        expect(await session.execute(const SetVolume(100)), isConfirmed);
+        expect(sim.volume, 100);
+        expect(session.maxVolume, 100);
+        sim.clearLog();
+        expect(await session.execute(const SetVolume(90)), isConfirmed);
+        expect(lines(sim.requests), ['GET $_volume', 'PUT $_volume']);
+      });
+
+      test('a range read that fails leaves the volume as it was, and is '
+          'tried again', () async {
+        final slow = await open(
+          testDriver(readTimeout: const Duration(milliseconds: 300)),
+        );
+        sim.clearLog();
+        final gate = sim.holdNext('GET', _volumeRange);
+        addTearDown(gate.release);
+        expect(
+          await slow.execute(const SetVolume(30)),
+          isFailedWith(WatchmeErrorCode.timeout),
+        );
+        expect(sim.requests.where((r) => r.method == 'PUT'), isEmpty);
+        expect(slow.maxVolume, isNull);
+        gate.release();
+        expect(await slow.execute(const SetVolume(30)), isConfirmed);
+        expect(sim.volume, 30);
+        expect(slow.maxVolume, 100);
       });
 
       test('a stale HASHVAL is read again and written once more', () async {
@@ -405,6 +497,7 @@ void main() {
         expect(await session.execute(const SetVolume(30)), isConfirmed);
         expect(sim.volume, 30);
         expect(lines(sim.requests), [
+          'GET $_volumeRange',
           'GET $_volume',
           'PUT $_volume',
           'GET $_volume',
@@ -433,6 +526,7 @@ void main() {
         });
         expect(await session.execute(const SetVolume(30)), isConfirmed);
         expect(lines(sim.requests), [
+          'GET $_volumeRange',
           'GET $_volume',
           'PUT $_volume',
           'GET $_volume',
@@ -453,6 +547,7 @@ void main() {
         expect(await session.execute(const SetVolume(30)), isConfirmed);
         expect(sim.volume, 30);
         expect(lines(sim.requests), [
+          'GET $_volumeRange',
           'GET $_volume',
           'PUT $_volume',
           'GET $_volume',
@@ -1026,6 +1121,51 @@ void main() {
         }
       });
 
+      test('a status word is shown only when it is a known one', () async {
+        // A TV that echoes the token as its status: the token, which the
+        // message would show upper-cased, is never shown.
+        final token = credential.token;
+        sim.respondOnce(
+          'PUT',
+          '/key_command/',
+          200,
+          json: {
+            'STATUS': {'RESULT': token},
+          },
+        );
+        final failed = await session.execute(const PressKey(RemoteKey.up));
+        expect(
+          failed,
+          isFailedWith(
+            WatchmeErrorCode.protocol,
+            message: 'Key up: unexpected SmartCast status',
+          ),
+        );
+        for (final text in errorTexts((failed as Failed).error)) {
+          expect(
+            text.toLowerCase(),
+            isNot(contains(token.toLowerCase())),
+            reason: text,
+          );
+        }
+        // A known word is shown, so the user can tell what happened.
+        sim.respondOnce(
+          'PUT',
+          '/key_command/',
+          200,
+          json: {
+            'STATUS': {'RESULT': 'BUSY'},
+          },
+        );
+        expect(
+          await session.execute(const PressKey(RemoteKey.up)),
+          isFailedWith(
+            WatchmeErrorCode.rejected,
+            message: 'Key up: the TV is busy (BUSY)',
+          ),
+        );
+      });
+
       test('requests never overlap, whoever sends them', () async {
         sim.clearLog();
         await Future.wait([
@@ -1167,6 +1307,59 @@ void main() {
           closing.refresh(),
           throwsWatchmeError(WatchmeErrorCode.cancelled),
         );
+      });
+
+      test('a TV lost during the optional reads stays lost: the refresh '
+          'throws and commits nothing', () async {
+        final slow = await open(
+          testDriver(readTimeout: const Duration(milliseconds: 200)),
+        );
+        final seen = <DeviceEvent>[];
+        slow.events.listen(seen.add);
+        await slow.refresh();
+        sim.clearLog();
+        // power_mode answers; then three reads in a row time out.
+        final gates = [
+          for (final path in [_volume, _mute, _currentInput, '/app/current'])
+            sim.holdNext('GET', path),
+        ];
+        addTearDown(() {
+          for (final gate in gates) {
+            gate.release();
+          }
+        });
+        await expectLater(
+          slow.refresh(),
+          throwsWatchmeError(WatchmeErrorCode.timeout),
+        );
+        expect(slow.state.connections, {
+          'vizio.smartcast': ConnectionState.disconnected,
+        });
+        expect(slow.state.power?.confidence, Confidence.stale);
+        await pumpEventQueue();
+        expect(seen.whereType<ConnectionChanged>().map((e) => e.state), [
+          ConnectionState.disconnected,
+        ]);
+      });
+
+      test('a refresh whose read is in flight when the session closes '
+          'commits nothing: the session stays disconnected', () async {
+        final gate = sim.holdNext('GET', '/app/current');
+        addTearDown(gate.release);
+        final refreshing = session.refresh();
+        await gate.reached;
+        await session.close();
+        expect(session.state.connections, {
+          'vizio.smartcast': ConnectionState.disconnected,
+        });
+        gate.release();
+        await expectLater(
+          refreshing,
+          throwsWatchmeError(WatchmeErrorCode.cancelled),
+        );
+        expect(session.state.connections, {
+          'vizio.smartcast': ConnectionState.disconnected,
+        });
       });
     });
   });

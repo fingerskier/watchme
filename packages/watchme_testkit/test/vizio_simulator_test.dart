@@ -141,8 +141,8 @@ void main() {
           throwsA(isA<SocketException>()),
         );
         expect(sim.endpoint.ports, {
-          'api': sim.apiPort,
-          'legacy': sim.legacyPort,
+          'smartcast': sim.apiPort,
+          'smartcastLegacy': sim.legacyPort,
         });
       },
     );

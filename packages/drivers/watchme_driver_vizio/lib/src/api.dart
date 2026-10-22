@@ -29,7 +29,12 @@ abstract final class VizioPaths {
   /// A leaf of the TV's dynamic settings tree, e.g. `audio/volume`.
   static String setting(String leaf) => '/menu_native/dynamic/$tvRoot/$leaf';
 
+  /// The static twin of a [setting] leaf, which holds its range
+  /// (`MINIMUM`, `MAXIMUM`) rather than its value.
+  static String range(String leaf) => '/menu_native/static/$tvRoot/$leaf';
+
   static final String volume = setting('audio/volume');
+  static final String volumeRange = range('audio/volume');
   static final String mute = setting('audio/mute');
   static final String currentInput = setting('devices/current_input');
   static final String inputList = setting('devices/name_input');
@@ -71,9 +76,9 @@ final class VizioApi {
     this.token,
     this.readTimeout = const Duration(seconds: 6),
     this.writeTimeout = const Duration(seconds: 15),
-  }) : endpoint = endpoint.withPorts({VizioPorts.api: port});
+  }) : endpoint = endpoint.withPorts({VizioPorts.smartcast: port});
 
-  /// The device, with [port] as its `api` port.
+  /// The device, with [port] as its `smartcast` port.
   final Endpoint endpoint;
   final NetworkStack network;
   final int port;
@@ -92,8 +97,12 @@ final class VizioApi {
   /// [error] with [secrets] and secret-bearing fields redacted.
   WatchmeError redact(WatchmeError error) => redactError(error, secrets);
 
-  Uri uri(String path) =>
-      endpoint.uri('https', VizioPorts.api, VizioPorts.apiDefault, path);
+  Uri uri(String path) => endpoint.uri(
+    'https',
+    VizioPorts.smartcast,
+    VizioPorts.smartcastDefault,
+    path,
+  );
 
   Map<String, String> _headers({required bool body}) => {
     // vizaio and pyvizio send exactly this; the TV wants JSON bodies.
@@ -247,6 +256,9 @@ enum VizioContext {
 /// * HTTP 500 (lighttpd "Unhandled Exception"), any other status, a body
 ///   without `STATUS.RESULT`, or an unknown result:
 ///   [WatchmeErrorCode.protocol].
+///
+/// The message names the result only when it is one of [vizioResultWords];
+/// any other result is not shown, since it could be anything (a token).
 WatchmeError vizioError(
   VizioReply reply,
   String what, {
@@ -287,7 +299,12 @@ WatchmeError vizioError(
       '$what: the TV answered without a SmartCast status',
     );
   }
-  String says(String meaning) => '$what: $meaning ($result)';
+  // Only a known status word is shown: the TV may put anything in
+  // STATUS.RESULT, a token included, and upper-cased there no redaction
+  // would find it.
+  String says(String meaning) => vizioResultWords.contains(result)
+      ? '$what: $meaning ($result)'
+      : '$what: $meaning';
   return switch (result) {
     'REQUIRES_PAIRING' when pairing => error(
       WatchmeErrorCode.unauthorized,
@@ -430,16 +447,16 @@ final class VizioDeviceInfo {
 
 /// The ports to try for [endpoint], in order, without repeats: [first]
 /// (the port remembered from pairing, or the TXT `hsp` hint of a
-/// `_viziocast._tcp` advertisement) unless the endpoint names its `api`
-/// port explicitly, then the `api` port (7345), then the `legacy` port
-/// (9000).
+/// `_viziocast._tcp` advertisement) unless the endpoint names its
+/// `smartcast` port explicitly, then the `smartcast` port (7345), then the
+/// `smartcastLegacy` port (9000).
 List<int> vizioPortCandidates(Endpoint endpoint, {int? first}) => {
-  if (!endpoint.ports.containsKey(VizioPorts.api)) ...[
+  if (!endpoint.ports.containsKey(VizioPorts.smartcast)) ...[
     ?first,
     ?advertisedRestPort(endpoint.attributes),
   ],
-  endpoint.port(VizioPorts.api, VizioPorts.apiDefault),
-  endpoint.port(VizioPorts.legacy, VizioPorts.legacyDefault),
+  endpoint.port(VizioPorts.smartcast, VizioPorts.smartcastDefault),
+  endpoint.port(VizioPorts.smartcastLegacy, VizioPorts.smartcastLegacyDefault),
 }.toList();
 
 /// Whether [attrs] come from a `_viziocast._tcp` mDNS record, whose TXT
@@ -466,6 +483,16 @@ PowerMode? parsePowerMode(VizioReply reply) {
       reply.itemNamed()?['value']) {
     1 || '1' => PowerMode.on,
     0 || '0' => PowerMode.standby,
+    _ => null,
+  };
+}
+
+/// The `MAXIMUM` a static settings answer gives the leaf [cname], or `null`
+/// when it gives no positive one.
+int? parseMaximum(VizioReply reply, String cname) {
+  if (!reply.success) return null;
+  return switch ((reply.itemNamed(cname) ?? reply.itemNamed())?['maximum']) {
+    final int max when max > 0 => max,
     _ => null,
   };
 }

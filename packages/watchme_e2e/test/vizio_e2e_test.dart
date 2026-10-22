@@ -17,12 +17,11 @@ import 'support/harness.dart';
 /// `dart:io` stack and the driver against the loopback simulator, with both
 /// loopback guards on.
 ///
-/// The drivers are the app's, without Fire TV: VIZIO's API port is named
-/// `api`, as Fire TV's is, and a device record keeps one flat port map, so
-/// Fire TV's token-less status probe would reach this simulator's API too
-/// and take its 403 for a paired-only Fire TV. Real TVs use different
-/// default ports (7345 and 8080), so this happens only when a caller names
-/// the ports, as these tests must.
+/// The drivers are the app's, all of them. A device record keeps one flat
+/// port map, and these tests must name the simulator's ports, so every
+/// other driver's port names point at closed loopback ports
+/// ([portsWith]); VIZIO's names (`smartcast`, `smartcastLegacy`) are its
+/// own, so no other driver's probe reaches the SmartCast API.
 void main() {
   late VizioSimulator sim;
   late Directory dir;
@@ -49,7 +48,7 @@ void main() {
     Iterable<DiscoveryProvider> Function(NetworkStack network)? discovery,
   }) => E2eSystem.start(
     dir,
-    drivers: appDrivers(fireTv: false),
+    drivers: appDrivers(),
     config: config,
     wakeOnLan: wakeOnLan,
     discovery: discovery,
@@ -73,8 +72,8 @@ void main() {
     sim = next;
     addTearDown(sim.close);
     ports = await portsWith({
-      VizioPorts.api: sim.apiPort,
-      VizioPorts.legacy: sim.legacyPort,
+      VizioPorts.smartcast: sim.apiPort,
+      VizioPorts.smartcastLegacy: sim.legacyPort,
     });
   }
 
@@ -108,6 +107,12 @@ void main() {
   group('manual add', () {
     test('recognises the TV by its open device info, reads nothing else '
         'and asks for pairing', () async {
+      // Every driver the app registers probes it, Fire TV (whose API port
+      // is named `api`) included, and only VIZIO claims it.
+      expect(
+        system.engine.drivers.map((d) => d.id),
+        containsAll(['roku.ecp', 'firetv.lightning', vizioDriverId]),
+      );
       final view = await addVizio();
       expect(view.drivers.map((d) => d.driverId), [vizioDriverId]);
       expect(view.manufacturer, 'VIZIO');
@@ -123,7 +128,8 @@ void main() {
       }
       expect(sim.effects, isEmpty);
       final record = (await system.devices.get(view.id))!;
-      expect(record.ports[VizioPorts.api], sim.apiPort);
+      expect(record.ports[VizioPorts.smartcast], sim.apiPort);
+      expect(record.ports['api'], isNot(sim.apiPort));
     });
 
     test('before pairing, commands and the power key send nothing', () async {
@@ -166,7 +172,7 @@ void main() {
       expect(view.name, isNotEmpty);
       final record = (await found.devices.get(view.id))!;
       expect(record.allMacs, contains(normalizeMac(sim.mac)));
-      expect(record.ports[VizioPorts.api], sim.apiPort);
+      expect(record.ports[VizioPorts.smartcast], sim.apiPort);
       expect(provider.scans.single.serviceTypes, contains('_viziocast._tcp'));
     });
   });
@@ -522,7 +528,7 @@ void main() {
       );
       final view = await addVizio();
       final record = (await system.devices.get(view.id))!;
-      expect(record.ports[VizioPorts.api], sim.legacyPort);
+      expect(record.ports[VizioPorts.smartcast], sim.legacyPort);
       expect((await pair(view.id)).last, const Paired.redacted());
 
       await system.close();

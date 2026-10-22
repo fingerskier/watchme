@@ -84,12 +84,18 @@ void main() {
     final json = await _jsonLine(lines, seen);
     expect(json['simulator'], 'vizio');
     final ports = json['ports']! as Map<String, Object?>;
-    expect(json['activePort'], ports['api']);
+    // The driver's port names, which no other driver reads.
+    expect(ports.keys, {'smartcast', 'smartcastLegacy'});
+    expect(json['activePort'], ports['smartcast']);
     expect(seen.join('\n'), contains('VIZIO SmartCast simulator'));
+    expect(
+      seen.join('\n'),
+      contains('{smartcast: ${ports['smartcast']}, smartcastLegacy: '),
+    );
     final client = HttpClient()..badCertificateCallback = (_, _, _) => true;
     addTearDown(client.close);
     final request = await client.getUrl(
-      Uri.https('127.0.0.1:${ports['api']}', '/state/device/deviceinfo'),
+      Uri.https('127.0.0.1:${ports['smartcast']}', '/state/device/deviceinfo'),
     );
     final response = await request.close();
     expect(response.statusCode, 200);

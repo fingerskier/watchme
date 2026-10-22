@@ -81,7 +81,7 @@ void main() {
       addTearDown(legacy.close);
       final result = await driver.probe(legacy.endpoint, transports);
       expect(result.matched, isTrue);
-      expect(result.endpoint?.ports['api'], legacy.legacyPort);
+      expect(result.endpoint?.ports['smartcast'], legacy.legacyPort);
       expect(result.info!.extra['apiPort'], '${legacy.legacyPort}');
       expect(
         transports.network.calls
@@ -100,7 +100,7 @@ void main() {
         transports,
       );
       expect(result.matched, isTrue);
-      expect(result.endpoint?.ports, {'api': sim.apiPort});
+      expect(result.endpoint?.ports, {'smartcast': sim.apiPort});
       expect(result.info!.mac, 'f0:4f:e0:2d:6e:20');
       // The advertised port answered first: 7345 and 9000 were not tried.
       expect(transports.network.calls.last.uri.port, sim.apiPort);
@@ -177,12 +177,12 @@ void main() {
       expect(net.httpCalls.single.headers, isEmpty);
     });
 
-    test('falls back to 9000 and records it as the api port', () async {
+    test('falls back to 9000 and records it as the smartcast port', () async {
       net.setUnreachable(host, port: 7345);
       net.respond('GET', '/state/device/deviceinfo', _deviceInfo(), port: 9000);
       final result = await driver.probe(const Endpoint(host), transports);
       expect(result.matched, isTrue);
-      expect(result.endpoint, const Endpoint(host, ports: {'api': 9000}));
+      expect(result.endpoint, const Endpoint(host, ports: {'smartcast': 9000}));
       expect([for (final c in net.httpCalls) c.uri.port], [7345, 9000]);
     });
 

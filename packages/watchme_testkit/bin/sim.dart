@@ -301,14 +301,15 @@ Future<Future<void> Function()> _runVizio(_Args args) async {
           ? 'Add it in watchme by IP: ${sim.host}, then pair; the PIN '
                 'appears here.'
           : 'Engine ports for addManual(${sim.host}): '
-                '{api: ${sim.apiPort}, legacy: ${sim.legacyPort}}',
+                '{smartcast: ${sim.apiPort}, '
+                'smartcastLegacy: ${sim.legacyPort}}',
     );
   if (args.flag('json')) {
     stdout.writeln(
       jsonEncode({
         'simulator': 'vizio',
         'host': sim.host,
-        'ports': {'api': sim.apiPort, 'legacy': sim.legacyPort},
+        'ports': {'smartcast': sim.apiPort, 'smartcastLegacy': sim.legacyPort},
         'activePort': sim.activePort,
         'mdnsTxt': sim.mdnsTxt,
       }),

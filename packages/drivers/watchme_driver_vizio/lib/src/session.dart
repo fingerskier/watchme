@@ -20,6 +20,10 @@ const int vizioMaxKeysPerRequest = 50;
 /// The most volume steps one `StepVolume` sends.
 const int vizioMaxVolumeSteps = 100;
 
+/// The top of a VIZIO TV's volume scale (vizaio and pyvizio agree). A TV's
+/// own static `MAXIMUM` may lower it, never raise it.
+const int vizioTvMaxVolume = 100;
+
 /// The longest text one `TypeText` sends.
 const int vizioMaxTextLength = 256;
 
@@ -41,7 +45,8 @@ const int vizioTimeoutsBeforeDisconnect = 3;
 ///   a power state the session only assumes from a command it sent is
 ///   [Confidence.inferred].
 /// * **Settings.** Absolute volume, discrete mute and input selection read
-///   the settings leaf for its `HASHVAL`, then `MODIFY` it. A refused
+///   the settings leaf for its `HASHVAL`, then `MODIFY` it. Absolute volume
+///   is clamped to [maxVolume], which the first one reads. A refused
 ///   `HASHVAL` (the value changed meanwhile, nothing was applied) is
 ///   retried once after a fresh read, and the write is skipped when the
 ///   fresh read already shows the target, so nothing is applied twice.
@@ -93,6 +98,7 @@ final class VizioSession implements DriverSession {
   bool _closed = false;
   bool _reauthReported = false;
   List<_Input>? _inputs;
+  int? _maxVolume;
 
   /// Requests of the running command that the TV accepted.
   int _delivered = 0;
@@ -105,6 +111,11 @@ final class VizioSession implements DriverSession {
 
   /// The API port in use.
   int get port => _api.port;
+
+  /// The highest volume the TV takes, once the first `SetVolume` read it
+  /// (brief §6): the static `audio/volume` `MAXIMUM`, at most
+  /// [vizioTvMaxVolume], or [vizioTvMaxVolume] when the TV gives none.
+  int? get maxVolume => _maxVolume;
 
   static const WatchmeError _closedError = WatchmeError.cancelled(
     'The VIZIO session is closed',
@@ -239,7 +250,7 @@ final class VizioSession implements DriverSession {
   }
 
   Future<CommandResult> _setVolume(int level) async {
-    final target = level.clamp(0, 100);
+    final target = level.clamp(0, await _volumeMax());
     final result = await _modify(
       VizioPaths.volume,
       'volume',
@@ -255,6 +266,18 @@ final class VizioSession implements DriverSession {
       _setState(_state.copyWith(volume: _inferred(target)));
     }
     return const Confirmed();
+  }
+
+  /// [maxVolume], read once per session: a level above it is
+  /// `VALUE_OUT_OF_RANGE`. A TV that answers without a range keeps the TV
+  /// scale; one that does not answer fails the command, and the next one
+  /// asks again.
+  Future<int> _volumeMax() async {
+    if (_maxVolume case final max?) return max;
+    final reply = await _get(VizioPaths.volumeRange);
+    _checkAuth(reply, 'Reading the volume range');
+    final max = parseMaximum(reply, 'volume');
+    return _maxVolume = min(max ?? vizioTvMaxVolume, vizioTvMaxVolume);
   }
 
   Future<CommandResult> _stepVolume(int steps) async {
@@ -474,7 +497,9 @@ final class VizioSession implements DriverSession {
   /// mute (input and app are no longer current; they go stale).
   ///
   /// Throws when `power_mode` cannot be read: a transport failure (see the
-  /// class notes on lost TVs) or a refused token.
+  /// class notes on lost TVs) or a refused token. Also throws, keeping
+  /// nothing it read, when a later read loses the TV or [close] comes
+  /// first.
   @override
   Future<DeviceState> refresh() => _serial(() async {
     _checkOpen();
@@ -515,6 +540,10 @@ final class VizioSession implements DriverSession {
           nowPlaying: _state.nowPlaying?.asStale(),
         );
       }
+      // [next] began as the state before the reads; a close while the last
+      // one was in flight has made the session disconnected since, and it
+      // stays so.
+      _checkOpen();
       _setState(next);
       return _state;
     } on WatchmeError catch (e) {
@@ -637,12 +666,16 @@ final class VizioSession implements DriverSession {
   }
 
   /// Whether [e], met by an optional read of [refresh], must end the
-  /// refresh: a refused token, a TV that stopped answering, or [close].
-  static bool _fatal(WatchmeError e) => const {
-    WatchmeErrorCode.reauthRequired,
-    WatchmeErrorCode.unreachable,
-    WatchmeErrorCode.cancelled,
-  }.contains(e.code);
+  /// refresh: a refused token, a TV that stopped answering (a timeout that
+  /// was the last straw included: the session is no longer connected), or
+  /// [close].
+  bool _fatal(WatchmeError e) =>
+      _connection != ConnectionState.connected ||
+      const {
+        WatchmeErrorCode.reauthRequired,
+        WatchmeErrorCode.unreachable,
+        WatchmeErrorCode.cancelled,
+      }.contains(e.code);
 
   /// [_readLeaf] for [refresh]: `null` when it fails, unless the failure is
   /// [_fatal].

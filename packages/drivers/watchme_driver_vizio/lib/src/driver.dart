@@ -12,10 +12,10 @@ import 'session.dart';
 ///
 /// * [probe] is passive: it reads `GET /state/device/deviceinfo`, the one
 ///   read a TV answers without a token, on 7345 and then 9000, and reports
-///   the port that answered as the `api` port of its refined endpoint. It
-///   reports no power: `power_mode` needs the pairing token, so before
-///   pairing the power is unknown, never off. Sound bars and speakers
-///   (settings root `audio_settings`) are not claimed.
+///   the port that answered as the `smartcast` port of its refined
+///   endpoint. It reports no power: `power_mode` needs the pairing token,
+///   so before pairing the power is unknown, never off. Sound bars and
+///   speakers (settings root `audio_settings`) are not claimed.
 /// * [startPairing] reads deviceinfo with trust on first use, records the
 ///   certificate and pins it for the rest of pairing, sends
 ///   `PUT /pairing/start` (the TV shows a PIN), prompts with [EnterCode]
@@ -124,14 +124,17 @@ final class VizioDriver implements Driver {
         ],
       );
     }
-    final primary = endpoint.port(VizioPorts.api, VizioPorts.apiDefault);
+    final primary = endpoint.port(
+      VizioPorts.smartcast,
+      VizioPorts.smartcastDefault,
+    );
     return ProbeResult.matched(
       info: _deviceInfo(endpoint.attributes, info, port),
       capabilities: vizioDescriptor.ceiling,
       requiresPairing: true,
       endpoint: port == primary
           ? null
-          : endpoint.withPorts({VizioPorts.api: port}),
+          : endpoint.withPorts({VizioPorts.smartcast: port}),
       notes: [
         'The VIZIO SmartCast API answered on port $port.',
         'Its power state needs pairing: power_mode requires the token.',

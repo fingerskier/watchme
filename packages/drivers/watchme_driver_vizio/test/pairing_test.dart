@@ -439,7 +439,8 @@ void main() {
           '$failed',
           ...errorTexts(failed.error),
         ]) {
-          expect(text, isNot(contains('S3cr3t')), reason: text);
+          // In any case: a status word is shown upper-cased.
+          expect(text.toLowerCase(), isNot(contains('s3cr3t')), reason: text);
         }
       }
 
@@ -463,6 +464,29 @@ void main() {
           expect(failed.rawDeviceMessage, contains('<redacted>'));
         },
       );
+
+      test('a status that is not a known word is never shown', () async {
+        // A malformed answer with the token as its status too: the message
+        // names no status, and nothing shows the token in any case.
+        sim.respondOnce(
+          'PUT',
+          '/pairing/pair',
+          200,
+          json: {
+            'ITEM': {'AUTH_TOKEN': token},
+            'STATUS': {'RESULT': token, 'DETAIL': 'Success'},
+          },
+        );
+        final steps = await drive(start(), ['4321']);
+        expectNoToken(steps.last);
+        final failed = steps.last as PairingFailed;
+        expect(failed.error.code, WatchmeErrorCode.protocol);
+        expect(
+          failed.error.message,
+          'Checking the PIN: unexpected SmartCast status',
+        );
+        expect(sim.cancelCount, 1);
+      });
 
       test('a non-JSON error body is removed whole', () async {
         sim.respondOnce('PUT', '/pairing/pair', 500, body: 'oops $token');
