@@ -49,8 +49,10 @@ abstract interface class WatchmeEngine {
   /// credentials.
   Future<void> forget(String deviceId);
 
-  /// Starts pairing [driverId] with [deviceId]. On [Paired] the engine stores
-  /// the credential and connects. A driver that needs no pairing yields
+  /// Starts pairing [driverId] with [deviceId]. The driver's open session
+  /// with the device is closed first (some devices serve one client at a
+  /// time). On [Paired] the engine stores the credential and connects. A
+  /// driver whose `startPairing` offers no flow for the device yields
   /// [PairingFailed] with [WatchmeErrorCode.unsupported].
   PairingFlow pair(String deviceId, String driverId);
 
@@ -144,6 +146,7 @@ final class DriverView {
     required this.driverId,
     required this.protocol,
     this.requiresPairing = false,
+    this.offersPairing = false,
     this.paired = false,
     this.connection = ConnectionState.disconnected,
     this.lastError,
@@ -156,6 +159,7 @@ final class DriverView {
     driverId: req<String>(json, 'driverId'),
     protocol: req<String>(json, 'protocol'),
     requiresPairing: opt<bool>(json, 'requiresPairing') ?? false,
+    offersPairing: opt<bool>(json, 'offersPairing') ?? false,
     paired: opt<bool>(json, 'paired') ?? false,
     connection:
         optEnum(json, 'connection', ConnectionState.values) ??
@@ -177,6 +181,11 @@ final class DriverView {
   /// Whether the driver needs pairing for this device.
   final bool requiresPairing;
 
+  /// Whether the driver offers pairing for optional set-up even when it
+  /// does not need it (`DriverDescriptor.offersPairing`): a Sharp AQUOS's
+  /// login or its network power-on setting.
+  final bool offersPairing;
+
   /// Whether a credential is stored.
   final bool paired;
 
@@ -195,6 +204,10 @@ final class DriverView {
   /// Whether the user must pair before this driver works.
   bool get needsPairing => requiresPairing && !paired;
 
+  /// Whether the user can start pairing this driver: it needs pairing, or
+  /// offers it for optional set-up ([offersPairing]).
+  bool get canPair => requiresPairing || offersPairing;
+
   /// Whether the session is connected.
   bool get connected => connection == ConnectionState.connected;
 
@@ -203,6 +216,7 @@ final class DriverView {
     'driverId': driverId,
     'protocol': protocol,
     'requiresPairing': requiresPairing,
+    if (offersPairing) 'offersPairing': true,
     'paired': paired,
     'connection': connection.name,
     if (lastError != null) 'lastError': lastError!.toJson(),
@@ -216,6 +230,7 @@ final class DriverView {
       other.driverId == driverId &&
       other.protocol == protocol &&
       other.requiresPairing == requiresPairing &&
+      other.offersPairing == offersPairing &&
       other.paired == paired &&
       other.connection == connection &&
       other.lastError == lastError &&
@@ -227,6 +242,7 @@ final class DriverView {
     driverId,
     protocol,
     requiresPairing,
+    offersPairing,
     paired,
     connection,
     lastError,

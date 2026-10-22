@@ -215,6 +215,26 @@ DeviceView fireTvDevice({bool paired = false}) => DeviceView(
   }),
 );
 
+/// A Sharp AQUOS without a login: it works unpaired, and its driver offers
+/// pairing for the optional login and network power-on.
+DeviceView sharpDevice({bool paired = false}) => DeviceView(
+  id: 'sharp-1',
+  name: 'Den AQUOS',
+  host: '192.0.2.30',
+  manufacturer: 'Sharp',
+  model: 'LC-60LE650U',
+  drivers: [
+    DriverView(
+      driverId: 'sharp.aquos',
+      protocol: 'Sharp AQUOS IP control',
+      offersPairing: true,
+      paired: paired,
+      connection: ConnectionState.connected,
+    ),
+  ],
+  capabilities: allCapabilities({}),
+);
+
 /// Sets the test window to [size] logical pixels.
 void useWindowSize(WidgetTester tester, Size size) {
   tester.view

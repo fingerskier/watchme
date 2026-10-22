@@ -115,4 +115,22 @@ void main() {
     final steps = await c.steps.toList();
     expect(steps, [const Instruct('one'), Paired(credentialFor('0000'))]);
   });
+
+  test('a pairing context offers the previous credential lazily', () async {
+    var reads = 0;
+    Future<Credential?> read() async {
+      reads++;
+      return credentialFor('0000');
+    }
+
+    final context = PairingContext(deviceId: 'dev-1', previousCredential: read);
+    expect(reads, 0, reason: 'nothing is read until a driver asks');
+    expect(await context.previousCredential!(), credentialFor('0000'));
+    expect(reads, 1);
+    expect(
+      context,
+      PairingContext(deviceId: 'dev-1', previousCredential: read),
+    );
+    expect(context, isNot(const PairingContext(deviceId: 'dev-1')));
+  });
 }

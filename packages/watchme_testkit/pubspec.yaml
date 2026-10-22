@@ -1,8 +1,8 @@
 name: watchme_testkit
 description: >-
   Test support for watchme: fake transports, a fake clock, matchers, and
-  loopback Roku and Fire TV protocol simulators (`dart run
-  watchme_testkit:sim`).
+  loopback Roku, Fire TV, VIZIO, Panasonic and Sharp protocol simulators
+  (`dart run watchme_testkit:sim`).
 version: 0.1.0
 repository: https://github.com/fingerskier/watchme
 publish_to: none
@@ -14,6 +14,7 @@ resolution: workspace
 
 dependencies:
   crypto: ^3.0.6
+  pointycastle: ^4.0.0
   test: ^1.25.0
   watchme_core: ^0.1.0
   xml: ^7.1.0

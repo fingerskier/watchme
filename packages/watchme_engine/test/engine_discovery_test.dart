@@ -497,6 +497,49 @@ void main() {
         expect(h.engine.currentDevices, isEmpty);
       });
 
+      test('when nothing matches, a refusal from a driver that reached the '
+          'device is the explanation, not another driver\'s silence', () async {
+        final silent = FakeDriver(
+          'roku.ecp',
+          onProbe: (_) => const ProbeResult.notMatched(
+            error: WatchmeError.unreachable('connection refused'),
+          ),
+        );
+        final refused = FakeDriver(
+          'panasonic.viera',
+          onProbe: (_) => const ProbeResult.notMatched(
+            error: WatchmeError.rejected(
+              'Reading the NRC description: the TV accepts only clients on '
+              'its own subnet',
+              rawDeviceMessage: 'HTTP 403',
+            ),
+            notes: ['GET /nrc/ddd.xml answered HTTP 403.'],
+          ),
+        );
+        final h = Harness(drivers: [silent, refused]);
+        addTearDown(h.close);
+        await expectLater(
+          h.engine.addManual('10.0.2.77'),
+          throwsA(
+            allOf(
+              isWatchmeError(
+                WatchmeErrorCode.unsupported,
+                message: allOf(
+                  contains('own subnet'),
+                  contains('answered HTTP 403'),
+                ),
+                rawDeviceMessage: 'HTTP 403',
+              ),
+              isA<WatchmeError>().having(
+                (e) => (e.cause! as WatchmeError).code,
+                'cause',
+                WatchmeErrorCode.rejected,
+              ),
+            ),
+          ),
+        );
+      });
+
       test('discovery hits from refused addresses are dropped, and cannot '
           'move a known device there', () async {
         final provider = FakeDiscoveryProvider(DiscoveryProviderId.ssdp);

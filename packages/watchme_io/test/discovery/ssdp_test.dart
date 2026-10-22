@@ -435,9 +435,63 @@ void main() {
         expect(net.callsTo('GET', '/upnp/dev/7c2a6a2e/desc'), hasLength(1));
         expect(net.callsTo('GET', '/'), hasLength(1));
         // Every target was searched twice.
-        expect(net.multicastQueries, hasLength(6));
+        expect(
+          net.multicastQueries,
+          hasLength(SsdpDiscovery.defaultSearchTargets.length * 2),
+        );
       },
     );
+
+    test('a scan that names no types also finds Panasonic and Sharp TVs '
+        'that answer only their own targets', () async {
+      net = FakeNetworkStack()
+        ..onMulticast(ssdpGroup, ssdpPort, (query) {
+          final st = SsdpMessage.tryParseBytes(query)!.header('st');
+          Datagram d(String host, String text) =>
+              Datagram(host, ssdpPort, utf8.encode(text));
+          return switch (st) {
+            'urn:panasonic-com:service:p00NetworkControl:1' => [
+              d('10.0.0.40', vieraNrcResponse()),
+            ],
+            'urn:schemas-sharp-co-jp:device:AquosIPC:1' => [
+              d('10.0.0.50', aquosIpcResponse()),
+            ],
+            _ => <Datagram>[],
+          };
+        });
+      final hits = await SsdpDiscovery(
+        net,
+        attempts: 1,
+        resendDelay: Duration.zero,
+        fetchDescriptions: false,
+      ).scan(const Duration(seconds: 1)).toList();
+      expect(
+        net.multicastQueries.map(
+          (q) => SsdpMessage.tryParse(q.text)!.header('st'),
+        ),
+        containsAll([
+          'urn:dial-multiscreen-org:device:dial:1',
+          'urn:panasonic-com:service:p00NetworkControl:1',
+          'urn:schemas-sharp-co-jp:device:AquosIPC:1',
+        ]),
+      );
+      // The matchers of the Panasonic and Sharp drivers' descriptors.
+      const viera = DiscoveryMatcher(
+        provider: DiscoveryProviderId.ssdp,
+        serviceType: 'urn:panasonic-com:service:p00NetworkControl:1',
+        portName: 'nrc',
+      );
+      const aquos = DiscoveryMatcher(
+        provider: DiscoveryProviderId.ssdp,
+        serviceType: 'urn:schemas-sharp-co-jp:device:AquosIPC:1',
+      );
+      final tv = hits.singleWhere(viera.matches);
+      expect(tv.host, '10.0.0.40');
+      expect(tv.port, 55000);
+      final sharp = hits.singleWhere(aquos.matches);
+      expect(sharp.host, '10.0.0.50');
+      expect(hits, hasLength(2));
+    });
 
     test('searches only the SSDP types it is given', () async {
       final hits = await provider(attempts: 1)

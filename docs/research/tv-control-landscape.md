@@ -166,15 +166,15 @@ Columns: Off = power_off, On = power_on, PSt = power_state, Vol = volume, Mute =
 | Matter Casting (Fire TV player) | P | P | P | P | ? | P | P | N | N | Y | ? | ? | Y | P | N | N | N | Y |
 | Apple TV Companion | Y | Y | Y | P | ? | Y | Y | Y | Y | Y | N | P | P | N | P | N | N | N |
 | Apple TV AirPlay 2 / MRP | P | P | P | Y | ? | Y | Y | N | P | N | N | N | Y | Y | N | N | N | P |
-| Vizio SmartCast REST | Y | P | Y | Y | Y | Y | Y | P | P | Y | Y | Y | P | P | N | N | N | P |
+| Vizio SmartCast REST | Y | P | Y | Y | Y | Y | Y | P | P | P | Y | P | P | P | N | N | N | N |
 | VIDAA MQTT (36669) | Y | P | P | Y | Y | Y | Y | P | Y | Y | Y | Y | P | P | ? | P | ? | P |
 | VIDAA UPnP DMR (38400) | N | N | P | Y | Y | N | N | N | N | N | N | N | P | P | N | N | N | P |
 | Philips JointSpace v6 (Android TV) | Y | P | Y | Y | Y | Y | Y | P | Y | Y | P | Y | P | P | N | N | N | P |
 | Titan OS MQTT (8883) | Y | P | P | P | P | Y | Y | Y | Y | Y | P | P | P | P | N | ? | N | ? |
 | Sony REST + IRCC | Y | P | Y | Y | Y | Y | Y | P | Y | Y | Y | P | P | P | N | N | N | P |
 | Sony Simple IP Control (TCP 20060) | Y | P | Y | Y | Y | Y | Y | N | N | N | Y | P | P | N | N | N | N | N |
-| Panasonic Viera SOAP (55000) | P | P | P | Y | Y | Y | Y | ? | Y | Y | P | P | P | N | ? | N | N | P |
-| Sharp AQUOS (TCP 10002) | Y | P | Y | Y | Y | P | P | N | N | N | Y | Y | P | P | N | N | N | N |
+| Panasonic Viera SOAP (55000) | P | P | P | Y | Y | Y | Y | P | Y | Y | P | P | P | P | N | N | N | P |
+| Sharp AQUOS (TCP 10002) | Y | P | Y | Y | Y | P | P | P | P | P | Y | Y | P | N | N | N | N | N |
 | HomeKit TV service (e.g. Xumo TVs) | Y | Y | Y | N | N | ? | ? | N | N | N | Y | N | ? | N | N | N | N | N |
 | HDMI-CEC (hub on HDMI) | Y | Y | Y | P | P | P | P | N | N | N | P | P | P | N | N | P | N | N |
 | DIAL | P | P | N | N | N | N | N | N | N | P | N | N | N | P | N | N | N | P |
@@ -219,6 +219,19 @@ Notes that change how the matrix should be read:
 
 **Bluetooth HID**
 - Only an LG G5 (webOS 25) with an Android phone is confirmed. A Linux/Pi BlueZ peripheral is unverified per TV.
+
+**Vizio**
+- Launch and the app list are partial: launch payloads come from Vizio's cloud catalog, or from a short built-in table (watchme uses only the table).
+- Channels need a tuner model. Cast is Chromecast built-in, a separate protocol.
+- `power_mode` is the TV's own report, but it needs the pairing token and is readable only while the API answers (Quick Start); in Eco mode the port is closed.
+
+**Panasonic**
+- The only power command is the `NRC_POWER` toggle. The power state is reported only through GENA `X_ScreenState`; everything else (a Pro AV description that answers, RenderingControl refusing a read) is inferred.
+- Text works only while an on-screen keyboard is open; now-playing is the foreground app only. Cast is the browser URL push, which needs an inbound connection from the TV.
+
+**Sharp**
+- Power state (`POWR?`) answers only while the TV listens in standby (RSPW 2 or Quick Start), and not at all on 2015 "ULI" firmware.
+- Apps are the Netflix key only; text needs the separate UPnP SOAP service on 12346. There is no now-playing readback (the earlier P here was wrong).
 
 **Wake-on-LAN**
 - Requires the TV's network-standby setting.
@@ -512,13 +525,16 @@ Endpoints and behavior:
 ### 6.7 Vizio (SmartCast / VIZIO OS)
 
 **Protocol.**
-- HTTPS on 7345 (port 9000 on older firmware). Self-signed certificate, CN `BG2.prod.vizio.com`.
+- HTTPS on 7345, or 9000 on firmware older than 4.0. The firmware decides, not the model year (a current sound bar in setup answered on 9000), so clients try 7345 then 9000. Self-signed certificate, CN `BG2.prod.vizio.com`, the same on every set: pinning it on first use does not tell two TVs apart, and the token is the real secret.
 - Pairing: `PUT /pairing/start` shows a 4-digit PIN; `/pairing/pair` returns a token, sent as the literal header `AUTH: <token>`. The token is **unscoped**: it also unlocks settings, network configuration and a system-webview URL launch.
-- Discovery: `_viziocast._tcp`.
+- Discovery: `_viziocast._tcp`. Its TXT `name` is a room name, not the model; `hsp` is the REST port and `wifi` the MAC (the cleanest Wake-on-LAN source). SSDP DIAL answers the device type `urn:dial-multiscreen-org:device:dial:1` with `manufacturer` VIZIO; its port is the DIAL server, not the API.
+- `GET /state/device/deviceinfo` needs no token. `power_mode` and everything else does, so an unpaired TV's power state is unknown, not off.
+- Power is discrete (11/1, 11/0); the toggle 11/2 is never needed. Mute changes are acknowledged but ignored in standby.
+- Inputs: modern firmware takes the input's lower-case cname in `current_input`, older firmware its display name.
 - Features: key codesets (power 11/x, volume 5/x, nav 3/x and so on), absolute volume readback, inputs, app launch.
 - `state_extended` is available on roughly 2022+ firmware.
 - Power-on works only in Quick Start mode; Eco mode disables the network.
-- The app list comes from a cloud catalog (scfs.vizio.com), so it needs internet.
+- The app list comes from a cloud catalog (scfs.vizio.com), so it needs internet. A few launch payloads (Netflix, YouTube, SmartCast Home) are stable enough to keep locally.
 - Sources: https://github.com/raman325/vizaio/blob/main/docs/android-app-findings.md, https://github.com/exiva/Vizio_SmartCast_API
 
 **Status (2026).**
@@ -528,7 +544,9 @@ Endpoints and behavior:
 
 **Browser.** Provisional. Every call is a PUT, which cannot be sent no-cors. A 2021 advisory called the CORS policy "open" on 2017 firmware. Test on owned hardware.
 
-**For watchme.** Port from vizaio (MIT, 0.7.0), which Home Assistant now uses instead of pyvizio.
+**Models.** Every VIZIO TV since 2016 runs SmartCast (renamed VIZIO OS in 2024; onn TVs joined in November 2025), and all of them speak this one API; there is no regional variant. Pre-2016 VIA / Internet Apps sets have no network API. Sound bars and Crave speakers use the same API under `audio_settings`, with a different volume scale and, on most, no pairing.
+
+**For watchme.** `vizio.smartcast` is clean-room Dart written from vizaio (MIT, 0.7.0, which Home Assistant now uses instead of pyvizio), pyvizio and heathbar's client. It covers TVs only, uses a built-in launch table instead of the cloud catalog, and does not implement the internal loopback API, the WebSocket bus or the raw-URL launcher that the 2026 security research describes.
 
 ### 6.8 Hisense / Toshiba / Loewe (VIDAA, becoming "V Home OS")
 
@@ -595,13 +613,19 @@ Endpoints and behavior:
 ### 6.11 Other consumer brands
 
 **Panasonic.**
-- Viera SOAP/UPnP on HTTP 55000. Encrypted PIN pairing arrived around 2019.
-- Covers keys, apps and RenderingControl volume. Legacy: 2024 flagships run Fire TV, and the 2026 EU range is split across Fire TV, Google TV and TiVo.
-- Reference: panasonic-viera (MIT).
+- Viera network remote control (NRC): SOAP/UPnP on HTTP 55000. 2011-2017 sets take plain commands with no pairing. Encrypted commands with PIN pairing (AES-128-CBC and HMAC-SHA-256) arrived with the 2018 F series, both FZ OLED and FX LCD, in the field, not around 2019. RenderingControl volume and mute stay plain and need no pairing, even on encrypted sets.
+- Covers keys, apps with icons, text into an open keyboard, inputs (the current one only on Pro AV "PAC" models) and channel digits.
+- Power is a toggle (`NRC_POWER`). The set reports its screen state only through GENA eventing; Wake-on-LAN is ignored for about 30 s after switching off; many 2011-2015 sets cannot be switched on over the network (a 2013 ET60 lists neither `VR_POWER` nor `VR_WOL`).
+- The TV answers HTTP 403 to clients on another subnet or VLAN, Panasonic's own app included.
+- Models: `TC-` Americas, `TX-` Europe and UK, `TH-` Asia and Oceania; the letter after the screen size gives the year (A 2014, C 2015, D 2016, E 2017, F 2018, G 2019, H 2020, J 2021, L 2022, M 2023). Panasonic left the US market and returned in 2024 with Fire TV sets only, so a US VIERA is almost always a pre-2017 plain `TC-...U`. From 2024 Panasonic TVs run Fire TV, Google TV, TiVo OS or Roku and do not speak NRC.
+- Reference: panasonic-viera (MIT), homebridge-vieramatic (Apache-2.0). watchme's `panasonic.viera` covers 2011-2023 sets, plain and encrypted.
 
 **Sharp.**
-- AQUOS IP control on TCP 10002 (ASCII). Legacy only.
-- Current Sharp-branded TVs run TiVo OS, Roku or Google TV.
+- AQUOS IP control on TCP 10002 (ASCII, 8-character commands; the port is configurable on the TV). An optional login ID and password, sent in clear; no encryption. Sharp's manuals document it.
+- Covered: Sharp-built US `LC-...U` sets of 2010-2014 (LE6xx/7xx/8xx/9xx, C6xxx, EQ/SQ/TQ/UQ, UD27), the US 4T-B commercial series (2021), EU sets of 2011-2013 (their own command set, and no power-on over IP), and JP AQUOS sets, Android TV models included. 2015 US sets (third-party "ULI" firmware) answer no queries: keys and power only.
+- Power-on over IP needs the TV to keep listening in standby: the power-on command setting `RSPW2` on US 2010-2013 sets (Sharp warns that standby power becomes "just about the same as usual"), Quick Start Mode on 2014, 4T-B and JP sets. Volume runs 0-60 or 0-100 by model.
+- Not covered: Hisense-built US sets of 2016-2019 (`LC-xxN/P/Q...U`) and current Sharp-branded TVs, which run Roku, Google TV, TiVo OS, Xumo or (from 2026 in the EU) Titan OS.
+- watchme's `sharp.aquos` is written from the manuals; pairing collects the login only when the TV asks for one, and asks before writing `RSPW`.
 
 **TiVo OS** (Vestel, Sharp, Panasonic and others). No public or reverse-engineered local API was found. A Vestel SmartCenter DIAL-based protocol may apply (unverified; mock-tested only).
 

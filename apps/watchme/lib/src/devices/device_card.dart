@@ -182,7 +182,7 @@ class _DriverChip extends StatelessWidget {
         Icons.error_outline,
         'connection failed',
       ),
-      DriverView(requiresPairing: true, paired: true) => (
+      DriverView(paired: true) when driver.canPair => (
         Icons.verified_outlined,
         'paired, ${connectionLabel(driver.connection).toLowerCase()}',
       ),
@@ -231,6 +231,15 @@ class _Notice extends StatelessWidget {
   }
 }
 
+/// The menu item that starts pairing [driver]: "Pair" for a driver that
+/// needs it, "Set up" for one that offers it for optional settings.
+String pairMenuLabel(DriverView driver) {
+  final verb = driver.requiresPairing ? 'Pair' : 'Set up';
+  return driver.paired
+      ? '$verb ${driver.protocol} again'
+      : '$verb ${driver.protocol}';
+}
+
 class _DeviceMenu extends StatelessWidget {
   const _DeviceMenu({
     required this.device,
@@ -244,9 +253,11 @@ class _DeviceMenu extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // Drivers that need pairing, and those that offer it for optional
+    // set-up (a Sharp AQUOS's login or network power-on).
     final pairable = [
       for (final d in device.drivers)
-        if (d.requiresPairing) d,
+        if (d.canPair) d,
     ];
     return PopupMenuButton<Object>(
       tooltip: 'More actions for ${device.name}',
@@ -268,11 +279,7 @@ class _DeviceMenu extends StatelessWidget {
             value: driver,
             child: ListTile(
               leading: const Icon(Icons.add_link),
-              title: Text(
-                driver.paired
-                    ? 'Pair ${driver.protocol} again'
-                    : 'Pair ${driver.protocol}',
-              ),
+              title: Text(pairMenuLabel(driver)),
             ),
           ),
         const PopupMenuItem(

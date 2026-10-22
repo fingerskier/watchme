@@ -82,7 +82,7 @@ void main() {
     expect(client.scanCalls, 1);
   });
 
-  testWidgets('empty state explains discovery and the Roku setting', (
+  testWidgets('empty state explains discovery and each brand\'s setting', (
     tester,
   ) async {
     final client = FakeWatchmeClient();
@@ -91,6 +91,11 @@ void main() {
     expect(find.text('No TVs yet'), findsOneWidget);
     expect(find.textContaining('SSDP and mDNS'), findsOneWidget);
     expect(find.textContaining('Control by mobile apps'), findsOneWidget);
+    for (final brand in ['VIZIO', 'Panasonic VIERA', 'Sharp AQUOS']) {
+      expect(find.text(brand), findsOneWidget, reason: brand);
+    }
+    expect(find.textContaining('Quick Start'), findsOneWidget);
+    expect(find.textContaining('own subnet'), findsOneWidget);
 
     await tester.tap(find.text('Scan for TVs'));
     await tester.pumpAndSettle();
@@ -169,6 +174,57 @@ void main() {
     expect(find.byType(PairingScreen), findsOneWidget);
     expect(client.pairings.single.deviceId, 'firetv-1');
     expect(client.pairings.single.driverId, 'firetv.lightning');
+  });
+
+  testWidgets('a driver that offers optional pairing can be set up from '
+      'the menu, though it needs no pairing', (tester) async {
+    final client = FakeWatchmeClient(devices: [sharpDevice()]);
+    await pumpApp(tester, client);
+
+    expect(find.text('Connected'), findsOneWidget);
+    expect(find.widgetWithText(FilledButton, 'Pair'), findsNothing);
+    expect(find.text('Sharp AQUOS IP control'), findsOneWidget);
+
+    await tester.tap(find.byTooltip('More actions for Den AQUOS'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Set up Sharp AQUOS IP control'));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 500));
+
+    expect(find.byType(PairingScreen), findsOneWidget);
+    expect(find.text('Set up Den AQUOS'), findsOneWidget);
+    expect(client.pairings.single.deviceId, 'sharp-1');
+    expect(client.pairings.single.driverId, 'sharp.aquos');
+  });
+
+  testWidgets('menu labels say pair for required pairing and set up for '
+      'optional pairing, and again once paired', (tester) async {
+    final client = FakeWatchmeClient(
+      devices: [
+        rokuDevice(),
+        fireTvDevice(paired: true),
+        sharpDevice(paired: true),
+      ],
+    );
+    await pumpApp(tester, client, size: const Size(800, 1200));
+
+    expect(find.byTooltip('Sharp AQUOS IP control: connected'), findsOneWidget);
+    await tester.tap(find.byTooltip('More actions for Den AQUOS'));
+    await tester.pumpAndSettle();
+    expect(find.text('Set up Sharp AQUOS IP control again'), findsOneWidget);
+    await tester.tapAt(Offset.zero);
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byTooltip('More actions for Bedroom Fire TV'));
+    await tester.pumpAndSettle();
+    expect(find.text('Pair Fire TV remote API again'), findsOneWidget);
+    await tester.tapAt(Offset.zero);
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byTooltip('More actions for Living Room Roku'));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('Pair Roku'), findsNothing);
+    expect(find.textContaining('Set up Roku'), findsNothing);
   });
 
   testWidgets('Forget asks first, then forgets', (tester) async {

@@ -1,13 +1,16 @@
 // Proves the pure-Dart half of watchme is web-safe: `dart compile js` fails
-// if watchme_core, watchme_engine or either driver reaches dart:io or
-// another VM-only library. CI compiles this and runs the output with Node.
+// if watchme_core, watchme_engine or any driver reaches dart:io or another
+// VM-only library. CI compiles this and runs the output with Node.
 //
 //   dart compile js -o <scratch>/web_safety_check.js tool/web_safety_check.dart
 //   node <scratch>/web_safety_check.js
 
 import 'package:watchme_core/watchme_core.dart';
 import 'package:watchme_driver_firetv/watchme_driver_firetv.dart';
+import 'package:watchme_driver_panasonic/watchme_driver_panasonic.dart';
 import 'package:watchme_driver_roku/watchme_driver_roku.dart';
+import 'package:watchme_driver_sharp/watchme_driver_sharp.dart';
+import 'package:watchme_driver_vizio/watchme_driver_vizio.dart';
 import 'package:watchme_engine/watchme_engine.dart';
 
 /// A browser-like bundle with no transports at all: the engine must still
@@ -31,7 +34,13 @@ final class _NoTransports implements Transports {
 
 Future<void> main() async {
   final engine = Engine(
-    drivers: [const RokuDriver(), FireTvDriver()],
+    drivers: [
+      const RokuDriver(),
+      FireTvDriver(),
+      VizioDriver(),
+      PanasonicDriver(),
+      SharpDriver(),
+    ],
     transports: _NoTransports(),
   );
   await engine.start();
@@ -59,8 +68,25 @@ Future<void> main() async {
   final power = Command.fromJson(
     const SetPower(true, userConfirmed: true).toJson(),
   );
+  // Secret handling is pure Dart too: the shared redactor, and Sharp's,
+  // which keeps the TV's fixed texts.
+  final redacted = [
+    redactSecrets('{"AUTH_TOKEN":"t0k3n"}'),
+    redactSharpSecrets('Login: admin', ['admin']),
+  ];
+  final ids = [
+    for (final d in [
+      rokuDescriptor,
+      fireTvDescriptor,
+      vizioDescriptor,
+      panasonicDescriptor,
+      sharpDescriptor,
+    ])
+      d.id,
+  ];
   print(
-    'drivers ${[rokuDescriptor.id, fireTvDescriptor.id]}, '
+    'drivers $ids, '
+    'redacted $redacted, '
     'enabled ${engine.drivers.length}, manual add refused: $refusal, '
     'public host refused: $publicRefusal, '
     '$command, $power, classes $classes, '

@@ -10,6 +10,18 @@ import 'package:watchme/src/bootstrap.dart';
 import 'package:watchme/src/destination_policy.dart';
 import 'package:watchme_core/watchme_core.dart';
 import 'package:watchme_testkit/roku_simulator.dart';
+import 'package:watchme_testkit/sharp_simulator.dart';
+
+/// Port 1 on loopback, where nothing listens: every driver a test does not
+/// exercise probes it instead of its standard port on this machine.
+const Map<String, int> _refused = {
+  'ecp': 1,
+  'dial': 1,
+  'api': 1,
+  'legacy': 1,
+  'nrc': 1,
+  'ipc': 1,
+};
 
 void main() {
   late Directory state;
@@ -33,7 +45,7 @@ void main() {
     final subscription = client.watchDevices().listen(lists.add);
     final view = await client.addManual(
       '127.0.0.1',
-      ports: {'ecp': roku.port, 'dial': 1, 'api': 1},
+      ports: {..._refused, 'ecp': roku.port},
     );
     expect(view.name, 'Simulated Roku TV');
     expect(
@@ -54,6 +66,41 @@ void main() {
     addTearDown(reopened.close);
     final first = await reopened.watchDevices().first;
     expect(first.map((d) => d.id), [view.id]);
+  });
+
+  test('the app registers every driver', () {
+    expect(
+      [for (final d in appDrivers()) d.descriptor.id],
+      [
+        'roku.ecp',
+        'firetv.lightning',
+        'vizio.smartcast',
+        'panasonic.viera',
+        'sharp.aquos',
+      ],
+    );
+  });
+
+  test('the engine client finds a Sharp AQUOS, which offers pairing though '
+      'it needs none', () async {
+    final sharp = SharpSimulator();
+    await sharp.start();
+    addTearDown(sharp.stop);
+    final client = await createEngineClient(stateDirectory: state.path);
+    addTearDown(client.close);
+    final view = await client.addManual(
+      '127.0.0.1',
+      ports: {..._refused, 'ipc': sharp.port},
+    );
+    final driver = view.drivers.single;
+    expect(driver.driverId, 'sharp.aquos');
+    expect(driver.needsPairing, isFalse);
+    expect(driver.canPair, isTrue);
+    expect(
+      await client.send(view.id, const PressKey(RemoteKey.up)),
+      isA<Confirmed>(),
+    );
+    expect(sharp.lines.last, 'RCKY41  ');
   });
 
   test('the app allows loopback but nothing else off the LAN', () {

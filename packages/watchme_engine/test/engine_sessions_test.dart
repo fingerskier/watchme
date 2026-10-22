@@ -664,6 +664,86 @@ void main() {
       },
     );
 
+    test('the driver can read the credential it stored before, and only '
+        'when it asks', () async {
+      final old = token(id, 'firetv.lightning', secret: 'OLD-TOKEN');
+      await h.credentials.write(old);
+      Credential? seen;
+      fire.onPair = (_, context) => PairingFlowController.run((_) async {
+        seen = await context.previousCredential!();
+        return token(id, 'firetv.lightning', secret: 'NEW-TOKEN');
+      });
+      final flow = h.engine.pair(id, 'firetv.lightning');
+      expect(await flow.steps.last, isPairedWith(isNull));
+      expect(seen, old);
+      expect(
+        ((await h.credentials.read(id, 'firetv.lightning'))! as TokenCredential)
+            .token,
+        'NEW-TOKEN',
+      );
+
+      // None stored: the reader gives null.
+      await h.credentials.delete(id);
+      seen = old;
+      expect(
+        await h.engine.pair(id, 'firetv.lightning').steps.last,
+        isPairedWith(isNull),
+      );
+      expect(seen, isNull);
+    });
+
+    test('pairing again first closes the session the driver has open, for '
+        'devices that serve one client at a time', () async {
+      Future<PairingStep> pairWith(String pin) {
+        final flow = h.engine.pair(id, 'firetv.lightning');
+        return flow.steps.map((s) {
+          if (s is EnterCode) flow.submit(pin);
+          return s;
+        }).last;
+      }
+
+      expect(await pairWith('1234'), isPairedWith(isNull));
+      expect(h.driverView(id, 'firetv.lightning').connected, isTrue);
+      final open = fire.lastSession;
+      final pairing = fire.onPair!;
+      bool? closedWhenPairing;
+      fire.onPair = (endpoint, context) {
+        closedWhenPairing = open.closed;
+        return pairing(endpoint, context);
+      };
+      expect(await pairWith('1234'), isPairedWith(isNull));
+      expect(closedWhenPairing, isTrue);
+      expect(fire.sessions, hasLength(2));
+      expect(h.driverView(id, 'firetv.lightning').connected, isTrue);
+
+      // A pairing that fails leaves the driver to reconnect on the next
+      // command, with the credential it had.
+      expect(
+        await pairWith('9999'),
+        isPairingFailedWith(WatchmeErrorCode.unauthorized),
+      );
+      expect(fire.sessions.last.closed, isTrue);
+      expect(await h.engine.send(id, home), isConfirmed);
+      expect(fire.sessions, hasLength(3));
+    });
+
+    test('a driver that offers optional pairing shows as pairable', () async {
+      final sharp = FakeDriver(
+        'sharp.aquos',
+        offersPairing: true,
+        onProbe: (_) => matched(name: 'AQUOS'),
+      );
+      final h2 = Harness(drivers: [sharp]);
+      addTearDown(h2.close);
+      final sharpId = await h2.add('10.0.2.31');
+      final view = h2.driverView(sharpId, 'sharp.aquos');
+      expect(view.offersPairing, isTrue);
+      expect(view.canPair, isTrue);
+      expect(view.needsPairing, isFalse);
+      expect(h.driverView(id, 'firetv.lightning').offersPairing, isFalse);
+      expect(h.driverView(id, 'firetv.lightning').canPair, isTrue);
+    });
+
     test(
       'drivers without pairing, unknown devices and unknown drivers fail',
       () async {

@@ -12,6 +12,9 @@ workspace:
   - packages/watchme_testkit
   - packages/drivers/watchme_driver_roku
   - packages/drivers/watchme_driver_firetv
+  - packages/drivers/watchme_driver_vizio
+  - packages/drivers/watchme_driver_panasonic
+  - packages/drivers/watchme_driver_sharp
   - packages/watchme_e2e
   - apps/watchme
 

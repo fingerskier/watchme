@@ -57,6 +57,9 @@ jobs:
             packages/watchme_testkit \
             packages/drivers/watchme_driver_roku \
             packages/drivers/watchme_driver_firetv \
+            packages/drivers/watchme_driver_vizio \
+            packages/drivers/watchme_driver_panasonic \
+            packages/drivers/watchme_driver_sharp \
             packages/watchme_e2e
           do
             echo "::group::dart test $package"
@@ -64,8 +67,9 @@ jobs:
             echo "::endgroup::"
           done
 
-      # dart2js fails if watchme_core, watchme_engine or a driver reaches
-      # dart:io. The output expects a browser-like `self`; Node gets one.
+      # dart2js fails if watchme_core, watchme_engine or any of the five
+      # drivers reaches dart:io. The output expects a browser-like `self`;
+      # Node gets one.
       - name: Web-safety compile
         working-directory: packages/watchme_e2e
         run: |
@@ -74,6 +78,7 @@ jobs:
             "$RUNNER_TEMP/web_safety_check.js" | tee "$RUNNER_TEMP/web_safety_check.txt"
           grep -q 'manual add refused: unsupported' "$RUNNER_TEMP/web_safety_check.txt"
           grep -q 'public host refused: destinationRefused' "$RUNNER_TEMP/web_safety_check.txt"
+          grep -q 'sharp.aquos\]' "$RUNNER_TEMP/web_safety_check.txt"
 
   flutter:
     name: Flutter tests and Linux build
