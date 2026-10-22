@@ -179,6 +179,8 @@ class RokuSimulator {
   int _ssdpReplies = 0;
 
   HttpServer? _server;
+  ServerSocket? _listener;
+  Future<void>? _listenerClosed;
   RawDatagramSocket? _ssdp;
   DateTime _startedAt = DateTime.now();
 
@@ -215,7 +217,12 @@ class RokuSimulator {
   }) async {
     if (_server != null) throw StateError('RokuSimulator is already running');
     final bind = address ?? InternetAddress.loopbackIPv4;
-    final server = await HttpServer.bind(bind, port);
+    // Bound here rather than by HttpServer.bind, so stop() can close the
+    // port itself and know when it refuses new connections.
+    final listener = await ServerSocket.bind(bind, port);
+    final server = HttpServer.listenOn(listener);
+    _listener = listener;
+    _listenerClosed = null;
     server.defaultResponseHeaders.clear();
     server.autoCompress = false;
     _server = server;
@@ -233,7 +240,8 @@ class RokuSimulator {
     }
   }
 
-  /// Stops listening. Further requests are refused (unreachable).
+  /// Stops listening. Further requests are refused (unreachable) once
+  /// [listenerClosed] completes.
   ///
   /// With [force] (the default) open connections are dropped and held
   /// answers released. Without it, connections already open finish first:
@@ -244,14 +252,27 @@ class RokuSimulator {
     _ssdp = null;
     final server = _server;
     _server = null;
+    final listener = _listener;
+    _listener = null;
+    final listenerClosed = _listenerClosed = listener?.close();
     if (force) {
       for (final gate in _gates) {
         gate.release();
       }
       _gates.clear();
     }
-    await server?.close(force: force);
+    final serverClosed = server?.close(force: force);
+    await listenerClosed;
+    await serverClosed;
   }
+
+  /// After [stop]: completes once the port refuses new connections.
+  ///
+  /// Closing a port finishes asynchronously, so a connection attempted
+  /// right after [stop] may still be accepted and then reset. A test that
+  /// needs the next request refused (unreachable) awaits this first; a
+  /// graceful stop's own future also waits for open connections.
+  Future<void> get listenerClosed => _listenerClosed ?? Future.value();
 
   /// Holds the answer to the next request matching [method] and [path]
   /// (exact path, query ignored) until [RokuSimGate.release]. The request

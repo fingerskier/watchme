@@ -96,6 +96,7 @@ void main() {
       await gate.reached;
       final stopped = sim.stop(force: false);
       expect(sim.isRunning, isFalse);
+      await sim.listenerClosed;
       await expectLater(
         client.getUrl(Uri.parse('http://127.0.0.1:$port/query/device-info')),
         throwsA(isA<SocketException>()),
