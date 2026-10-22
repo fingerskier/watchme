@@ -165,7 +165,6 @@ final class Engine implements WatchmeEngine {
   Future<void>? _started;
   Future<void>? _discovery;
   bool _closed = false;
-  final Completer<void> _closing = Completer();
   bool _emitScheduled = false;
 
   /// Descriptors of the drivers enabled on these transports.
@@ -209,7 +208,10 @@ final class Engine implements WatchmeEngine {
   Future<void> close() async {
     if (_closed) return;
     _closed = true;
-    _closing.complete();
+    for (final turn in _volumeWaiters) {
+      turn.complete();
+    }
+    _volumeWaiters.clear();
     power.close();
     for (final pairing in [..._pairings.values]) {
       await pairing.cancel();
@@ -1003,6 +1005,11 @@ final class Engine implements WatchmeEngine {
   /// Per device, the last volume or mute command queued.
   final Map<String, Future<void>> _volumeTail = {};
 
+  /// Volume and mute commands still waiting for the one in front of them.
+  /// [close] lets them all go at once. Only waiting commands are held here,
+  /// so nothing accumulates while commands come and go.
+  final Set<Completer<void>> _volumeWaiters = {};
+
   /// Runs volume and mute commands for [deviceId] one at a time, so each
   /// routes and infers from the level the previous one left: two
   /// overlapping `SetVolume(20)` from 10 on a relative-only route must not
@@ -1014,11 +1021,20 @@ final class Engine implements WatchmeEngine {
     String deviceId,
     Future<CommandResult> Function() run,
   ) {
-    final previous = _volumeTail[deviceId] ?? Future<void>.value();
+    final previous = _volumeTail[deviceId];
     final done = Completer<void>();
     final tail = done.future;
     _volumeTail[deviceId] = tail;
-    return Future.any([previous, _closing.future])
+    final turn = Completer<void>();
+    if (previous == null) {
+      turn.complete();
+    } else {
+      _volumeWaiters.add(turn);
+      previous.then((_) {
+        if (_volumeWaiters.remove(turn)) turn.complete();
+      });
+    }
+    return turn.future
         .then<CommandResult>((_) {
           if (_closed) {
             return const Failed(WatchmeError.cancelled('The engine is closed'));
