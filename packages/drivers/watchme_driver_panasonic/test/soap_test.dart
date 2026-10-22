@@ -253,11 +253,59 @@ void main() {
         '<X_LaunchAppResponse/>',
         'X_SendKeyResponse',
         '',
+        // A Body that is not a top-level SOAP Envelope's (Codex round
+        // three).
+        '<html><diagnostic><Body><X_SendKeyResponse/></Body></diagnostic>'
+            '</html>',
+        '<X_Wrap><s:Envelope><s:Body><X_SendKeyResponse/></s:Body>'
+            '</s:Envelope></X_Wrap>',
       ]) {
         expect(
           isEncryptedAcknowledgement(fragment, 'X_SendKey'),
           isFalse,
           reason: fragment,
+        );
+      }
+    });
+
+    test('well-formed means what XML 1.0 says, beyond what the parser '
+        'checks', () {
+      // Codex round three: the parser reads all of these.
+      String answer(String inside, {String attributes = ''}) =>
+          '<s:Envelope$attributes><s:Body><u:X_SendKeyResponse>$inside'
+          '</u:X_SendKeyResponse></s:Body></s:Envelope>';
+      for (final xml in [
+        answer('&'),
+        answer('a & b'),
+        answer('&nbsp;'),
+        answer('&#;'),
+        answer('&amp'),
+        answer('', attributes: ' a="1" a="2"'),
+        '<!-- a -- b -->${answer('')}',
+        '<!-- ends in a dash --->${answer('')}',
+        answer('\u0001'),
+        answer('\u001f'),
+      ]) {
+        expect(isSoapAnswer(xml, 'X_SendKey'), isFalse, reason: xml);
+        expect(
+          isEncryptedAcknowledgement(xml, 'X_SendKey'),
+          isFalse,
+          reason: xml,
+        );
+      }
+      for (final xml in [
+        answer('&amp; &lt; &gt; &quot; &apos; &#65; &#x41;'),
+        answer('tab\tCR\rLF\n'),
+        answer('<![CDATA[a & b -- c]]>'),
+        '<!-- a & b - c -->${answer('')}',
+        '<?pi a & b?>${answer('')}',
+        answer('', attributes: ' a="1" b="2" x:a="3"'),
+      ]) {
+        expect(isSoapAnswer(xml, 'X_SendKey'), isTrue, reason: xml);
+        expect(
+          isEncryptedAcknowledgement(xml, 'X_SendKey'),
+          isTrue,
+          reason: xml,
         );
       }
     });

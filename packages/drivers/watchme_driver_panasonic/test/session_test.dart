@@ -889,6 +889,18 @@ void main() {
                   '<u:X_SendKeyResponse xmlns:u="$urn"></u:X_SendKeyResponse><',
                   '<html><body><X_SendKeyResponse/></body></html>',
                   '<html><body><br><X_SendKeyResponse/></body></html>',
+                  // Codex round three: not well-formed XML, though the
+                  // parser reads it, and an answer under a Body that is
+                  // no SOAP Body.
+                  '<u:X_SendKeyResponse xmlns:u="$urn">&</u:X_SendKeyResponse>',
+                  '<u:X_SendKeyResponse xmlns:u="$urn">&nbsp;'
+                      '</u:X_SendKeyResponse>',
+                  '<u:X_SendKeyResponse a="1" a="2" xmlns:u="$urn"/>',
+                  '<!-- a -- b --><u:X_SendKeyResponse xmlns:u="$urn"/>',
+                  '<u:X_SendKeyResponse xmlns:u="$urn">\u0001'
+                      '</u:X_SendKeyResponse>',
+                  '<html><diagnostic><Body><X_SendKeyResponse/></Body>'
+                      '</diagnostic></html>',
                 ])
                   sealed(inner),
                 // A genuine acknowledgement in a truncated outer answer.
@@ -906,6 +918,18 @@ void main() {
                     '<s:Body/></s:Envelope>',
                 '<s:Envelope><s:Body><u:X_SendKeyResponse/></s:Body>'
                     '</s:Envelope>trailing text',
+                // Codex round three: not well-formed XML, though the parser
+                // reads it.
+                '<s:Envelope><s:Body><u:X_SendKeyResponse>&'
+                    '</u:X_SendKeyResponse></s:Body></s:Envelope>',
+                '<s:Envelope><s:Body><u:X_SendKeyResponse>&nbsp;'
+                    '</u:X_SendKeyResponse></s:Body></s:Envelope>',
+                '<s:Envelope a="1" a="2"><s:Body><u:X_SendKeyResponse/>'
+                    '</s:Body></s:Envelope>',
+                '<!-- a -- b --><s:Envelope><s:Body><u:X_SendKeyResponse/>'
+                    '</s:Body></s:Envelope>',
+                '<s:Envelope><s:Body><u:X_SendKeyResponse>\u0001'
+                    '</u:X_SendKeyResponse></s:Body></s:Envelope>',
               ];
         for (final body in bodies) {
           sim.clearLog();

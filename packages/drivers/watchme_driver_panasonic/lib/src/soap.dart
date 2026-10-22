@@ -93,12 +93,16 @@ bool xmlHasElement(String xml, String localName) =>
 ///
 /// Well-formed as XML 1.0 has it: one root element, every element closed
 /// in order, comments, CDATA sections and processing instructions
-/// terminated, and nothing but whitespace, comments and processing
-/// instructions outside the root. Namespace prefixes are not resolved, so
-/// an undeclared one is no error: answers are matched by local name, as
-/// the field clients match them, and the brief leaves the prefixes of some
+/// terminated, nothing but whitespace, comments and processing
+/// instructions outside the root, every `&` a predefined entity or a
+/// character reference, comments without `--`, no control characters and
+/// no attribute given twice ([_lexicallyWellFormed]: the parser itself
+/// lets those through). Namespace prefixes are not resolved, so an
+/// undeclared one is no error: answers are matched by local name, as the
+/// field clients match them, and the brief leaves the prefixes of some
 /// answers unverified (section 6.4).
 XmlDocument? _wellFormed(String xml) {
+  if (!_lexicallyWellFormed(xml)) return null;
   final XmlDocument doc;
   try {
     doc = XmlDocument(
@@ -123,7 +127,53 @@ XmlDocument? _wellFormed(String xml) {
         break;
     }
   }
+  for (final e in doc.descendantElements) {
+    final names = <String>{};
+    for (final a in e.attributes) {
+      if (!names.add(a.name.qualified)) return null;
+    }
+  }
   return doc;
+}
+
+final RegExp _reference = RegExp(
+  r'&(#x[0-9a-fA-F]+|#[0-9]+|amp|lt|gt|quot|apos);',
+);
+final RegExp _controlCharacter = RegExp(r'[\x00-\x08\x0B\x0C\x0E-\x1F]');
+
+/// The checks XML 1.0 makes that the parser does not: outside comments,
+/// CDATA sections and processing instructions every `&` starts a
+/// predefined entity or a character reference (there is no DTD to define
+/// others); a comment holds no `--` and does not end in `-`; and nothing
+/// holds a control character other than tab, CR and LF. An unterminated
+/// comment, CDATA section or processing instruction fails too.
+bool _lexicallyWellFormed(String xml) {
+  if (_controlCharacter.hasMatch(xml)) return false;
+  var i = 0;
+  while (i < xml.length) {
+    if (xml.startsWith('<!--', i)) {
+      final end = xml.indexOf('-->', i + 4);
+      if (end < 0) return false;
+      final comment = xml.substring(i + 4, end);
+      if (comment.contains('--') || comment.endsWith('-')) return false;
+      i = end + 3;
+    } else if (xml.startsWith('<![CDATA[', i)) {
+      final end = xml.indexOf(']]>', i + 9);
+      if (end < 0) return false;
+      i = end + 3;
+    } else if (xml.startsWith('<?', i)) {
+      final end = xml.indexOf('?>', i + 2);
+      if (end < 0) return false;
+      i = end + 2;
+    } else if (xml.codeUnitAt(i) == 0x26 /* & */ ) {
+      final ref = _reference.matchAsPrefix(xml, i);
+      if (ref == null) return false;
+      i = ref.end;
+    } else {
+      i++;
+    }
+  }
+  return true;
 }
 
 /// The decrypted answer [fragment] of an encrypted command in an `X_Data`
@@ -189,17 +239,21 @@ String? encryptedResult(String xml) {
 /// The brief marks the wrapper unknown (section 5.4): FastyBird's parser
 /// implies the element sits bare or under some root, and the simulator's
 /// `X_OriginalResult` is an assumption. So the element may be at the top
-/// of the fragment, under one top-level element, or in a SOAP `Body`; one
-/// deeper inside other content (an HTML page) is not the answer.
+/// of the fragment, under one top-level element, or in the `Body` of a
+/// top-level SOAP `Envelope`; one deeper inside other content (an HTML
+/// page, or an element merely named `Body`) is not the answer.
 bool isEncryptedAcknowledgement(String fragment, String action) {
   final root = _fragment(fragment);
   if (root == null) return false;
   for (final e in root.descendantElements) {
     if (e.name.local != '${action}Response') continue;
     final parent = e.parentElement;
+    final grandparent = parent?.parentElement;
     if (parent == root ||
-        parent?.parentElement == root ||
-        parent?.name.local == 'Body') {
+        grandparent == root ||
+        (parent?.name.local == 'Body' &&
+            grandparent?.name.local == 'Envelope' &&
+            grandparent?.parentElement == root)) {
       return true;
     }
   }
