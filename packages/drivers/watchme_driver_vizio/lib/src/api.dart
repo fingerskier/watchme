@@ -487,16 +487,6 @@ PowerMode? parsePowerMode(VizioReply reply) {
   };
 }
 
-/// The `MAXIMUM` a static settings answer gives the leaf [cname], or `null`
-/// when it gives no positive one.
-int? parseMaximum(VizioReply reply, String cname) {
-  if (!reply.success) return null;
-  return switch ((reply.itemNamed(cname) ?? reply.itemNamed())?['maximum']) {
-    final int max when max > 0 => max,
-    _ => null,
-  };
-}
-
 /// The `VALUE` and `HASHVAL` of a settings leaf answer, or `null`.
 ({Object? value, int hash})? parseLeaf(VizioReply reply, String cname) {
   if (!reply.success) return null;

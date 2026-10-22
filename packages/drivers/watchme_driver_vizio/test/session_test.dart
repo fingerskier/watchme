@@ -485,6 +485,127 @@ void main() {
         expect(slow.maxVolume, 100);
       });
 
+      test('a range read the TV could not answer (BUSY, HTTP 500, a '
+          'malformed body) writes nothing and assumes no maximum: the next '
+          'SetVolume asks again', () async {
+        final (tv, s) = await openWithMax(40);
+        final before = tv.volume;
+        for (final (status, body, code) in <(int, Object, WatchmeErrorCode)>[
+          (
+            200,
+            {
+              'STATUS': {'RESULT': 'BUSY'},
+            },
+            WatchmeErrorCode.rejected,
+          ),
+          (500, 'Unhandled Exception', WatchmeErrorCode.protocol),
+          (200, '<html>oops</html>', WatchmeErrorCode.protocol),
+          (
+            200,
+            {
+              'ITEMS': [
+                {'CNAME': 'volume', 'MAXIMUM': 40},
+              ],
+            },
+            WatchmeErrorCode.protocol,
+          ),
+          (
+            200,
+            {
+              'ITEMS': [
+                {'CNAME': 'volume', 'MAXIMUM': 'forty'},
+              ],
+              'STATUS': {'RESULT': 'SUCCESS'},
+            },
+            WatchmeErrorCode.protocol,
+          ),
+          (
+            200,
+            {
+              'ITEMS': [
+                {'CNAME': 'volume', 'MAXIMUM': 0},
+              ],
+              'STATUS': {'RESULT': 'SUCCESS'},
+            },
+            WatchmeErrorCode.protocol,
+          ),
+        ]) {
+          tv
+            ..clearLog()
+            ..respondOnce(
+              'GET',
+              _volumeRange,
+              status,
+              body: body is String ? body : '',
+              json: body is Map<String, Object?> ? body : null,
+            );
+          expect(
+            await s.execute(const SetVolume(80)),
+            isFailedWith(code),
+            reason: '$status $body',
+          );
+          expect(lines(tv.requests), ['GET $_volumeRange'], reason: '$body');
+          expect(tv.volume, before, reason: '$body');
+          expect(s.maxVolume, isNull, reason: '$body');
+        }
+        tv.clearLog();
+        expect(await s.execute(const SetVolume(80)), isConfirmed);
+        expect(lines(tv.requests), [
+          'GET $_volumeRange',
+          'GET $_volume',
+          'PUT $_volume',
+        ]);
+        expect(tv.volume, 40);
+        expect(s.maxVolume, 40);
+      });
+
+      test(
+        'a TV that says it has no range (URI_NOT_FOUND, HTTP 404, or an '
+        'answer without MAXIMUM) keeps the TV scale for the session',
+        () async {
+          for (final (status, json) in <(int, Map<String, Object?>?)>[
+            (
+              200,
+              {
+                'STATUS': {'RESULT': 'URI_NOT_FOUND'},
+              },
+            ),
+            (404, null),
+            (
+              200,
+              {
+                'ITEMS': [
+                  {'CNAME': 'volume', 'MINIMUM': 0},
+                ],
+                'STATUS': {'RESULT': 'SUCCESS'},
+              },
+            ),
+            (
+              200,
+              {
+                'STATUS': {'RESULT': 'SUCCESS'},
+              },
+            ),
+          ]) {
+            final (tv, s) = await openWithMax(40);
+            tv.respondOnce('GET', _volumeRange, status, json: json);
+            expect(
+              await s.execute(const SetVolume(30)),
+              isConfirmed,
+              reason: '$status $json',
+            );
+            expect(tv.volume, 30, reason: '$json');
+            expect(s.maxVolume, 100, reason: '$json');
+            tv.clearLog();
+            expect(await s.execute(const SetVolume(20)), isConfirmed);
+            expect(lines(tv.requests), [
+              'GET $_volume',
+              'PUT $_volume',
+            ], reason: '$json');
+          }
+        },
+      );
+
       test('a stale HASHVAL is read again and written once more', () async {
         sim.respondOnce(
           'PUT',

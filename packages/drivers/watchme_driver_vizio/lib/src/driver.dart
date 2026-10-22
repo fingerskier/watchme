@@ -33,7 +33,7 @@ import 'session.dart';
 ///   deviceinfo and `power_mode`, and sends no Wake-on-LAN (the engine's
 ///   power orchestrator does that, best-effort, for a TV in Eco mode). A TV
 ///   whose port is closed fails at once as unreachable.
-/// * No error carries the token or the PIN.
+/// * No error carries the token, the pairing challenge or the PIN.
 final class VizioDriver implements Driver {
   /// Creates the driver.
   ///
@@ -396,7 +396,9 @@ final class _Pairing {
   /// (see [VizioDriver._controllerIdFor]).
   late final String controllerId;
 
-  /// Secrets met so far: a token the TV sent with a failure.
+  /// Secrets met so far: every secret field value of the `/pairing/start`
+  /// answer (the challenge's `PAIRING_REQ_TOKEN`), and a token the TV sent
+  /// with a failure.
   final List<String> secrets = [];
 
   VizioApi? _api;
@@ -499,6 +501,17 @@ final class _Pairing {
           e.code != WatchmeErrorCode.destinationRefused;
       rethrow;
     }
+    // The challenge (`PAIRING_REQ_TOKEN`), or any token the TV sent, is a
+    // secret from here on, wherever it shows again; an error shows this
+    // answer with every value redacted except the status word, as for
+    // `/pairing/pair`.
+    secrets.addAll(_secretValues(started.body));
+    String shown() => redactSecrets(
+      started.text,
+      secrets: secrets,
+      allValues: true,
+      keep: vizioResultWords,
+    );
     final challenge = switch (started.item) {
       {'challenge_type': final int type, 'pairing_req_token': final int req}
           when started.success =>
@@ -513,12 +526,13 @@ final class _Pairing {
         started,
         'Starting pairing',
         context: VizioContext.pairing,
+        shown: shown(),
       );
     }
     if (challenge == null) {
       throw WatchmeError.protocol(
         'The TV started pairing without a challenge',
-        rawDeviceMessage: redactSecrets(started.text),
+        rawDeviceMessage: shown(),
       );
     }
     checkCancelled();
@@ -592,6 +606,29 @@ final class _Pairing {
         context: VizioContext.pairing,
         shown: shown(),
       );
+    }
+  }
+
+  /// The values of every secret field ([isSecretFieldName]) in [json], a
+  /// decoded answer, nested ones included: `PAIRING_REQ_TOKEN`,
+  /// `AUTH_TOKEN` and the like.
+  static Iterable<String> _secretValues(
+    Object? json, {
+    bool secret = false,
+  }) sync* {
+    switch (json) {
+      case final Map<String, Object?> m:
+        for (final MapEntry(:key, :value) in m.entries) {
+          yield* _secretValues(value, secret: secret || isSecretFieldName(key));
+        }
+      case final List<Object?> l:
+        for (final v in l) {
+          yield* _secretValues(v, secret: secret);
+        }
+      case final String s when secret && s.trim().isNotEmpty:
+        yield s;
+      case final num n when secret:
+        yield '$n';
     }
   }
 

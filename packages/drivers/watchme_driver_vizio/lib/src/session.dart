@@ -269,15 +269,31 @@ final class VizioSession implements DriverSession {
   }
 
   /// [maxVolume], read once per session: a level above it is
-  /// `VALUE_OUT_OF_RANGE`. A TV that answers without a range keeps the TV
-  /// scale; one that does not answer fails the command, and the next one
+  /// `VALUE_OUT_OF_RANGE`. Only a TV that says it has no range
+  /// (`URI_NOT_FOUND`, HTTP 404, or a `SUCCESS` without `MAXIMUM`) keeps
+  /// the TV scale. Any other answer (`BUSY`, HTTP 500, a malformed body) or
+  /// none fails the command before it writes anything, and the next one
   /// asks again.
   Future<int> _volumeMax() async {
     if (_maxVolume case final max?) return max;
+    const what = 'Reading the volume range';
     final reply = await _get(VizioPaths.volumeRange);
-    _checkAuth(reply, 'Reading the volume range');
-    final max = parseMaximum(reply, 'volume');
-    return _maxVolume = min(max ?? vizioTvMaxVolume, vizioTvMaxVolume);
+    _checkAuth(reply, what);
+    if (!reply.success) {
+      final error = _error(reply, what);
+      if (error.code != WatchmeErrorCode.unsupported) throw error;
+      return _maxVolume = vizioTvMaxVolume;
+    }
+    final range = reply.itemNamed('volume') ?? reply.itemNamed();
+    final max = switch (range?['maximum']) {
+      null => vizioTvMaxVolume,
+      final int max when max > 0 => max,
+      _ => throw WatchmeError.protocol(
+        '$what: the TV sent an unusable MAXIMUM',
+        rawDeviceMessage: reply.text,
+      ),
+    };
+    return _maxVolume = min(max, vizioTvMaxVolume);
   }
 
   Future<CommandResult> _stepVolume(int steps) async {

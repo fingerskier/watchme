@@ -556,6 +556,79 @@ void main() {
         expect(sim.cancelCount, 1);
       });
     });
+
+    group('a failed pairing start never shows its challenge', () {
+      const req = 123456789;
+
+      /// Pairs against a `/pairing/start` that gives [answer], checks that
+      /// nothing the failure reaches shows the challenge, and returns it.
+      Future<PairingFailed> startFailing(Map<String, Object?> answer) async {
+        sim.respondOnce('PUT', '/pairing/start', 200, json: answer);
+        final steps = await drive(start(), ['4321']);
+        expect(steps.whereType<EnterCode>(), isEmpty);
+        final failed = steps.last as PairingFailed;
+        for (final text in [
+          jsonEncode(failed.toJson()),
+          jsonEncode(failed.toJson(includeSecrets: true)),
+          '$failed',
+          ...errorTexts(failed.error),
+        ]) {
+          expect(text, isNot(contains('$req')), reason: text);
+        }
+        return failed;
+      }
+
+      test('a status that echoes the PAIRING_REQ_TOKEN', () async {
+        final failed = await startFailing({
+          'ITEM': {'CHALLENGE_TYPE': 1, 'PAIRING_REQ_TOKEN': req},
+          'STATUS': {'RESULT': '$req', 'DETAIL': 'Success'},
+          'URI': '/pairing/start',
+        });
+        expect(failed.error.code, WatchmeErrorCode.protocol);
+        expect(
+          failed.error.message,
+          'Starting pairing: unexpected SmartCast status',
+        );
+      });
+
+      test('a known refusal that repeats it elsewhere keeps only the status '
+          'word', () async {
+        final failed = await startFailing({
+          'ITEM': {'PAIRING_REQ_TOKEN': req, '$req': true},
+          'STATUS': {'RESULT': 'BLOCKED', 'DETAIL': 'challenge $req is open'},
+          'URI': '/pairing/start',
+        });
+        expect(failed.error.code, WatchmeErrorCode.rejected);
+        expect(failed.rawDeviceMessage, contains('"BLOCKED"'));
+        expect(failed.rawDeviceMessage, contains('<redacted>'));
+        expect(sim.cancelCount, 0);
+      });
+
+      test(
+        'a challenge under a field of another name is not shown either',
+        () async {
+          final failed = await startFailing({
+            'ITEM': {'CHALLENGE_TYPE': 1, 'PAIRING_REQ': req},
+            'STATUS': {'RESULT': 'FAILURE', 'DETAIL': 'req $req'},
+          });
+          expect(failed.error.code, WatchmeErrorCode.rejected);
+          expect(failed.rawDeviceMessage, contains('"FAILURE"'));
+        },
+      );
+
+      test('a success without a usable challenge', () async {
+        final failed = await startFailing({
+          'ITEM': {'CHALLENGE_TYPE': '1', 'PAIRING_REQ_TOKEN': req},
+          'STATUS': {'RESULT': 'SUCCESS', 'DETAIL': 'req $req'},
+          'URI': '/pairing/start',
+        });
+        expect(failed.error.code, WatchmeErrorCode.protocol);
+        expect(failed.error.message, contains('without a challenge'));
+        expect(failed.rawDeviceMessage, contains('"SUCCESS"'));
+        // The TV may be showing a PIN: it is told to drop it.
+        expect(sim.cancelCount, 1);
+      });
+    });
   });
 
   group('with a scripted network', () {
