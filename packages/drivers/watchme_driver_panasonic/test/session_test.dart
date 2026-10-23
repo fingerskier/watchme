@@ -908,6 +908,9 @@ void main() {
                         '</u:X_SendKeyResponse>',
                   for (final attribute in _badAttributes)
                     '<u:X_SendKeyResponse xmlns:u="$urn" $attribute/>',
+                  // Codex round five: a malformed XML declaration.
+                  for (final declaration in _badDeclarations)
+                    '$declaration<u:X_SendKeyResponse xmlns:u="$urn"/>',
                 ])
                   sealed(inner),
                 // A genuine acknowledgement in a truncated outer answer.
@@ -943,6 +946,10 @@ void main() {
                       '</u:X_SendKeyResponse></s:Body></s:Envelope>',
                 for (final attribute in _badAttributes)
                   '<s:Envelope><s:Body><u:X_SendKeyResponse $attribute/>'
+                      '</s:Body></s:Envelope>',
+                // Codex round five.
+                for (final declaration in _badDeclarations)
+                  '$declaration\n<s:Envelope><s:Body><u:X_SendKeyResponse/>'
                       '</s:Body></s:Envelope>',
               ];
         for (final body in bodies) {
@@ -1562,3 +1569,14 @@ const List<String> _notXml = [
 
 /// Attributes that are not XML although the xml package parses them.
 const List<String> _badAttributes = ['a=value', 'a', 'a="<"'];
+
+/// XML declarations that break the XML 1.0 grammar.
+const List<String> _badDeclarations = [
+  '<?xml ?>',
+  '<?xml version="1.0" foo="bar"?>',
+  '<?xml encoding="utf-8" version="1.0"?>',
+  '<?xml version="1.0" standalone="maybe"?>',
+  '<?xml version="1.0" encoding="8utf"?>',
+  '<?xml version="banana"?>',
+  '<?xml version="1.0" version="1.0"?>',
+];

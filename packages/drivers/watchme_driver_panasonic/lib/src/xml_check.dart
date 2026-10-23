@@ -19,9 +19,29 @@ bool isWellFormedXml(String xml) {
   }
 }
 
+/// Where the content after the XML declaration at [start] of [xml]
+/// begins: [start] itself when there is no declaration there, `null` when
+/// there is one and it breaks the XML 1.0 grammar. For answers checked
+/// after their declaration is removed, such as the decrypted fragments of
+/// encrypted commands.
+int? xmlDeclarationEnd(String xml, int start) {
+  final checker = _XmlChecker(xml).._i = start;
+  if (!checker._atDeclaration) return start;
+  try {
+    checker._xmlDeclaration();
+    return checker._i;
+  } on _Malformed {
+    return null;
+  }
+}
+
 final class _Malformed implements Exception {
   const _Malformed();
 }
+
+final RegExp _versionNumber = RegExp(r'^1\.[0-9]+$');
+final RegExp _encodingName = RegExp(r'^[A-Za-z][A-Za-z0-9._-]*$');
+final RegExp _standalone = RegExp(r'^(yes|no)$');
 
 const Set<String> _predefinedEntities = {'amp', 'lt', 'gt', 'quot', 'apos'};
 
@@ -40,18 +60,53 @@ final class _XmlChecker {
     for (final c in _s.runes) {
       if (!_isChar(c)) _bad();
     }
-    if (_at('﻿')) _i++;
-    // XMLDecl, only at the very start. Its pseudo-attributes are not
-    // checked: the parse that follows reads the document either way.
-    if (_at('<?xml') && _isSpaceAt(_i + 5)) {
-      _i += 5;
-      _skipPast('?>');
-    }
+    if (_at('\uFEFF')) _i++;
+    if (_atDeclaration) _xmlDeclaration();
     _misc();
     if (!_at('<') || _at('<!')) _bad();
     _element();
     _misc();
     if (_i != _s.length) _bad();
+  }
+
+  /// An XMLDecl starts here: only at the very start of a document, and
+  /// `<?xml` without a space after it is a processing instruction whose
+  /// target XML reserves.
+  bool get _atDeclaration => _at('<?xml') && _isSpaceAt(_i + 5);
+
+  /// XMLDecl ::= '<?xml' VersionInfo EncodingDecl? SDDecl? S? '?>', with
+  /// VersionNum ::= '1.' [0-9]+, EncName ::= [A-Za-z] ([A-Za-z0-9._] |
+  /// '-')* and standalone 'yes' or 'no', in that order, each once.
+  void _xmlDeclaration() {
+    _i += 5;
+    _skipSpace();
+    _expect('version');
+    _pseudoAttributeValue(_versionNumber);
+    var spaced = _skipSpace();
+    if (spaced && _at('encoding')) {
+      _i += 8;
+      _pseudoAttributeValue(_encodingName);
+      spaced = _skipSpace();
+    }
+    if (spaced && _at('standalone')) {
+      _i += 10;
+      _pseudoAttributeValue(_standalone);
+      _skipSpace();
+    }
+    _expect('?>');
+  }
+
+  /// Eq, then a quoted value matching [grammar].
+  void _pseudoAttributeValue(RegExp grammar) {
+    _skipSpace();
+    _expect('=');
+    _skipSpace();
+    if (_i >= _s.length) _bad();
+    final quote = _s[_i];
+    if (quote != '"' && quote != "'") _bad();
+    final end = _s.indexOf(quote, _i + 1);
+    if (end < 0 || !grammar.hasMatch(_s.substring(_i + 1, end))) _bad();
+    _i = end + 1;
   }
 
   /// Misc ::= Comment | PI | S

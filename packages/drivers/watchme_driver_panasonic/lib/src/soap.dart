@@ -129,12 +129,15 @@ XmlDocument? _wellFormed(String xml) {
 /// The decrypted answer [fragment] of an encrypted command in an `X_Data`
 /// root, as the field clients parse it (several top-level elements, and
 /// text between them, are fine), or `null` when the fragment is not
-/// well-formed XML content. A leading XML declaration is dropped.
-XmlElement? _fragment(String fragment) => _wellFormed(
-  '<X_Data>'
-  '${fragment.replaceFirst(RegExp(r'^\s*<\?xml[^>]*\?>'), '')}'
-  '</X_Data>',
-)?.rootElement;
+/// well-formed XML content. A leading XML declaration is checked against
+/// the XML grammar, then dropped.
+XmlElement? _fragment(String fragment) {
+  final lead = RegExp(r'\s*').matchAsPrefix(fragment)!.end;
+  final content = xmlDeclarationEnd(fragment, lead);
+  if (content == null) return null;
+  final body = content == lead ? fragment : fragment.substring(content);
+  return _wellFormed('<X_Data>$body</X_Data>')?.rootElement;
+}
 
 /// The text of the first element under [scope] whose local name is
 /// [localName], with entities decoded: `null` when there is none, or when

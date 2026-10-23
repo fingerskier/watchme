@@ -7,7 +7,7 @@ void main() {
       for (final xml in [
         '<a/>',
         '<a></a>',
-        '﻿<a/>',
+        '\uFEFF<a/>',
         '<?xml version="1.0" encoding="utf-8"?>\n<s:Envelope '
             'xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
             's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">'
@@ -80,6 +80,60 @@ void main() {
       ]) {
         expect(isWellFormedXml(xml), isFalse, reason: xml);
       }
+    });
+
+    test('an XML declaration follows the XML 1.0 grammar', () {
+      // Codex round five: the declaration was skipped unchecked.
+      for (final declaration in [
+        '<?xml version="1.0"?>',
+        "<?xml version='1.0'?>",
+        '<?xml version="1.1" ?>',
+        '<?xml version = "1.0" encoding = "utf-8"?>',
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+        '<?xml version="1.0" standalone="no"?>',
+        '<?xml\tversion="1.0"\nencoding="ISO-8859-1"?>',
+      ]) {
+        expect(
+          isWellFormedXml('$declaration<a/>'),
+          isTrue,
+          reason: declaration,
+        );
+        expect(
+          xmlDeclarationEnd('$declaration<a/>', 0),
+          declaration.length,
+          reason: declaration,
+        );
+      }
+      for (final declaration in [
+        '<?xml ?>',
+        '<?xml version="1.0" foo="bar"?>',
+        '<?xml encoding="utf-8" version="1.0"?>',
+        '<?xml version="1.0" standalone="maybe"?>',
+        '<?xml version="1.0" encoding="8utf"?>',
+        '<?xml version="banana"?>',
+        '<?xml version="1.0" version="1.0"?>',
+        '<?xml version="1."?>',
+        '<?xml version="2.0"?>',
+        '<?xml version=1.0?>',
+        '<?xml version="1.0\'?>',
+        '<?xml version="1.0"encoding="utf-8"?>',
+        '<?xml version="1.0" standalone="yes" encoding="utf-8"?>',
+        '<?xml version="1.0"',
+      ]) {
+        expect(
+          isWellFormedXml('$declaration<a/>'),
+          isFalse,
+          reason: declaration,
+        );
+        expect(
+          xmlDeclarationEnd('$declaration<a/>', 0),
+          isNull,
+          reason: declaration,
+        );
+      }
+      // No declaration: the content starts where it was asked about.
+      expect(xmlDeclarationEnd('  <a/>', 2), 2);
+      expect(xmlDeclarationEnd('<?xml-stylesheet x?><a/>', 0), 0);
     });
 
     test('a deeply nested answer is checked without exhausting the stack', () {
