@@ -901,6 +901,13 @@ void main() {
                       '</u:X_SendKeyResponse>',
                   '<html><diagnostic><Body><X_SendKeyResponse/></Body>'
                       '</diagnostic></html>',
+                  // Codex round four: references to characters XML forbids,
+                  // and attribute and text grammar the parser lets through.
+                  for (final inside in _notXml)
+                    '<u:X_SendKeyResponse xmlns:u="$urn">$inside'
+                        '</u:X_SendKeyResponse>',
+                  for (final attribute in _badAttributes)
+                    '<u:X_SendKeyResponse xmlns:u="$urn" $attribute/>',
                 ])
                   sealed(inner),
                 // A genuine acknowledgement in a truncated outer answer.
@@ -930,6 +937,13 @@ void main() {
                     '</s:Body></s:Envelope>',
                 '<s:Envelope><s:Body><u:X_SendKeyResponse>\u0001'
                     '</u:X_SendKeyResponse></s:Body></s:Envelope>',
+                // Codex round four.
+                for (final inside in _notXml)
+                  '<s:Envelope><s:Body><u:X_SendKeyResponse>$inside'
+                      '</u:X_SendKeyResponse></s:Body></s:Envelope>',
+                for (final attribute in _badAttributes)
+                  '<s:Envelope><s:Body><u:X_SendKeyResponse $attribute/>'
+                      '</s:Body></s:Envelope>',
               ];
         for (final body in bodies) {
           sim.clearLog();
@@ -1535,3 +1549,16 @@ void main() {
     expect(sim.keyLog, ['NRC_GUIDE-ONOFF', 'NRC_CC-ONOFF']);
   });
 }
+
+/// Answer content that is not XML although the xml package parses it:
+/// references to characters XML forbids, and `]]>` in text.
+const List<String> _notXml = [
+  '&#0;',
+  '&#x1F;',
+  '&#xD800;',
+  '&#x110000;',
+  ']]>',
+];
+
+/// Attributes that are not XML although the xml package parses them.
+const List<String> _badAttributes = ['a=value', 'a', 'a="<"'];

@@ -3,6 +3,7 @@ import 'package:xml/xml.dart';
 import 'package:xml/xml_events.dart' show XmlNodeDecoder, parseEvents;
 
 import 'constants.dart';
+import 'xml_check.dart';
 
 // SOAP request shapes and answer parsing for the VIERA UPnP server, written
 // from the watchme research brief (sections 3 and 6), whose byte layouts
@@ -91,18 +92,13 @@ bool xmlHasElement(String xml, String localName) =>
 
 /// [xml] as one well-formed XML document, or `null`.
 ///
-/// Well-formed as XML 1.0 has it: one root element, every element closed
-/// in order, comments, CDATA sections and processing instructions
-/// terminated, nothing but whitespace, comments and processing
-/// instructions outside the root, every `&` a predefined entity or a
-/// character reference, comments without `--`, no control characters and
-/// no attribute given twice ([_lexicallyWellFormed]: the parser itself
-/// lets those through). Namespace prefixes are not resolved, so an
-/// undeclared one is no error: answers are matched by local name, as the
-/// field clients match them, and the brief leaves the prefixes of some
-/// answers unverified (section 6.4).
+/// Well-formed as XML 1.0 has it ([isWellFormedXml]: the xml package's
+/// parser alone is lenient), with no document type declaration. Namespace
+/// prefixes are not resolved, so an undeclared one is no error: answers
+/// are matched by local name, as the field clients match them, and the
+/// brief leaves the prefixes of some answers unverified (section 6.4).
 XmlDocument? _wellFormed(String xml) {
-  if (!_lexicallyWellFormed(xml)) return null;
+  if (!isWellFormedXml(xml)) return null;
   final XmlDocument doc;
   try {
     doc = XmlDocument(
@@ -127,53 +123,7 @@ XmlDocument? _wellFormed(String xml) {
         break;
     }
   }
-  for (final e in doc.descendantElements) {
-    final names = <String>{};
-    for (final a in e.attributes) {
-      if (!names.add(a.name.qualified)) return null;
-    }
-  }
   return doc;
-}
-
-final RegExp _reference = RegExp(
-  r'&(#x[0-9a-fA-F]+|#[0-9]+|amp|lt|gt|quot|apos);',
-);
-final RegExp _controlCharacter = RegExp(r'[\x00-\x08\x0B\x0C\x0E-\x1F]');
-
-/// The checks XML 1.0 makes that the parser does not: outside comments,
-/// CDATA sections and processing instructions every `&` starts a
-/// predefined entity or a character reference (there is no DTD to define
-/// others); a comment holds no `--` and does not end in `-`; and nothing
-/// holds a control character other than tab, CR and LF. An unterminated
-/// comment, CDATA section or processing instruction fails too.
-bool _lexicallyWellFormed(String xml) {
-  if (_controlCharacter.hasMatch(xml)) return false;
-  var i = 0;
-  while (i < xml.length) {
-    if (xml.startsWith('<!--', i)) {
-      final end = xml.indexOf('-->', i + 4);
-      if (end < 0) return false;
-      final comment = xml.substring(i + 4, end);
-      if (comment.contains('--') || comment.endsWith('-')) return false;
-      i = end + 3;
-    } else if (xml.startsWith('<![CDATA[', i)) {
-      final end = xml.indexOf(']]>', i + 9);
-      if (end < 0) return false;
-      i = end + 3;
-    } else if (xml.startsWith('<?', i)) {
-      final end = xml.indexOf('?>', i + 2);
-      if (end < 0) return false;
-      i = end + 2;
-    } else if (xml.codeUnitAt(i) == 0x26 /* & */ ) {
-      final ref = _reference.matchAsPrefix(xml, i);
-      if (ref == null) return false;
-      i = ref.end;
-    } else {
-      i++;
-    }
-  }
-  return true;
 }
 
 /// The decrypted answer [fragment] of an encrypted command in an `X_Data`
