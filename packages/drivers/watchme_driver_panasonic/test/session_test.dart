@@ -911,6 +911,11 @@ void main() {
                   // Codex round five: a malformed XML declaration.
                   for (final declaration in _badDeclarations)
                     '$declaration<u:X_SendKeyResponse xmlns:u="$urn"/>',
+                  // Codex round six: a character XML forbids before a good
+                  // declaration (vertical tab, form feed).
+                  for (final lead in ['\u000B', '\u000C'])
+                    '$lead<?xml version="1.0"?>'
+                        '<u:X_SendKeyResponse xmlns:u="$urn"/>',
                 ])
                   sealed(inner),
                 // A genuine acknowledgement in a truncated outer answer.

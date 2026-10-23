@@ -132,7 +132,8 @@ XmlDocument? _wellFormed(String xml) {
 /// well-formed XML content. A leading XML declaration is checked against
 /// the XML grammar, then dropped.
 XmlElement? _fragment(String fragment) {
-  final lead = RegExp(r'\s*').matchAsPrefix(fragment)!.end;
+  // XML whitespace only: Dart's \s also matches characters XML forbids.
+  final lead = RegExp(r'[ \t\r\n]*').matchAsPrefix(fragment)!.end;
   final content = xmlDeclarationEnd(fragment, lead);
   if (content == null) return null;
   final body = content == lead ? fragment : fragment.substring(content);

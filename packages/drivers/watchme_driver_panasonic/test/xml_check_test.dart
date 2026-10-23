@@ -134,6 +134,9 @@ void main() {
       // No declaration: the content starts where it was asked about.
       expect(xmlDeclarationEnd('  <a/>', 2), 2);
       expect(xmlDeclarationEnd('<?xml-stylesheet x?><a/>', 0), 0);
+      expect(xmlDeclarationEnd('<a/>', 4), 4);
+      expect(() => xmlDeclarationEnd('<a/>', -1), throwsRangeError);
+      expect(() => xmlDeclarationEnd('<a/>', 5), throwsRangeError);
     });
 
     test('a deeply nested answer is checked without exhausting the stack', () {

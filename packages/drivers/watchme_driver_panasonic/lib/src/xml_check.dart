@@ -23,8 +23,10 @@ bool isWellFormedXml(String xml) {
 /// begins: [start] itself when there is no declaration there, `null` when
 /// there is one and it breaks the XML 1.0 grammar. For answers checked
 /// after their declaration is removed, such as the decrypted fragments of
-/// encrypted commands.
+/// encrypted commands. [start] must lie within [xml] (it may be its
+/// length).
 int? xmlDeclarationEnd(String xml, int start) {
+  RangeError.checkValueInInterval(start, 0, xml.length, 'start');
   final checker = _XmlChecker(xml).._i = start;
   if (!checker._atDeclaration) return start;
   try {
